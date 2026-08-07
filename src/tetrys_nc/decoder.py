@@ -29,6 +29,8 @@ class TetrysDecoder:
     _total_source_rx: int = 0
     _total_coded_rx: int = 0
     _total_recovered: int = 0
+    # Highest source id observed (received or referenced by a coded packet)
+    highest_seen: int = -1
     total_symbols: int | None = None
     payload_size: int = 32768
 
@@ -38,10 +40,15 @@ class TetrysDecoder:
             return got
         return self._delivered.get(sid)
 
+    def _note_seen(self, sid: int) -> None:
+        if sid > self.highest_seen:
+            self.highest_seen = sid
+
     def on_source_raw(self, sid: int, payload: bytes | memoryview | bytearray) -> list[tuple[int, bytes]]:
         """Hot path entry without allocating SourcePacket."""
         self._packets_since_feedback += 1
         self._total_source_rx += 1
+        self._note_seen(sid)
         if sid < self.next_deliver or sid in self._symbols:
             return []
 
@@ -62,6 +69,7 @@ class TetrysDecoder:
     def on_coded(self, pkt: CodedPacket) -> list[tuple[int, bytes]]:
         self._packets_since_feedback += 1
         self._total_coded_rx += 1
+        self._note_seen(pkt.last_source_id)
 
         coefs: dict[int, int] = {}
         payload = bytearray(pkt.payload)
@@ -179,32 +187,43 @@ class TetrysDecoder:
         return self._packets_since_feedback >= self.cfg.feedback_every_packets
 
     def build_feedback(self, sack_bits: int = 256) -> WindowUpdatePacket:
+        """
+        SACK/PLR only cover symbols we have *evidence* were sent
+        (up to highest_seen). Counting not-yet-sent ids as losses
+        falsely reports ~100% PLR and collapses sender pacing.
+        """
         self._packets_since_feedback = 0
         base = self.next_deliver
+        # End of observed range (inclusive). If nothing seen ahead, no holes.
+        observed_end = max(self.highest_seen, base - 1)
+        span = max(0, observed_end - base + 1)
+        span = min(span, sack_bits)
+        if self.total_symbols is not None:
+            span = min(span, max(0, self.total_symbols - base))
+
         n_bytes = (sack_bits + 7) // 8
         sack = bytearray(n_bytes)
         missing = 0
-        hi = sack_bits
-        if self.total_symbols is not None:
-            hi = min(sack_bits, max(0, self.total_symbols - base))
-        for i in range(hi):
+        for i in range(span):
             sid = base + i
-            if sid in self._symbols or sid < self.next_deliver:
+            if sid in self._symbols:
                 sack[i // 8] |= 1 << (i % 8)
             else:
                 missing += 1
-        # Also mark already-delivered prefix bits as present (base itself is "needed")
-        # bit0 corresponds to cumulative_ack (= next_deliver) which is still missing
-        # unless recovered into _symbols.
-        denom = max(hi, 1)
-        plr_pct = min(100.0, 100.0 * missing / denom)
+        # Bits beyond observed_end stay 0 but are NOT counted as losses /
+        # and missing_ids() must not request them — truncate sack to span.
+        usable_bytes = (span + 7) // 8
+        sack = bytes(sack[:usable_bytes]) if usable_bytes else b""
+
+        denom = max(span, 1)
+        plr_pct = min(100.0, 100.0 * missing / denom) if span > 0 else 0.0
         plr_byte = int(plr_pct * 256 / 100)
         return WindowUpdatePacket(
             cumulative_ack=self.next_deliver,
             nb_missing_src=missing,
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
-            sack=bytes(sack),
+            sack=sack,
         )
 
     def is_complete(self) -> bool:

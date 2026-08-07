@@ -105,7 +105,22 @@ def test_sack_missing_ids():
     dec.on_source_raw(3, b"\x03" * 8)
     # deliver 0
     assert dec.next_deliver == 1
+    assert dec.highest_seen == 3
     fb = dec.build_feedback(sack_bits=32)
     assert fb.cumulative_ack == 1
     missing = fb.missing_ids(limit=16)
     assert 1 in missing
+    # Must NOT treat not-yet-seen future ids as losses
+    assert fb.nb_missing_src == 1
+    assert fb.plr_byte > 0
+
+
+def test_plr_zero_when_in_order():
+    dec = TetrysDecoder()
+    dec.total_symbols = 1000
+    for i in range(50):
+        dec.on_source_raw(i, bytes([i % 256]) * 8)
+    fb = dec.build_feedback(sack_bits=256)
+    assert fb.cumulative_ack == 50
+    assert fb.nb_missing_src == 0
+    assert fb.plr_byte == 0

@@ -44,7 +44,7 @@ class RateLimiter:
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
-        self.rate = max(rate_bps, 50_000.0)  # floor ~50 KB/s
+        self.rate = max(rate_bps, 2_000_000.0)  # floor ~2 MB/s total UDP
         self.burst = max(self.rate * 0.25, self.rate * 0.05)
 
     def consume(self, nbytes: int) -> None:
@@ -83,8 +83,9 @@ def run_server(
         # High-loss long-RTT profile: heavy repair (≈1 source + 3 coded)
         if payload_size >= 8000:
             payload_size = 1350
-        if max_window > 512:
-            max_window = 512
+        # BDP for ~20MB/s * 150ms ≈ 3MB → ~2200 packets @1350; use 2048
+        if max_window < 2048:
+            max_window = 2048
         # Force dense redundancy unless user passed an even denser value
         if redundancy_every > 1:
             redundancy_every = 1
@@ -92,8 +93,8 @@ def run_server(
             coded_burst = 3
         code_degree = 48
         if rate_mbit <= 0:
-            # Lower start rate: repair traffic is ~3x, stay under path capacity
-            rate_mbit = 60.0
+            # Total UDP budget; goodput ≈ rate/(1+burst) ≈ 40 Mbit with burst=3
+            rate_mbit = 160.0
     else:
         code_degree = 8
 
@@ -191,15 +192,15 @@ def run_server(
                     ack_progress["ack"] = pkt.cumulative_ack
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
-                    # AIMD-ish rate control
+                    # AIMD-ish rate control (gentle — false PLR used to nuke the rate)
                     if limiter is not None:
                         plr = pkt.plr_byte * 100.0 / 256.0
-                        if plr >= 15:
-                            limiter.set_rate(limiter.rate * 0.5)
-                        elif plr >= 5:
-                            limiter.set_rate(limiter.rate * 0.85)
-                        elif plr < 2 and pkt.nb_missing_src < 8:
-                            limiter.set_rate(min(limiter.rate * 1.05, 250_000_000 / 8))
+                        if plr >= 40 and pkt.nb_missing_src >= 8:
+                            limiter.set_rate(limiter.rate * 0.7)
+                        elif plr >= 20 and pkt.nb_missing_src >= 4:
+                            limiter.set_rate(limiter.rate * 0.9)
+                        elif plr < 5 and pkt.nb_missing_src <= 2:
+                            limiter.set_rate(min(limiter.rate * 1.08, 400_000_000 / 8))
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -401,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="high-loss WAN: payload 1350, window 512, 1 source + 3 coded, pacing+NACK",
+        help="high-loss WAN: payload 1350, window 2048, 1 source + 3 coded, pacing+NACK",
     )
     p.add_argument(
         "--rate-mbit",

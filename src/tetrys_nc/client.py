@@ -35,8 +35,8 @@ def run_client(
     wan: bool = False,
 ) -> int:
     if wan:
-        if max_window > 512:
-            max_window = 512
+        if max_window < 2048:
+            max_window = 2048
         if feedback_every > 32:
             feedback_every = 16
 

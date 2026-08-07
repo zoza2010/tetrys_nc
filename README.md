@@ -79,7 +79,7 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan` включает: payload 1350, window 512, **1 source + 3 coded** (и до 4 при высоком PLR), coded по **oldest**, SACK/NACK, pacing.
+`--wan` включает: payload 1350, window 2048, **1 source + 3 coded** (до 4 при высоком PLR), coded по **oldest**, SACK/NACK, pacing (~160 Mbit UDP).
 
 Ещё гуще (≈1+5 coded):
 ```bash
