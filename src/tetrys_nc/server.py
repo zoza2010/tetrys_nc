@@ -34,6 +34,31 @@ def file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+class RateLimiter:
+    """Simple token-bucket pacing in bytes/sec."""
+
+    def __init__(self, rate_bps: float, burst: float | None = None) -> None:
+        self.rate = max(rate_bps, 1.0)
+        self.burst = burst if burst is not None else self.rate * 0.25
+        self.tokens = self.burst
+        self.updated = time.monotonic()
+
+    def set_rate(self, rate_bps: float) -> None:
+        self.rate = max(rate_bps, 50_000.0)  # floor ~50 KB/s
+        self.burst = max(self.rate * 0.25, self.rate * 0.05)
+
+    def consume(self, nbytes: int) -> None:
+        now = time.monotonic()
+        elapsed = now - self.updated
+        self.updated = now
+        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
+        self.tokens -= nbytes
+        if self.tokens < 0:
+            sleep_s = (-self.tokens) / self.rate
+            time.sleep(min(sleep_s, 0.05))
+            self.tokens = 0.0
+
+
 def run_server(
     host: str,
     port: int,
@@ -41,13 +66,36 @@ def run_server(
     payload_size: int = 32768,
     max_window: int = 8192,
     redundancy_every: int = 32,
+    coded_burst: int = 0,
     pace_us: float = 0.0,
     skip_hash: bool = False,
+    wan: bool = False,
+    rate_mbit: float = 0.0,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
         print(f"error: file not found: {file_path}", file=sys.stderr)
         return 1
+
+    if coded_burst <= 0:
+        coded_burst = 1
+    if wan:
+        # High-loss long-RTT profile: heavy repair (≈1 source + 3 coded)
+        if payload_size >= 8000:
+            payload_size = 1350
+        if max_window > 512:
+            max_window = 512
+        # Force dense redundancy unless user passed an even denser value
+        if redundancy_every > 1:
+            redundancy_every = 1
+        if coded_burst < 3:
+            coded_burst = 3
+        code_degree = 48
+        if rate_mbit <= 0:
+            # Lower start rate: repair traffic is ~3x, stay under path capacity
+            rate_mbit = 60.0
+    else:
+        code_degree = 8
 
     file_size = file_path.stat().st_size
     if skip_hash:
@@ -61,7 +109,8 @@ def run_server(
     total_symbols = (file_size + payload_size - 1) // payload_size if file_size else 0
     print(
         f"symbols={total_symbols} payload={payload_size} "
-        f"window={max_window} redundancy={redundancy_every}"
+        f"window={max_window} redundancy={redundancy_every}x{coded_burst} "
+        f"wan={wan} rate_mbit={rate_mbit or 'unlimited'}"
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -78,12 +127,21 @@ def run_server(
         EncoderConfig(
             max_window=max_window,
             redundancy_every=redundancy_every,
+            coded_burst=coded_burst,
             payload_size=payload_size,
+            code_degree=code_degree,
         )
     )
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
+    ack_progress = {"ack": 0, "plr": 0, "t": time.monotonic()}
+
+    # Pacing: WAN always; optional explicit --rate-mbit
+    limiter: RateLimiter | None = None
+    if rate_mbit > 0 or wan:
+        start_rate = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
+        limiter = RateLimiter(start_rate)
 
     deadline = time.monotonic() + 600
     while client_addr is None:
@@ -127,8 +185,21 @@ def run_server(
                 except ValueError:
                     continue
                 if isinstance(pkt, WindowUpdatePacket):
+                    missing = pkt.missing_ids(limit=64)
                     with enc_lock:
-                        enc.apply_feedback(pkt.cumulative_ack, pkt.plr_byte)
+                        enc.apply_feedback(pkt.cumulative_ack, pkt.plr_byte, missing)
+                    ack_progress["ack"] = pkt.cumulative_ack
+                    ack_progress["plr"] = pkt.plr_byte
+                    ack_progress["t"] = time.monotonic()
+                    # AIMD-ish rate control
+                    if limiter is not None:
+                        plr = pkt.plr_byte * 100.0 / 256.0
+                        if plr >= 15:
+                            limiter.set_rate(limiter.rate * 0.5)
+                        elif plr >= 5:
+                            limiter.set_rate(limiter.rate * 0.85)
+                        elif plr < 2 and pkt.nb_missing_src < 8:
+                            limiter.set_rate(min(limiter.rate * 1.05, 250_000_000 / 8))
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -141,8 +212,20 @@ def run_server(
     t0 = time.monotonic()
     last_progress = t0
     fin_sent = False
-    batch = 2048
+    batch = 64 if wan else 2048
     file_offset = 0
+    last_ack_seen = 0
+    stall_repairs = 0
+
+    def send_datagram(wire: bytes) -> None:
+        if limiter is not None:
+            limiter.consume(len(wire))
+        while True:
+            try:
+                sock.sendto(wire, client_addr)
+                return
+            except BlockingIOError:
+                select.select([], [sock], [], 0.005)
 
     try:
         with file_path.open("rb") as f:
@@ -154,6 +237,41 @@ def run_server(
                         elapsed = time.monotonic() - t0
                         _print_summary(enc, file_size, elapsed)
                         return 0
+
+                    # Prioritize repair of NACKs / HOL before new data
+                    with enc_lock:
+                        repairs = enc.pop_nack_retransmit(limit=32 if wan else 4)
+                        plr_b = enc.last_plr_byte
+                        burst = enc.coded_burst
+                        need_coded = wan or plr_b > 0 or bool(repairs)
+                        n_repair_coded = (burst + 1) if need_coded and (wan or repairs) else 0
+                        coded_repairs = []
+                        for _ in range(n_repair_coded):
+                            c = enc.make_coded(prefer_oldest=True)
+                            if c is None:
+                                break
+                            coded_repairs.append(c.pack())
+                    for wire in repairs:
+                        send_datagram(wire)
+                    for wire in coded_repairs:
+                        send_datagram(wire)
+
+                    # Detect ACK stall → flood oldest repair
+                    cur_ack = ack_progress["ack"]
+                    if cur_ack == last_ack_seen:
+                        stall_repairs += 1
+                    else:
+                        stall_repairs = 0
+                        last_ack_seen = cur_ack
+                    if stall_repairs >= 3 and not eof:
+                        with enc_lock:
+                            oldest = enc.oldest_id
+                            w = enc.pack_source_id(oldest) if oldest is not None else None
+                            c = enc.make_coded(prefer_oldest=True)
+                        if w:
+                            send_datagram(w)
+                        if c:
+                            send_datagram(c.pack())
 
                     sent = 0
                     while not eof and sent < batch:
@@ -173,20 +291,11 @@ def run_server(
                             chunk = bytes(raw)
 
                         with enc_lock:
-                            # Copy out of reusable encoder buffer before unlock
                             wire = bytes(enc.add_source(chunk))
-                            coded = enc.maybe_coded()
-                        while True:
-                            try:
-                                sock.sendto(wire, client_addr)
-                                break
-                            except BlockingIOError:
-                                select.select([], [sock], [], 0.005)
-                        if coded is not None:
-                            try:
-                                sock.sendto(coded, client_addr)
-                            except BlockingIOError:
-                                pass
+                            coded_list = enc.maybe_coded()
+                        send_datagram(wire)
+                        for coded in coded_list:
+                            send_datagram(coded)
                         sent += 1
                         if pace_us > 0:
                             time.sleep(pace_us / 1_000_000.0)
@@ -198,39 +307,39 @@ def run_server(
                             if not fin_sent:
                                 fin = FinPacket(True, total_symbols).pack()
                                 for _ in range(3):
-                                    sock.sendto(fin, client_addr)
+                                    send_datagram(fin)
                                 fin_sent = True
                             if fin_from_client.wait(0.1):
                                 elapsed = time.monotonic() - t0
                                 _print_summary(enc, file_size, elapsed)
                                 return 0
-                            sock.sendto(FinPacket(True, total_symbols).pack(), client_addr)
+                            send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                c = enc.make_coded()
+                                repairs = enc.pop_nack_retransmit(limit=16)
+                                c = enc.make_coded(prefer_oldest=True)
                                 oldest = enc.oldest_id
-                                wire = enc.pack_source_id(oldest) if oldest is not None else None
+                                w = enc.pack_source_id(oldest) if oldest is not None else None
+                            for wire in repairs:
+                                send_datagram(wire)
                             if c:
-                                try:
-                                    sock.sendto(c.pack(), client_addr)
-                                except BlockingIOError:
-                                    pass
-                            if wire is not None:
-                                try:
-                                    sock.sendto(wire, client_addr)
-                                except BlockingIOError:
-                                    pass
-                            time.sleep(0.0005)
+                                send_datagram(c.pack())
+                            if w:
+                                send_datagram(w)
+                            time.sleep(0.001)
                     elif sent == 0:
                         with enc_lock:
+                            repairs = enc.pop_nack_retransmit(limit=16)
+                            c = enc.make_coded(prefer_oldest=True)
                             oldest = enc.oldest_id
-                            wire = enc.pack_source_id(oldest) if oldest is not None else None
-                        if wire is not None:
-                            try:
-                                sock.sendto(wire, client_addr)
-                            except BlockingIOError:
-                                pass
-                        time.sleep(0.0002)
+                            w = enc.pack_source_id(oldest) if oldest is not None else None
+                        for wire in repairs:
+                            send_datagram(wire)
+                        if c:
+                            send_datagram(c.pack())
+                        if w:
+                            send_datagram(w)
+                        time.sleep(0.001)
 
                     now = time.monotonic()
                     if now - last_progress >= 1.0:
@@ -240,10 +349,13 @@ def run_server(
                             done = enc.next_source_id
                         pct = 100.0 * done / total_symbols if total_symbols else 0
                         rate = file_offset / max(now - t0, 1e-6) / (1024 * 1024)
+                        pace = (limiter.rate / (1024 * 1024)) if limiter else 0
                         print(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']} ack={st['cumulative_ack']} "
-                            f"coded={st['sent_coded']} {rate:.1f} MiB/s"
+                            f"coded={st['sent_coded']} burst={st['coded_burst']} "
+                            f"nack={st['nack_q']} plr={st['plr_byte']} "
+                            f"pace={pace:.1f}MiB/s app={rate:.1f} MiB/s"
                         )
 
                     if fin_sent and time.monotonic() - t0 > 3600:
@@ -278,8 +390,25 @@ def main(argv: list[str] | None = None) -> int:
         default=32,
         help="coded every N source packets (0=off; repair still via retransmit)",
     )
+    p.add_argument(
+        "--coded-burst",
+        type=int,
+        default=0,
+        help="coded packets per redundancy tick (0=auto; WAN default 3)",
+    )
     p.add_argument("--pace-us", type=float, default=0.0)
     p.add_argument("--skip-hash", action="store_true")
+    p.add_argument(
+        "--wan",
+        action="store_true",
+        help="high-loss WAN: payload 1350, window 512, 1 source + 3 coded, pacing+NACK",
+    )
+    p.add_argument(
+        "--rate-mbit",
+        type=float,
+        default=0.0,
+        help="pace send rate in Mbit/s (0=unlimited unless --wan)",
+    )
     args = p.parse_args(argv)
     return run_server(
         args.host,
@@ -288,8 +417,11 @@ def main(argv: list[str] | None = None) -> int:
         payload_size=args.payload_size,
         max_window=args.window,
         redundancy_every=args.redundancy,
+        coded_burst=args.coded_burst,
         pace_us=args.pace_us,
         skip_hash=args.skip_hash,
+        wan=args.wan,
+        rate_mbit=args.rate_mbit,
     )
 
 

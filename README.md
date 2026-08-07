@@ -67,8 +67,26 @@ uv run python scripts/bench_inplace.py --size 64M
 bash scripts/run_bench.sh
 ```
 
+## WAN (потери, большой RTT)
+
+Без pacing UDP забивает путь → ещё больше потерь; coded по «хвосту» окна не лечит HOL-дыру в начале.
+
+```bash
+# сервер (в Испании)
+uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --skip-hash
+
+# клиент (в РФ)
+uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
+```
+
+`--wan` включает: payload 1350, window 512, **1 source + 3 coded** (и до 4 при высоком PLR), coded по **oldest**, SACK/NACK, pacing.
+
+Ещё гуще (≈1+5 coded):
+```bash
+--wan --coded-burst 5 --rate-mbit 100
+```
+
 ## Замечания
 
-- Реализация следует идеям RFC 9407 (elastic window, on-the-fly coding, feedback), с упрощённым бинарным framing удобным для файлового теста.
-- Для localhost 1 ГиБ обычно проходит за секунды–десятки секунд в зависимости от CPU (декодирование GF).
-- На lossy-канале увеличьте `--redundancy` (меньше N = больше repair) или уменьшите `--window`.
+- Реализация следует идеям RFC 9407 (elastic window, on-the-fly coding, feedback).
+- Localhost: большие payload; WAN: обязательно `--wan`.

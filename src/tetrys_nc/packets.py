@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
-# Magic / version for our session framing
 MAGIC = 0x54  # 'T'
 VERSION = 1
 
@@ -52,8 +51,6 @@ class SourcePacket:
 
 @dataclass(slots=True)
 class CodedPacket:
-    """Coded symbol over a contiguous elastic window [first_source_id, last_source_id]."""
-
     coded_id: int
     first_source_id: int
     last_source_id: int
@@ -83,28 +80,53 @@ class CodedPacket:
 class WindowUpdatePacket:
     """
     Feedback from decoder.
-    cumulative_ack: all source symbols with id < cumulative_ack are safe to remove.
-    Also carries PLR / buffer stats for adaptive redundancy.
+    cumulative_ack: symbols with id < cumulative_ack are fully delivered.
+    sack: bit i set => symbol (cumulative_ack + i) is already held by receiver.
+    Missing bits in the SACK range are NACK targets for repair/retransmit.
     """
 
     cumulative_ack: int
     nb_missing_src: int
     nb_not_used_coded: int
     plr_byte: int
+    sack: bytes = b""
 
     def pack(self) -> bytes:
+        sack = self.sack
+        pad = (-len(sack)) % 4
+        if pad:
+            sack = sack + b"\x00" * pad
+        sack_words = len(sack) // 4
         return _HDR.pack(MAGIC, VERSION, PKT_WND_UPT, 0) + struct.pack(
-            "!III B",
+            "!III BB",
             self.cumulative_ack,
             self.nb_missing_src,
             self.nb_not_used_coded,
             self.plr_byte & 0xFF,
-        )
+            sack_words & 0xFF,
+        ) + sack
 
     @classmethod
     def unpack(cls, data: bytes) -> WindowUpdatePacket:
+        if len(data) >= 18:
+            cum, nb_miss, nb_coded, plr, sack_words = struct.unpack_from("!III BB", data, 4)
+            sack = data[18 : 18 + sack_words * 4]
+            return cls(cum, nb_miss, nb_coded, plr, sack)
+        # backward-compatible short format
         cum, nb_miss, nb_coded, plr = struct.unpack_from("!III B", data, 4)
-        return cls(cum, nb_miss, nb_coded, plr)
+        return cls(cum, nb_miss, nb_coded, plr, b"")
+
+    def missing_ids(self, limit: int = 64) -> list[int]:
+        """Symbol IDs in SACK range that receiver does NOT have."""
+        out: list[int] = []
+        for i, byte in enumerate(self.sack):
+            for b in range(8):
+                bit = i * 8 + b
+                if not (byte & (1 << b)):
+                    out.append(self.cumulative_ack + bit)
+                    if len(out) >= limit:
+                        return out
+        return out
 
 
 @dataclass(slots=True)

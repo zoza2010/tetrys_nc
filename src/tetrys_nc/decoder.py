@@ -168,24 +168,43 @@ class TetrysDecoder:
             self.next_deliver += 1
         return out
 
+    def has_holes(self) -> bool:
+        """True if we hold future symbols while waiting on next_deliver."""
+        return bool(self._symbols) or bool(self._equations)
+
     def need_feedback(self) -> bool:
+        # Feedback ASAP when HOL-blocked — critical on lossy WAN
+        if self.has_holes() and self._packets_since_feedback >= 8:
+            return True
         return self._packets_since_feedback >= self.cfg.feedback_every_packets
 
-    def build_feedback(self) -> WindowUpdatePacket:
+    def build_feedback(self, sack_bits: int = 256) -> WindowUpdatePacket:
         self._packets_since_feedback = 0
+        base = self.next_deliver
+        n_bytes = (sack_bits + 7) // 8
+        sack = bytearray(n_bytes)
         missing = 0
+        hi = sack_bits
         if self.total_symbols is not None:
-            hi = min(self.next_deliver + 256, self.total_symbols)
-            for sid in range(self.next_deliver, hi):
-                if sid not in self._symbols:
-                    missing += 1
-        plr_pct = min(100.0, 100.0 * missing / 256.0)
+            hi = min(sack_bits, max(0, self.total_symbols - base))
+        for i in range(hi):
+            sid = base + i
+            if sid in self._symbols or sid < self.next_deliver:
+                sack[i // 8] |= 1 << (i % 8)
+            else:
+                missing += 1
+        # Also mark already-delivered prefix bits as present (base itself is "needed")
+        # bit0 corresponds to cumulative_ack (= next_deliver) which is still missing
+        # unless recovered into _symbols.
+        denom = max(hi, 1)
+        plr_pct = min(100.0, 100.0 * missing / denom)
         plr_byte = int(plr_pct * 256 / 100)
         return WindowUpdatePacket(
             cumulative_ack=self.next_deliver,
             nb_missing_src=missing,
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
+            sack=bytes(sack),
         )
 
     def is_complete(self) -> bool:

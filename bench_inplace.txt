@@ -1,0 +1,6 @@
+=== inplace bench 64M ===
+payload=8192 window=8192 red=32 ok=True 34.1 MiB/s in 1.88s
+payload=32768 window=8192 red=32 ok=True 38.8 MiB/s in 1.65s
+payload=60000 window=4096 red=32 ok=True 18.5 MiB/s in 3.46s
+payload=32768 window=8192 red=0 ok=False 0.0 MiB/s in 0.00s
+BEST: (32768, 8192, 32) @ 38.8 MiB/s

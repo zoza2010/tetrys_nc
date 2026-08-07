@@ -23,7 +23,6 @@ from .packets import (
     FinPacket,
     MetaPacket,
     ReadyPacket,
-    parse_packet,
 )
 
 
@@ -33,7 +32,14 @@ def run_client(
     output: Path,
     max_window: int = 8192,
     feedback_every: int = 256,
+    wan: bool = False,
 ) -> int:
+    if wan:
+        if max_window > 512:
+            max_window = 512
+        if feedback_every > 32:
+            feedback_every = 16
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 4 * 1024 * 1024)
     try_set_buffer(sock, socket.SO_SNDBUF, 1 * 1024 * 1024)
@@ -42,9 +48,9 @@ def run_client(
 
     dec = TetrysDecoder(
         DecoderConfig(
-            max_decode_window=max_window,
+            max_decode_window=max_window * 2,
             feedback_every_packets=feedback_every,
-            delivered_cache=max_window,
+            delivered_cache=max_window * 2,
         )
     )
 
@@ -64,6 +70,8 @@ def run_client(
             sock.sendto(ready, server)
             continue
         data, _addr = sock.recvfrom(65535)
+        from .packets import parse_packet
+
         try:
             pkt = parse_packet(data)
         except ValueError:
@@ -91,19 +99,19 @@ def run_client(
     t0 = time.monotonic()
     last_progress = t0
     fin_seen = False
-    fb_wire = None
+    last_fb = 0.0
 
-    # Larger stdio buffer
     with out_path.open("wb", buffering=8 * 1024 * 1024) as out:
         while True:
-            timeout = 0.05 if fin_seen else 0.1
+            timeout = 0.02 if (wan or dec.has_holes()) else 0.1
             r, _, _ = select.select([sock], [], [], timeout)
+            now = time.monotonic()
             if not r:
-                fb_wire = dec.build_feedback().pack()
-                sock.sendto(fb_wire, server)
+                sock.sendto(dec.build_feedback().pack(), server)
+                last_fb = now
                 if fin_seen and dec.is_complete():
                     break
-                if time.monotonic() - t0 > 3600:
+                if now - t0 > 3600:
                     print("transfer timeout", file=sys.stderr)
                     return 1
                 continue
@@ -145,10 +153,15 @@ def run_client(
 
                 processed += 1
 
-            if processed and dec.need_feedback():
+            # Aggressive feedback when holes or periodically
+            if processed and (
+                dec.need_feedback()
+                or (wan and now - last_fb > 0.05)
+                or (dec.has_holes() and now - last_fb > 0.05)
+            ):
                 sock.sendto(dec.build_feedback().pack(), server)
+                last_fb = now
 
-            now = time.monotonic()
             if now - last_progress >= 1.0:
                 last_progress = now
                 st = dec.stats()
@@ -157,6 +170,7 @@ def run_client(
                 print(
                     f"progress {bytes_written}/{meta.file_size} ({pct:.1f}%) "
                     f"deliver={st['next_deliver']}/{total_symbols} "
+                    f"buf={st['buffered']} eq={st['equations']} "
                     f"recovered={st['recovered']} {rate:.1f} MiB/s"
                 )
 
@@ -193,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--output", type=Path, default=Path("received.bin"))
     p.add_argument("--window", type=int, default=8192)
     p.add_argument("--feedback-every", type=int, default=256)
+    p.add_argument(
+        "--wan",
+        action="store_true",
+        help="lossy/long-RTT profile: smaller window, faster SACK/NACK feedback",
+    )
     args = p.parse_args(argv)
     return run_client(
         args.host,
@@ -200,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output,
         max_window=args.window,
         feedback_every=args.feedback_every,
+        wan=args.wan,
     )
 
 
