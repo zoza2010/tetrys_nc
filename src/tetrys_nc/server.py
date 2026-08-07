@@ -38,13 +38,15 @@ class RateLimiter:
     """Simple token-bucket pacing in bytes/sec."""
 
     def __init__(self, rate_bps: float, burst: float | None = None) -> None:
-        self.rate = max(rate_bps, 1.0)
+        self.max_rate = max(rate_bps, 1.0)  # hard ceiling from --rate/--rate-mbit
+        self.min_rate = min(2_000_000.0, self.max_rate)  # floor, never above max
+        self.rate = self.max_rate
         self.burst = burst if burst is not None else self.rate * 0.25
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
-        self.rate = max(rate_bps, 2_000_000.0)  # floor ~2 MB/s total UDP
+        self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
         self.burst = max(self.rate * 0.25, self.rate * 0.05)
 
     def consume(self, nbytes: int) -> None:
@@ -55,7 +57,8 @@ class RateLimiter:
         self.tokens -= nbytes
         if self.tokens < 0:
             sleep_s = (-self.tokens) / self.rate
-            time.sleep(min(sleep_s, 0.05))
+            time.sleep(sleep_s)
+            self.updated = time.monotonic()
             self.tokens = 0.0
 
 
@@ -88,11 +91,11 @@ def run_server(
         if max_window < 2048:
             max_window = 2048
         if redundancy_every >= 32:
-            # default localhost red is 32; for WAN use light periodic repair
-            redundancy_every = 4
+            # light periodic repair when healthy; ramps up on PLR
+            redundancy_every = 8
         if coded_burst <= 1:
             coded_burst = 1
-        code_degree = 12
+        code_degree = 8
         if rate_mbit <= 0:
             rate_mbit = 200.0
     else:
@@ -192,7 +195,7 @@ def run_server(
                     ack_progress["ack"] = pkt.cumulative_ack
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
-                    # AIMD-ish rate control (gentle — false PLR used to nuke the rate)
+                    # AIMD within [min_rate, max_rate] — never exceeds --rate-mbit
                     if limiter is not None:
                         plr = pkt.plr_byte * 100.0 / 256.0
                         if plr >= 40 and pkt.nb_missing_src >= 8:
@@ -200,7 +203,7 @@ def run_server(
                         elif plr >= 20 and pkt.nb_missing_src >= 4:
                             limiter.set_rate(limiter.rate * 0.9)
                         elif plr < 5 and pkt.nb_missing_src <= 2:
-                            limiter.set_rate(min(limiter.rate * 1.08, 400_000_000 / 8))
+                            limiter.set_rate(limiter.rate * 1.05)
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -360,12 +363,13 @@ def run_server(
                         pct = 100.0 * done / total_symbols if total_symbols else 0
                         rate = file_offset / max(now - t0, 1e-6) / (1024 * 1024)
                         pace = (limiter.rate / (1024 * 1024)) if limiter else 0
+                        cap = (limiter.max_rate / (1024 * 1024)) if limiter else 0
                         print(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
-                            f"pace={pace:.1f}MiB/s app={rate:.1f} MiB/s"
+                            f"pace={pace:.1f}/{cap:.1f}MiB/s app={rate:.1f} MiB/s"
                         )
 
                     if fin_sent and time.monotonic() - t0 > 3600:
@@ -415,9 +419,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--rate-mbit",
+        "--rate",
         type=float,
         default=0.0,
-        help="pace send rate in Mbit/s (0=unlimited unless --wan)",
+        dest="rate_mbit",
+        help="max UDP send rate in Mbit/s (alias: --rate). 0=unlimited unless --wan",
     )
     args = p.parse_args(argv)
     return run_server(
