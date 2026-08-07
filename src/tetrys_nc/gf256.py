@@ -80,13 +80,17 @@ def mul_bytes(coef: int, data: bytes | bytearray, out: bytearray) -> None:
     """out[i] ^= coef * data[i] for all i (in-place accumulate)."""
     if coef == 0:
         return
+    n = len(data)
     if coef == 1:
-        for i, b in enumerate(data):
-            out[i] ^= b
+        # Local binds help a bit in tight Python loops
+        ox = out
+        for i in range(n):
+            ox[i] ^= data[i]
         return
     table = MUL_TABLE[coef]
-    for i, b in enumerate(data):
-        out[i] ^= table[b]
+    ox = out
+    for i in range(n):
+        ox[i] ^= table[data[i]]
 
 
 def scale_bytes(coef: int, data: bytes | bytearray) -> bytearray:

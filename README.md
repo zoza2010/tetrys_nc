@@ -79,11 +79,12 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan` включает: payload 1350, window 2048, **1 source + 3 coded** (до 4 при высоком PLR), coded по **oldest**, SACK/NACK, pacing (~160 Mbit UDP).
+`--wan` стартует **легко** (coded каждые 4 source, degree=12) — иначе pure-Python GF становится bottleneck (~0.2 MiB/s при plr=0).  
+При росте PLR автоматически усиливается до 1 source + 2..4 coded.
 
-Ещё гуще (≈1+5 coded):
+Принудительно густо (если потери реально огромные):
 ```bash
---wan --coded-burst 5 --rate-mbit 100
+--wan --redundancy 1 --coded-burst 3 --rate-mbit 200
 ```
 
 ## Замечания

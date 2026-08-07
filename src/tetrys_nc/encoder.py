@@ -153,24 +153,23 @@ class TetrysEncoder:
                     self._nack_q.append(sid)
 
         self.last_plr_byte = plr_byte
-        if plr_byte > 0:
-            plr = plr_byte * 100.0 / 256.0
-            # High loss → more coded packets per source (burst), every source
-            if plr >= 40:
-                self._redundancy_every = 1
-                self._coded_burst = max(self.cfg.coded_burst, 4)
-            elif plr >= 25:
-                self._redundancy_every = 1
-                self._coded_burst = max(self.cfg.coded_burst, 3)
-            elif plr >= 12:
-                self._redundancy_every = 1
-                self._coded_burst = max(self.cfg.coded_burst, 2)
-            elif plr >= 5:
-                self._redundancy_every = 1
-                self._coded_burst = max(self.cfg.coded_burst, 1)
-            elif self.cfg.redundancy_every > 0:
-                self._redundancy_every = self.cfg.redundancy_every
-                self._coded_burst = self.cfg.coded_burst
+        plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
+        if plr >= 40:
+            self._redundancy_every = 1
+            self._coded_burst = max(self.cfg.coded_burst, 4)
+        elif plr >= 25:
+            self._redundancy_every = 1
+            self._coded_burst = max(self.cfg.coded_burst, 3)
+        elif plr >= 12:
+            self._redundancy_every = 1
+            self._coded_burst = max(self.cfg.coded_burst, 2)
+        elif plr >= 5:
+            self._redundancy_every = 1
+            self._coded_burst = max(self.cfg.coded_burst, 1)
+        else:
+            # Healthy path: back off to configured light redundancy (save CPU)
+            self._redundancy_every = self.cfg.redundancy_every
+            self._coded_burst = self.cfg.coded_burst
         return removed
 
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytes]:

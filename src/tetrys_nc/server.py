@@ -80,21 +80,21 @@ def run_server(
     if coded_burst <= 0:
         coded_burst = 1
     if wan:
-        # High-loss long-RTT profile: heavy repair (≈1 source + 3 coded)
+        # WAN: start LEAN (CPU+bandwidth). Ramp repair only when PLR/NACK appear.
+        # Previous 1x3 + degree=48 made pure-Python GF the bottleneck (~0.2 MiB/s)
+        # even with plr=0.
         if payload_size >= 8000:
             payload_size = 1350
-        # BDP for ~20MB/s * 150ms ≈ 3MB → ~2200 packets @1350; use 2048
         if max_window < 2048:
             max_window = 2048
-        # Force dense redundancy unless user passed an even denser value
-        if redundancy_every > 1:
-            redundancy_every = 1
-        if coded_burst < 3:
-            coded_burst = 3
-        code_degree = 48
+        if redundancy_every >= 32:
+            # default localhost red is 32; for WAN use light periodic repair
+            redundancy_every = 4
+        if coded_burst <= 1:
+            coded_burst = 1
+        code_degree = 12
         if rate_mbit <= 0:
-            # Total UDP budget; goodput ≈ rate/(1+burst) ≈ 40 Mbit with burst=3
-            rate_mbit = 160.0
+            rate_mbit = 200.0
     else:
         code_degree = 8
 
@@ -239,13 +239,13 @@ def run_server(
                         _print_summary(enc, file_size, elapsed)
                         return 0
 
-                    # Prioritize repair of NACKs / HOL before new data
+                    # Repair only when there are real holes / losses — not on every WAN tick
                     with enc_lock:
                         repairs = enc.pop_nack_retransmit(limit=32 if wan else 4)
                         plr_b = enc.last_plr_byte
                         burst = enc.coded_burst
-                        need_coded = wan or plr_b > 0 or bool(repairs)
-                        n_repair_coded = (burst + 1) if need_coded and (wan or repairs) else 0
+                        need_repair = bool(repairs) or plr_b > 0
+                        n_repair_coded = burst if need_repair else 0
                         coded_repairs = []
                         for _ in range(n_repair_coded):
                             c = enc.make_coded(prefer_oldest=True)
@@ -257,25 +257,34 @@ def run_server(
                     for wire in coded_repairs:
                         send_datagram(wire)
 
-                    # Detect ACK stall → flood oldest repair
+                    # Detect ACK stall → light repair (not a coded flood)
                     cur_ack = ack_progress["ack"]
                     if cur_ack == last_ack_seen:
                         stall_repairs += 1
                     else:
                         stall_repairs = 0
                         last_ack_seen = cur_ack
-                    if stall_repairs >= 3 and not eof:
+                    if stall_repairs >= 5 and not eof:
                         with enc_lock:
                             oldest = enc.oldest_id
                             w = enc.pack_source_id(oldest) if oldest is not None else None
-                            c = enc.make_coded(prefer_oldest=True)
+                            c = (
+                                enc.make_coded(prefer_oldest=True)
+                                if enc.last_plr_byte > 0
+                                else None
+                            )
                         if w:
                             send_datagram(w)
                         if c:
                             send_datagram(c.pack())
 
+                    # Larger batches when the path is healthy (no holes)
+                    cur_batch = batch
+                    if wan and plr_b == 0 and not repairs:
+                        cur_batch = 512
+
                     sent = 0
-                    while not eof and sent < batch:
+                    while not eof and sent < cur_batch:
                         with enc_lock:
                             can = enc.can_accept()
                         if not can:
@@ -402,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="high-loss WAN: payload 1350, window 2048, 1 source + 3 coded, pacing+NACK",
+        help="WAN profile: payload 1350, window 2048, light repair (ramps up on loss)",
     )
     p.add_argument(
         "--rate-mbit",
