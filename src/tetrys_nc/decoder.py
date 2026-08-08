@@ -209,9 +209,10 @@ class TetrysDecoder:
                 sack[i // 8] |= 1 << (i % 8)
             else:
                 missing += 1
-        # Bits beyond observed_end stay 0 but are NOT counted as losses /
-        # and missing_ids() must not request them — truncate sack to span.
+        # Bits beyond span must look "present" so missing_ids() won't NACK them.
         usable_bytes = (span + 7) // 8
+        for i in range(span, usable_bytes * 8):
+            sack[i // 8] |= 1 << (i % 8)
         sack = bytes(sack[:usable_bytes]) if usable_bytes else b""
 
         denom = max(span, 1)

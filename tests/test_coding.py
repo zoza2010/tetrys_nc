@@ -166,26 +166,38 @@ def test_window_update_echo_roundtrip():
     assert 10 not in got.missing_ids()
 
 
-def test_blast_starts_at_max():
+def test_bbr_starts_below_max():
     lim = RateLimiter(50_000_000.0)
-    assert lim.rate == lim.max_rate
-    assert lim.min_rate >= lim.max_rate * 0.3
+    assert lim.rate < lim.max_rate
+    assert lim.min_rate <= lim.max_rate * 0.05
 
 
 def test_loss_does_not_collapse_rate():
-    lim = RateLimiter(50_000_000.0)
-    cc = DelayRateController(lim)
-    before = lim.rate
-    cc.on_loss(120)  # ~47% — must NOT collapse
-    assert lim.rate >= before * 0.99
-    cc.on_loss(220)  # extreme
-    assert lim.rate >= lim.min_rate
-    assert lim.rate >= before * 0.85
-
-
-def test_ack_climbs_toward_max():
     lim = RateLimiter(50_000_000.0, start_bps=20_000_000.0)
-    cc = DelayRateController(lim)
-    for _ in range(30):
-        cc.on_ack(64, plr_byte=100)  # plr ignored for climb
-    assert lim.rate >= 40_000_000.0
+    cc = DelayRateController(lim, payload_size=1350)
+    before = lim.rate
+    cc.on_loss(120)  # ~47% — must NOT change rate
+    assert lim.rate == before
+    cc.on_loss(220)
+    assert lim.rate == before
+
+
+def test_bbr_tracks_delivery_rate():
+    lim = RateLimiter(50_000_000.0, start_bps=5_000_000.0)
+    cc = DelayRateController(lim, payload_size=1000)
+    t0 = cc._sample_t
+    # Simulate ~20 MB/s delivery over several samples
+    import time
+
+    for _ in range(5):
+        time.sleep(0.035)
+        cc.on_ack(700, plr_byte=80)  # 700*1000/0.035 ≈ 20 MB/s
+    assert cc.btlbw > 5_000_000.0
+    assert lim.rate > 5_000_000.0
+    # PLR must not be required for climb
+    assert cc.mode in (
+        DelayRateController.MODE_STARTUP,
+        DelayRateController.MODE_DRAIN,
+        DelayRateController.MODE_PROBE_BW,
+    )
+    del t0

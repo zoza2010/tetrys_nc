@@ -122,28 +122,28 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight = display/cap of unacked sources. WAN blast: open at full window.
+    # flight = BBR cwnd (packets); grows with BtlBw×minRTT, not loss signals
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": max_window if wan else min(4096, max_window),
+        "flight": min(4096, max_window) if wan else min(4096, max_window),
     }
 
-    # Pacing: WAN always; optional explicit --rate-mbit
-    # Slow-start from a fraction of --rate, then delay-based climb (loss ≠ cut rate).
+    # BBR pacing: --rate is ceiling; start below and climb via delivery-rate / RTT
     limiter: RateLimiter | None = None
     delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
         max_bps = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
-        # Blast: open at full --rate (fill the pipe; loss → NACK repair, not backoff)
-        limiter = RateLimiter(max_bps, start_bps=max_bps)
-        delay_cc = DelayRateController(limiter)
+        start_bps = min(max_bps, max(max_bps * 0.25, 8_000_000.0))
+        limiter = RateLimiter(max_bps, start_bps=start_bps)
+        delay_cc = DelayRateController(limiter, payload_size=payload_size)
         print(
-            f"pace BLAST {max_bps / (1024 * 1024):.1f} MiB/s "
-            f"(loss→repair, no rate collapse)"
+            f"pace BBR start {start_bps / (1024 * 1024):.1f} "
+            f"cap {max_bps / (1024 * 1024):.1f} MiB/s "
+            f"(delay+delivery-rate; loss→repair only)"
         )
 
     deadline = time.monotonic() + 600
@@ -196,15 +196,8 @@ def run_server(
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
-                    if wan:
-                        # BLAST: stay at full window; never shrink on loss
-                        ack_progress["flight"] = enc.cfg.max_window
-                    elif delta > 0:
-                        ack_progress["flight"] = min(
-                            enc.cfg.max_window,
-                            max(ack_progress["flight"] + max(delta, 1), 1024),
-                        )
                     if delay_cc is not None:
+                        # PLR ignored for pacing (BBR); still recorded on encoder
                         delay_cc.on_loss(pkt.plr_byte)
                         if delta > 0:
                             delay_cc.on_ack(delta, pkt.plr_byte)
@@ -214,6 +207,14 @@ def run_server(
                             if rtt is not None:
                                 ack_progress["rtt_us"] = rtt
                         ack_progress["echo"] = pkt.echo_ts_us
+                        ack_progress["flight"] = min(
+                            enc.cfg.max_window, delay_cc.target_cwnd_packets()
+                        )
+                    elif delta > 0:
+                        ack_progress["flight"] = min(
+                            enc.cfg.max_window,
+                            max(ack_progress["flight"] + max(delta, 1), 1024),
+                        )
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -277,8 +278,7 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL only when cumulative ACK is stuck for ~1 RTT — NOT on
-                    # every NACK/PLR. Old repair-first mode starved new data.
+                    # HOL: ACK stuck ≥1 RTT → repair only (no more new data debt)
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     with enc_lock:
                         win = enc.window_size
@@ -287,15 +287,21 @@ def run_server(
                             and win > 256
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        # Modest NACK repair; HOL retransmit only when stalled
                         repairs = enc.pop_nack_retransmit(
-                            limit=(256 if stalled else (64 if wan else 4))
+                            limit=(512 if stalled else (128 if wan else 4))
                         )
                         if stalled or win >= enc.cfg.max_window:
                             repairs.extend(enc.retransmit_oldest(limit=512))
                         room = enc.cfg.max_window - enc.window_size
-                    # WAN blast: window is the only admit limit (no flight choke)
-                    n_take = min(batch, max(room, 0))
+
+                    # BBR cwnd: admit new data only within flight target
+                    flight_cap = int(ack_progress["flight"])
+                    flight_room = max(0, flight_cap - win)
+                    if stalled:
+                        n_take = 0
+                    else:
+                        n_take = min(batch, max(room, 0), flight_room)
+
                     chunks: list[bytes] = []
                     for _ in range(n_take):
                         if file_offset >= file_size:
@@ -318,9 +324,13 @@ def run_server(
                                 break
                             wires.append(bytes(enc.add_source(chunk)))
 
-                    # New data first, then repairs (keeps goodput high)
-                    send_batch(wires)
-                    send_batch(repairs)
+                    if stalled:
+                        # Unblock HOL first; new data waits
+                        send_batch(repairs)
+                        send_batch(wires)
+                    else:
+                        send_batch(wires)
+                        send_batch(repairs)
                     sent = len(wires)
 
                     if eof:
@@ -360,11 +370,16 @@ def run_server(
                         cap = (limiter.max_rate / (1024 * 1024)) if limiter else 0
                         rtt_ms = ack_progress["rtt_us"] / 1000.0
                         q_ms = 0.0
-                        ss = ""
+                        mode = ""
+                        bw_m = 0.0
                         if delay_cc is not None:
                             if delay_cc.srtt_us and delay_cc.base_rtt_us:
                                 q_ms = max(0.0, delay_cc.srtt_us - delay_cc.base_rtt_us) / 1000.0
-                            ss = " ss" if delay_cc.slow_start else " ca"
+                            mode = f" {delay_cc.mode}"
+                            bw_m = delay_cc.btlbw / (1024 * 1024)
+                            ack_progress["flight"] = min(
+                                enc.cfg.max_window, delay_cc.target_cwnd_packets()
+                            )
                         flight = int(ack_progress["flight"])
                         print(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
@@ -372,7 +387,8 @@ def run_server(
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
-                            f"pace={pace:.1f}/{cap:.1f}MiB/s{ss} app={rate:.1f} MiB/s"
+                            f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}{mode} "
+                            f"app={rate:.1f} MiB/s"
                             f"{' HOL' if stalled else ''}"
                         )
 
