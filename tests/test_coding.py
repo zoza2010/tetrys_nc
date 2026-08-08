@@ -171,48 +171,51 @@ def test_window_update_echo_roundtrip():
 
 
 def test_sack_release_unpins_window():
-    """SACKed symbols leave the encoder window (works with or without FEC)."""
+    """SACK frees admission (unsacked); with FEC payloads stay until cumack."""
     enc = TetrysEncoder(
         EncoderConfig(max_window=32, redundancy_every=8, payload_size=8)
     )
     for i in range(20):
         enc.add_source(bytes([i]) * 8)
     assert enc.window_size == 20
-    # Receiver delivered 0..4, holds 6..10, missing 5
     held = list(range(6, 11))
     missing = [5]
     enc.apply_feedback(5, plr_byte=40, missing_ids=missing, held_ids=held)
-    assert enc.window_size == 20 - 5 - 5  # freed cumack 0..4 and held 6..10
-    assert 5 in enc._window
+    # cumack freed 0..4; SACK freed admission for 6..10; 5+11..19 still unsacked
+    assert enc.window_size == 10
+    assert enc.coding_size == 15  # payloads 5..19 kept for FEC
+    assert 5 in enc._payloads
+    assert 6 in enc._payloads  # kept for coding
+    assert 6 not in enc._unsacked
     assert 5 in enc._nack_set
-    assert 11 in enc._window
 
 
-def test_coded_contiguous_after_sack_free():
-    """Coded [first,last] must match in-window contiguous run (no sparse mix)."""
+def test_coded_uses_sack_kept_payloads():
+    """With FEC, coded HOL span includes SACKed neighbors (not degree-1 hole)."""
     enc = TetrysEncoder(
         EncoderConfig(max_window=64, redundancy_every=4, payload_size=16, code_degree=8)
     )
     for i in range(30):
         enc.add_source(bytes([i]) * 16)
-    # Cumack 0, hold 1..5 and 10..20, leave holes at 0 and 6..9
     enc.apply_feedback(
         0,
         plr_byte=80,
         missing_ids=[0, 6, 7, 8, 9],
         held_ids=list(range(1, 6)) + list(range(10, 21)),
     )
-    assert 0 in enc._window
-    assert 1 not in enc._window
+    assert 0 in enc._unsacked
+    assert 1 not in enc._unsacked
+    assert 1 in enc._payloads
     pkt = enc.make_coded(prefer_oldest=True)
     assert pkt is not None
-    # Oldest contiguous run is only symbol 0 (gap before 6)
+    # Contiguous coding span from oldest payload (0) for degree 8
     assert pkt.first_source_id == 0
-    assert pkt.last_source_id == 0
+    assert pkt.last_source_id == 7
+    assert pkt.last_source_id - pkt.first_source_id + 1 == 8
 
 
 def test_fec_recovers_with_sack_free_window():
-    """Drop symbols; SACK-free + contiguous coded + retransmit restores file."""
+    """Drop symbols; SACK admission-free + FEC over kept payloads restores file."""
     enc = TetrysEncoder(
         EncoderConfig(max_window=128, redundancy_every=4, payload_size=32, code_degree=8)
     )
@@ -261,6 +264,7 @@ def test_fec_recovers_with_sack_free_window():
     for s, data in dec.pop_deliverable():
         delivered[s] = data
     assert len(delivered) == n
+    assert dec.stats()["recovered"] > 0
     for i, msg in enumerate(messages):
         assert delivered[i] == msg
 

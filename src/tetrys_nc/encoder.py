@@ -17,6 +17,8 @@ _SOURCE_PREFIX = struct.Struct("!BBBBII")
 @dataclass(slots=True)
 class EncoderConfig:
     max_window: int = 8192
+    # Cap on (next_id - cumack) while FEC keeps SACKed payloads for coding.
+    max_coding_span: int = 0  # 0 → 4×max_window
     # 0 = disable periodic coding; else coded every N sources
     redundancy_every: int = 32
     # How many coded packets to emit each redundancy tick
@@ -27,9 +29,22 @@ class EncoderConfig:
 
 
 class TetrysEncoder:
+    """
+    Dual accounting for FASP-like throughput + Tetrys FEC:
+
+    - ``_payloads``: all symbols with id ≥ cumack (coding + retransmit memory)
+    - ``_unsacked``: subset not yet SACKed by receiver (admission / flight)
+
+    SACK frees admission slots without deleting coding payloads (when FEC on),
+    so coded packets still see a contiguous HOL span with known+missing symbols.
+    """
+
     def __init__(self, config: EncoderConfig | None = None) -> None:
         self.cfg = config or EncoderConfig()
-        self._window: OrderedDict[int, bytes] = OrderedDict()
+        if self.cfg.max_coding_span <= 0:
+            self.cfg.max_coding_span = max(self.cfg.max_window * 4, 32768)
+        self._payloads: OrderedDict[int, bytes] = OrderedDict()
+        self._unsacked: set[int] = set()
         self._next_source_id = 0
         self._next_coded_id = 1
         self._sources_since_coded = 0
@@ -38,14 +53,12 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        # NACK queue from receiver SACK holes
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
         self.last_plr_byte = 0
         self._send_ts_us = 0
 
     def stamp(self) -> int:
-        """Refresh send timestamp (monotonic µs, uint32)."""
         self._send_ts_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
         return self._send_ts_us
 
@@ -55,7 +68,12 @@ class TetrysEncoder:
 
     @property
     def window_size(self) -> int:
-        return len(self._window)
+        """In-flight / admission occupancy (unsacked only)."""
+        return len(self._unsacked)
+
+    @property
+    def coding_size(self) -> int:
+        return len(self._payloads)
 
     @property
     def next_source_id(self) -> int:
@@ -63,9 +81,9 @@ class TetrysEncoder:
 
     @property
     def oldest_id(self) -> int | None:
-        if not self._window:
+        if not self._payloads:
             return None
-        return next(iter(self._window))
+        return next(iter(self._payloads))
 
     @property
     def coded_burst(self) -> int:
@@ -75,8 +93,17 @@ class TetrysEncoder:
     def fec_enabled(self) -> bool:
         return self.cfg.redundancy_every > 0
 
+    def _coding_span(self) -> int:
+        if not self._payloads:
+            return 0
+        return self._next_source_id - self._cumulative_ack
+
     def can_accept(self) -> bool:
-        return len(self._window) < self.cfg.max_window
+        if len(self._unsacked) >= self.cfg.max_window:
+            return False
+        if self._coding_span() >= self.cfg.max_coding_span:
+            return False
+        return True
 
     def add_source(self, payload: bytes) -> bytearray:
         """Pack SOURCE into an owned bytearray (mutable for late timestamp stamp)."""
@@ -93,7 +120,8 @@ class TetrysEncoder:
 
         sid = self._next_source_id
         self._next_source_id += 1
-        self._window[sid] = payload
+        self._payloads[sid] = payload
+        self._unsacked.add(sid)
         self._sources_since_coded += 1
         self._total_sent_source += 1
 
@@ -104,8 +132,7 @@ class TetrysEncoder:
         return wire
 
     def maybe_coded(self) -> list[bytes]:
-        """Return 0..N packed coded packets according to redundancy schedule."""
-        if self._redundancy_every <= 0 or not self._window:
+        if self._redundancy_every <= 0 or not self._payloads:
             return []
         if self._sources_since_coded < self._redundancy_every:
             return []
@@ -113,9 +140,9 @@ class TetrysEncoder:
         return self.emit_coded(self._coded_burst)
 
     def emit_coded(self, n: int = 1) -> list[bytes]:
-        """Force N coded packets over the oldest contiguous HOL run."""
+        """Force N coded packets over the oldest coding span (HOL)."""
         out: list[bytes] = []
-        if n <= 0 or not self._window:
+        if n <= 0 or not self._payloads:
             return out
         for _ in range(n):
             pkt = self.make_coded(prefer_oldest=True)
@@ -124,58 +151,39 @@ class TetrysEncoder:
             out.append(pkt.pack())
         return out
 
-    def _oldest_contiguous(self, degree: int) -> list[tuple[int, bytes]]:
-        """
-        Longest contiguous run starting at the oldest in-window symbol, capped
-        at degree. After SACK-free the window is sparse; coding MUST only mix
-        ids that are still present so [first,last] matches encoder terms
-        (decoder assumes every id in the span participates).
-        """
-        if not self._window or degree <= 0:
-            return []
-        start = next(iter(self._window))
-        chosen: list[tuple[int, bytes]] = [(start, self._window[start])]
-        for sid in range(start + 1, start + degree):
-            data = self._window.get(sid)
-            if data is None:
-                break
-            chosen.append((sid, data))
-        return chosen
-
     def make_coded(self, prefer_oldest: bool = True) -> CodedPacket | None:
         """
-        Build coded packet over the elastic window.
-        WAN/HOL: contiguous oldest run (safe with SACK-free sparse window).
+        Contiguous mix over ``_payloads`` (includes SACKed-but-not-cumack'd).
+        Decoder subtracts symbols it already holds → equations on the holes.
+        Skip degree-1 when that symbol is still unsacked (SOURCE retransmit is enough).
         """
-        if not self._window:
+        if not self._payloads:
             return None
-        degree = min(self.cfg.code_degree, len(self._window))
+        degree = min(self.cfg.code_degree, len(self._payloads))
         if prefer_oldest:
-            chosen = self._oldest_contiguous(degree)
+            start = next(iter(self._payloads))
+            chosen: list[tuple[int, bytes]] = []
+            for sid in range(start, start + degree):
+                data = self._payloads.get(sid)
+                if data is None:
+                    break
+                chosen.append((sid, data))
         else:
-            items = list(self._window.items())
-            chosen = items[-degree:]
-            # Newest path may be sparse too — keep contiguous from first chosen.
-            if len(chosen) >= 2:
-                base = chosen[0][0]
-                contig = [(base, self._window[base])]
-                for sid in range(base + 1, chosen[-1][0] + 1):
-                    data = self._window.get(sid)
-                    if data is None:
-                        break
-                    contig.append((sid, data))
-                chosen = contig[:degree]
+            items = list(self._payloads.items())[-degree:]
+            chosen = items
         if not chosen:
             return None
+        # Degree-1 over an unsacked symbol ≡ redundant SOURCE — don't waste rate.
+        if len(chosen) == 1 and chosen[0][0] in self._unsacked:
+            return None
+
         first, last = chosen[0][0], chosen[-1][0]
         cid = self._next_coded_id
         self._next_coded_id += 1
-
         terms = [
             (gf256.vandermonde_coef(sid + 1, cid), data) for sid, data in chosen
         ]
         payload = gf256.linear_combine(terms, self.cfg.payload_size)
-
         self._total_sent_coded += 1
         return CodedPacket(cid, first, last, payload, send_ts_us=self.stamp())
 
@@ -189,26 +197,28 @@ class TetrysEncoder:
         if cumulative_ack > self._cumulative_ack:
             self._cumulative_ack = cumulative_ack
         removed = 0
-        while self._window and next(iter(self._window)) < self._cumulative_ack:
-            sid, _ = self._window.popitem(last=False)
+        while self._payloads and next(iter(self._payloads)) < self._cumulative_ack:
+            sid, _ = self._payloads.popitem(last=False)
+            self._unsacked.discard(sid)
             self._nack_set.discard(sid)
             removed += 1
 
-        # Free SACKed symbols so they don't pin admission. Coded packets only
-        # mix contiguous in-window runs, so gaps from SACK-free are safe.
+        # SACK: free admission slot; keep payload for FEC until cumack (if FEC on).
         if held_ids:
             for sid in held_ids:
-                if self._window.pop(sid, None) is not None:
+                if sid in self._unsacked:
+                    self._unsacked.discard(sid)
                     self._nack_set.discard(sid)
                     removed += 1
+                if not self.fec_enabled and sid in self._payloads:
+                    del self._payloads[sid]
 
         if missing_ids:
             for sid in missing_ids:
-                if sid in self._window and sid not in self._nack_set:
+                if sid in self._payloads and sid not in self._nack_set:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
 
-        # Adaptive FEC around configured base. Loss → denser coded over HOL.
         self.last_plr_byte = plr_byte
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
         base_red = self.cfg.redundancy_every
@@ -216,10 +226,10 @@ class TetrysEncoder:
             self._redundancy_every = 0
             self._coded_burst = 1
         elif plr >= 25:
-            self._redundancy_every = max(3, base_red // 2)
+            self._redundancy_every = max(4, base_red // 2)
             self._coded_burst = max(self.cfg.coded_burst, 2)
         elif plr >= 10:
-            self._redundancy_every = max(4, min(base_red, 6))
+            self._redundancy_every = max(6, min(base_red, 8))
             self._coded_burst = max(self.cfg.coded_burst, 1)
         else:
             self._redundancy_every = base_red
@@ -227,7 +237,6 @@ class TetrysEncoder:
         return removed
 
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
-        """Pack SOURCE packets for NACKed ids still in the window."""
         out: list[bytearray] = []
         while self._nack_q and len(out) < limit:
             sid = self._nack_q.popleft()
@@ -238,25 +247,25 @@ class TetrysEncoder:
         return out
 
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
-        """
-        Retransmit the oldest unacked SOURCE symbols (HOL frontier).
-        This is what unblocks the receiver when the window is full of
-        future data waiting on early holes — better than coded spam alone.
-        """
+        """Retransmit oldest *unsacked* symbols (HOL holes + unconfirmed)."""
         out: list[bytearray] = []
-        if limit <= 0 or not self._window:
+        if limit <= 0 or not self._unsacked:
             return out
-        for sid in list(self._window.keys())[:limit]:
+        for sid in self._payloads:
+            if sid not in self._unsacked:
+                continue
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                if len(out) >= limit:
+                    break
         return out
 
     def get_source(self, symbol_id: int) -> bytes | None:
-        return self._window.get(symbol_id)
+        return self._payloads.get(symbol_id)
 
     def pack_source_id(self, symbol_id: int) -> bytearray | None:
-        payload = self._window.get(symbol_id)
+        payload = self._payloads.get(symbol_id)
         if payload is None:
             return None
         wire = bytearray(SOURCE_HDR_SIZE + len(payload))
@@ -264,9 +273,15 @@ class TetrysEncoder:
         wire[SOURCE_HDR_SIZE:] = payload
         return wire
 
+    # Compat alias used by older tests / call sites
+    @property
+    def _window(self) -> OrderedDict[int, bytes]:
+        return self._payloads
+
     def stats(self) -> dict:
         return {
-            "window": len(self._window),
+            "window": len(self._unsacked),
+            "coding": len(self._payloads),
             "next_source_id": self._next_source_id,
             "sent_source": self._total_sent_source,
             "sent_coded": self._total_sent_coded,

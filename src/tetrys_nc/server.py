@@ -109,6 +109,7 @@ def run_server(
     enc = TetrysEncoder(
         EncoderConfig(
             max_window=max_window,
+            max_coding_span=max(max_window * 4, 65536),
             redundancy_every=redundancy_every,
             coded_burst=coded_burst,
             payload_size=payload_size,
@@ -309,10 +310,10 @@ def run_server(
                                     limit=max(128, repair_n - len(repairs))
                                 )
                             )
-                        # Extra coded repair over HOL frontier when FEC is on.
+                        # Modest coded repair over HOL (known+missing mix) — not a flood.
                         coded_repair: list[bytes] = []
                         if holey and enc.fec_enabled:
-                            n_coded = 64 if stalled else 16
+                            n_coded = 8 if stalled else 4
                             coded_repair = enc.emit_coded(n_coded)
                         room = enc.cfg.max_window - enc.window_size
 
@@ -376,7 +377,7 @@ def run_server(
                                 tail = enc.retransmit_oldest(limit=256)
                                 tail.extend(enc.pop_nack_retransmit(limit=128))
                                 if enc.fec_enabled:
-                                    tail.extend(enc.emit_coded(32))
+                                    tail.extend(enc.emit_coded(8))
                             send_batch(tail)
                             time.sleep(0.00005)
                     elif sent == 0:
@@ -384,7 +385,7 @@ def run_server(
                             tail = enc.retransmit_oldest(limit=256)
                             tail.extend(enc.pop_nack_retransmit(limit=128))
                             if enc.fec_enabled:
-                                tail.extend(enc.emit_coded(32))
+                                tail.extend(enc.emit_coded(8))
                         send_batch(tail)
 
                     now = time.monotonic()
@@ -416,7 +417,8 @@ def run_server(
                         flight = int(ack_progress["flight"])
                         print(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
-                            f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
+                            f"win={st['window']}/{flight} coding={st.get('coding', st['window'])} "
+                            f"ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
