@@ -1,4 +1,4 @@
-"""BBR-style pacing for lossy WAN: delay + delivery-rate; loss ≠ congestion."""
+"""Delay-based pacing (BBR-like): queue delay steers rate; loss ≠ congestion."""
 
 from __future__ import annotations
 
@@ -16,18 +16,18 @@ class RateLimiter:
         burst: float | None = None,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # FASP-like: stay hot; only delay (not loss) may ease slightly
-        self.min_rate = min(self.max_rate, max(self.max_rate * 0.5, 16_000_000.0))
+        # Allow real drain when RTT blows up (was 50% floor → stuck at 64 MiB/s)
+        self.min_rate = min(self.max_rate, max(self.max_rate * 0.08, 4_000_000.0))
         if start_bps is None:
-            start_bps = self.max_rate
+            start_bps = min(self.max_rate, max(self.max_rate * 0.35, 12_000_000.0))
         self.rate = min(self.max_rate, max(start_bps, self.min_rate))
-        self.burst = burst if burst is not None else max(self.rate * 0.1, 400_000.0)
+        self.burst = burst if burst is not None else max(self.rate * 0.08, 200_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.1, 400_000.0)
+        self.burst = max(self.rate * 0.08, 200_000.0)
 
     def consume(self, nbytes: int) -> None:
         now = time.monotonic()
@@ -44,21 +44,17 @@ class RateLimiter:
 
 class DelayRateController:
     """
-    BBR-ish controller tuned for shallow-buffer WAN (iperf-like):
+    Delay-based controller (loss ignored for pacing):
 
-    - Loss/PLR never cuts pacing (repair is separate)
-    - BtlBw from cumulative-ACK delivery rate (max filter + peak hold)
-    - min_RTT ignores the first noisy samples (startup queue spike)
-    - Drain only on clear standing queue (RTT ≫ min_RTT)
-    - cwnd floored so a ~80ms path can carry hundreds of Mbit/s
+    - Track min_RTT (skip first noisy echoes)
+    - Estimate delivery rate from cumulative ACK
+    - Standing queue (srtt − min_rtt) → cut toward delivery rate
+    - Clear path → climb toward --rate
     """
 
     MODE_STARTUP = "Startup"
     MODE_DRAIN = "Drain"
     MODE_PROBE_BW = "ProbeBW"
-
-    # Milder than classic BBR — 0.75 drains killed goodput on this path
-    _PROBE_GAINS = (1.25, 1.0, 1.0, 1.0, 0.9, 1.0, 1.0, 1.0)
 
     __slots__ = (
         "limiter",
@@ -76,10 +72,6 @@ class DelayRateController:
         "_sample_t",
         "_sample_delivered",
         "_bw_filter",
-        "_full_bw",
-        "_full_bw_count",
-        "_cycle_idx",
-        "_cycle_t",
         "_rtt_warmup",
         "_min_rtt_stamp",
     )
@@ -105,15 +97,10 @@ class DelayRateController:
         self._sample_t = time.monotonic()
         self._sample_delivered = 0.0
         self._bw_filter: deque[tuple[float, float]] = deque()
-        self._full_bw = 0.0
-        self._full_bw_count = 0
-        self._cycle_idx = 0
-        self._cycle_t = time.monotonic()
-        self._rtt_warmup = 0  # skip first echoes for min_rtt
+        self._rtt_warmup = 0
         self._min_rtt_stamp = time.monotonic()
 
     def on_loss(self, plr_byte: int) -> None:
-        """Loss is NOT congestion — ignore for pacing."""
         return
 
     def on_ack(self, acked: int, plr_byte: int = 0) -> None:
@@ -136,7 +123,6 @@ class DelayRateController:
         if now_us is None:
             now_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
         rtt = (now_us - echo_ts_us) & 0xFFFFFFFF
-        # Discard absurd samples (startup stamp skew / wrap)
         if rtt < 1_000 or rtt > 2_000_000:
             return None
 
@@ -145,14 +131,13 @@ class DelayRateController:
         self.samples += 1
         self._rtt_warmup += 1
 
-        # First echoes often include sender queue — don't poison min_rtt
-        if self._rtt_warmup >= 4:
+        # min_RTT: ignore first echoes; also ignore extreme spikes for baseline
+        if self._rtt_warmup >= 4 and rtt < 250_000:
             if self.base_rtt_us is None or rtt < self.base_rtt_us:
                 self.base_rtt_us = float(rtt)
                 self._min_rtt_stamp = now
             elif now - self._min_rtt_stamp > 10.0:
-                # slowly allow min_rtt to rise if path changed
-                self.base_rtt_us = min(self.base_rtt_us * 1.05, float(rtt))
+                self.base_rtt_us = min(self.base_rtt_us * 1.02, float(rtt))
                 self._min_rtt_stamp = now
 
         if self.srtt_us is None:
@@ -165,19 +150,18 @@ class DelayRateController:
         return float(rtt)
 
     def target_cwnd_packets(self) -> int:
-        """Inflight ≈ several BDPs at cap — fill the pipe (FASP-style)."""
         min_rtt = self.base_rtt_us or self.srtt_us or 80_000.0
-        bdp = self.limiter.max_rate * (min_rtt / 1_000_000.0) / self.payload_size
-        gain = 4.0 if self.mode != self.MODE_DRAIN else 2.5
-        return max(8192, int(bdp * gain))
+        bw = max(self.limiter.rate, self.btlbw, self.peak_bw * 0.5)
+        bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
+        gain = 2.0 if self.mode != self.MODE_DRAIN else 1.25
+        return max(2048, int(bdp * gain))
 
     def _offer_bw(self, now: float, sample_bps: float) -> None:
         if sample_bps <= 0:
             return
         self._bw_filter.append((now, sample_bps))
         min_rtt_s = (self.base_rtt_us or 80_000.0) / 1_000_000.0
-        # Longer filter — HOL makes short windows too pessimistic
-        horizon = min(15.0, max(2.0, 12.0 * min_rtt_s))
+        horizon = min(8.0, max(1.5, 8.0 * min_rtt_s))
         while self._bw_filter and now - self._bw_filter[0][0] > horizon:
             self._bw_filter.popleft()
         self.btlbw = max(s for _, s in self._bw_filter)
@@ -189,42 +173,57 @@ class DelayRateController:
             return 0.0
         return max(0.0, self.srtt_us - self.base_rtt_us)
 
-    def _queue_ratio(self) -> float:
-        if not self.base_rtt_us or not self.srtt_us:
-            return 1.0
-        return self.srtt_us / self.base_rtt_us
-
     def _update_pacing(self, now: float) -> None:
-        """
-        FASP-like: run at --rate unless standing queue is large.
-        Delivery-rate samples update btlbw/peak for logs & cwnd only.
-        Loss never cuts pacing.
-        """
-        q = self._queue_ratio()
         q_us = self._queue_us()
-        heavy_queue = q > 1.6 and q_us > 50_000
+        bw = self.btlbw if self.btlbw > 0 else 0.0
+        floor = self.limiter.min_rate
 
         if self.mode == self.MODE_STARTUP:
             self.slow_start = True
-            self.limiter.set_rate(self.limiter.max_rate)
-            if self.samples >= 8:
-                self.mode = self.MODE_DRAIN if heavy_queue else self.MODE_PROBE_BW
+            if q_us > 25_000:
+                self.mode = self.MODE_DRAIN
+                self.slow_start = False
+                target = max(floor, bw * 0.9) if bw > 0 else self.limiter.rate * 0.5
+                self.limiter.set_rate(target)
+                return
+            self.limiter.set_rate(
+                min(self.limiter.max_rate, max(self.limiter.rate * 1.3, self.limiter.rate + 2_000_000))
+            )
+            if self.limiter.rate >= self.limiter.max_rate * 0.95 and self.samples >= 6:
+                self.mode = self.MODE_PROBE_BW
                 self.slow_start = False
             return
 
-        if heavy_queue:
+        # Real drain: match delivery rate when we built a standing queue
+        if q_us > 40_000:
             self.mode = self.MODE_DRAIN
             self.slow_start = False
-            # Mild ease only — still keep the pipe busy
-            self.limiter.set_rate(self.limiter.max_rate * 0.9)
+            if bw > 0:
+                target = bw * 0.85
+            else:
+                target = self.limiter.rate * 0.7
+            self.limiter.set_rate(max(floor, min(self.limiter.max_rate, target)))
             return
 
+        if q_us > 15_000:
+            self.mode = self.MODE_PROBE_BW
+            self.slow_start = False
+            if bw > 0:
+                target = min(self.limiter.rate, max(bw * 1.05, floor))
+            else:
+                target = self.limiter.rate * 0.95
+            self.limiter.set_rate(max(floor, min(self.limiter.max_rate, target)))
+            return
+
+        # Clear path — climb (loss ignored)
         self.mode = self.MODE_PROBE_BW
         self.slow_start = False
-        # Probe slightly above measured peak toward cap (never below min_rate)
-        peak = max(self.peak_bw, self.btlbw, self.limiter.min_rate)
-        target = min(self.limiter.max_rate, max(peak * 1.15, self.limiter.max_rate * 0.95))
-        self.limiter.set_rate(target)
+        self.limiter.set_rate(
+            min(
+                self.limiter.max_rate,
+                max(self.limiter.rate * 1.08, self.limiter.rate + 1_000_000.0),
+            )
+        )
 
     def stats(self) -> dict:
         return {

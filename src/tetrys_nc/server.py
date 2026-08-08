@@ -61,16 +61,16 @@ def run_server(
     if coded_burst <= 0:
         coded_burst = 1
     if wan:
-        # WAN: ~10% proactive FEC (iperf ~6% loss) over HOL frontier + light NACK.
+        # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
             payload_size = 1350
         if max_window < 16384:
             max_window = 16384
         if redundancy_every >= 32:
-            redundancy_every = 8  # every 8 sources → ~12% coded
+            redundancy_every = 0
         if coded_burst <= 1:
             coded_burst = 1
-        code_degree = 12  # mix oldest 12 — recovers single HOL holes
+        code_degree = 8
         if rate_mbit <= 0:
             rate_mbit = 200.0
     else:
@@ -116,26 +116,28 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight = several BDPs; WAN opens wide (FASP fill)
+    # flight ≈ BDP×gain from delay CC
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": min(16384, max_window),
+        "flight": min(4096, max_window),
     }
 
-    # FASP-like BBR: start at --rate; loss → FEC/NACK, not rate collapse
+    # Delay-BBR: climb toward --rate; standing queue cuts rate; loss → NACK only
     limiter: RateLimiter | None = None
     delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
         max_bps = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
-        limiter = RateLimiter(max_bps, start_bps=max_bps)
+        start_bps = min(max_bps, max(max_bps * 0.35, 12_000_000.0))
+        limiter = RateLimiter(max_bps, start_bps=start_bps)
         delay_cc = DelayRateController(limiter, payload_size=payload_size)
         print(
-            f"pace FASP/BBR {max_bps / (1024 * 1024):.1f} MiB/s "
-            f"(fill pipe; FEC+NACK repair; delay-only ease)"
+            f"pace BBR start {start_bps / (1024 * 1024):.1f} "
+            f"cap {max_bps / (1024 * 1024):.1f} MiB/s "
+            f"(delay steers rate; loss→NACK only)"
         )
 
     deadline = time.monotonic() + 600
@@ -273,7 +275,7 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL stall → extra coded over oldest; keep new data flowing otherwise
+                    # HOL: ACK stuck → prioritized SOURCE repair; no coded flood
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     with enc_lock:
                         win = enc.window_size
@@ -282,28 +284,23 @@ def run_server(
                             and win > 256
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        # Cap reactive SOURCE repair (~8% wire); FEC does the heavy lifting
-                        repair_n = 96 if stalled else (48 if wan else 4)
+                        repair_n = 128 if stalled else (32 if wan else 4)
                         repairs = enc.pop_nack_retransmit(limit=repair_n)
-                        if stalled:
+                        if stalled or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(16, repair_n - len(repairs))
+                                    limit=max(32, repair_n - len(repairs))
                                 )
                             )
-                            repairs.extend(enc.emit_coded(4))
                         room = enc.cfg.max_window - enc.window_size
 
                     flight_cap = max(int(ack_progress["flight"]), win)
-                    if wan:
-                        # Prefer filling toward full client window
-                        flight_cap = max(flight_cap, min(enc.cfg.max_window, 16384))
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
-                    # Even when stalled, drip new data if there is room (FASP)
-                    n_take = min(batch, max(room, 0), flight_room)
                     if stalled:
-                        n_take = min(n_take, batch // 4)
+                        n_take = 0
+                    else:
+                        n_take = min(batch, max(room, 0), flight_room)
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -326,9 +323,10 @@ def run_server(
                             if not enc.can_accept():
                                 break
                             wires.append(bytes(enc.add_source(chunk)))
-                            wires.extend(enc.maybe_coded())
+                            # maybe_coded only if --redundancy > 0
+                            for cw in enc.maybe_coded():
+                                wires.append(cw)
 
-                    # New+FEC first; small NACK after (not repair-flood)
                     if stalled:
                         send_batch(repairs)
                         send_batch(wires)
@@ -352,16 +350,14 @@ def run_server(
                             send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                tail = enc.emit_coded(8)
+                                tail = enc.retransmit_oldest(limit=128)
                                 tail.extend(enc.pop_nack_retransmit(limit=64))
-                                tail.extend(enc.retransmit_oldest(limit=64))
                             send_batch(tail)
                             time.sleep(0.0002)
                     elif sent == 0:
                         with enc_lock:
-                            tail = enc.emit_coded(4)
+                            tail = enc.retransmit_oldest(limit=128)
                             tail.extend(enc.pop_nack_retransmit(limit=64))
-                            tail.extend(enc.retransmit_oldest(limit=64))
                         send_batch(tail)
 
                     now = time.monotonic()
@@ -444,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, FASP/BBR pacing, ~12%% HOL FEC + light NACK",
+        help="WAN: payload 1350, delay-BBR pacing, NACK/HOL repair (no FEC)",
     )
     p.add_argument(
         "--rate-mbit",

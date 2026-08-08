@@ -166,31 +166,35 @@ def test_window_update_echo_roundtrip():
     assert 10 not in got.missing_ids()
 
 
-def test_fasp_starts_at_cap():
+def test_bbr_starts_below_cap():
     lim = RateLimiter(50_000_000.0)
-    assert lim.rate == lim.max_rate
-    assert lim.min_rate >= lim.max_rate * 0.45
+    assert lim.rate < lim.max_rate
+    assert lim.min_rate <= lim.max_rate * 0.15
 
 
 def test_loss_does_not_collapse_rate():
-    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
+    lim = RateLimiter(50_000_000.0, start_bps=20_000_000.0)
     cc = DelayRateController(lim, payload_size=1350)
     before = lim.rate
-    cc.on_loss(120)  # ~47% — must NOT change rate
+    cc.on_loss(120)
     assert lim.rate == before
     cc.on_loss(220)
     assert lim.rate == before
 
 
-def test_bbr_tracks_delivery_and_keeps_pipe_full():
-    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
+def test_bbr_drains_on_standing_queue():
+    lim = RateLimiter(50_000_000.0, start_bps=40_000_000.0)
     cc = DelayRateController(lim, payload_size=1000)
     import time
 
-    for _ in range(5):
+    for _ in range(4):
         time.sleep(0.055)
-        cc.on_ack(1200, plr_byte=80)
-    assert cc.btlbw > 10_000_000.0
-    # FASP: still near cap despite lossy ACKs
-    assert lim.rate >= lim.max_rate * 0.9
-    assert cc.target_cwnd_packets() >= 8192
+        cc.on_ack(800, plr_byte=40)
+    # Establish min_rtt ~80ms then a large queue via high srtt
+    cc.base_rtt_us = 80_000.0
+    cc.srtt_us = 200_000.0  # 120ms standing queue
+    cc.mode = DelayRateController.MODE_PROBE_BW
+    cc.slow_start = False
+    cc._update_pacing(time.monotonic())
+    assert cc.mode == DelayRateController.MODE_DRAIN
+    assert lim.rate < 40_000_000.0
