@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -14,6 +15,9 @@ class DecoderConfig:
     max_decode_window: int = 4096
     feedback_every_packets: int = 256
     delivered_cache: int = 4096
+    # Ignore gaps younger than this when computing PLR (reorder tolerance).
+    # SACK bits stay truthful; only PLR uses aged holes.
+    reorder_s: float = 0.0
 
 
 @dataclass
@@ -33,6 +37,8 @@ class TetrysDecoder:
     highest_seen: int = -1
     total_symbols: int | None = None
     payload_size: int = 32768
+    # sid -> monotonic time when gap was first observed
+    _gap_t: dict[int, float] = field(default_factory=dict)
 
     def _known(self, sid: int) -> bytes | None:
         got = self._symbols.get(sid)
@@ -49,13 +55,12 @@ class TetrysDecoder:
         self._packets_since_feedback += 1
         self._total_source_rx += 1
         self._note_seen(sid)
+        self._gap_t.pop(sid, None)
         if sid < self.next_deliver or sid in self._symbols:
             return []
 
-        # Own the bytes — callers may pass a view into a reused buffer.
         payload_b = payload if isinstance(payload, bytes) else bytes(payload)
 
-        # Lossless in-order path: no cache, no equations
         if sid == self.next_deliver and not self._equations and not self._symbols:
             self.next_deliver = sid + 1
             return [(sid, payload_b)]
@@ -81,7 +86,6 @@ class TetrysDecoder:
             if known is not None:
                 gf256.mul_bytes(coef, known, payload)
             elif sid < self.next_deliver:
-                # Need delivered cache for late coded packets
                 return []
             else:
                 coefs[sid] = coef
@@ -126,6 +130,7 @@ class TetrysDecoder:
                         self._symbols[sid] = bytes(
                             gf256.scale_bytes(gf256.inv(coef), payload)
                         )
+                        self._gap_t.pop(sid, None)
                         self._total_recovered += 1
                         progress = True
                     continue
@@ -168,35 +173,37 @@ class TetrysDecoder:
         out: list[tuple[int, bytes]] = []
         while self.next_deliver in self._symbols:
             data = self._symbols.pop(self.next_deliver)
-            # Cache only when coding/recovery is active
+            self._gap_t.pop(self.next_deliver, None)
             if self._equations or self._total_recovered:
                 self._cache_delivered(self.next_deliver, data)
             out.append((self.next_deliver, data))
             self.next_deliver += 1
+        if self._gap_t:
+            stale = [g for g in self._gap_t if g < self.next_deliver]
+            for g in stale:
+                del self._gap_t[g]
         return out
 
     def has_holes(self) -> bool:
-        """True if we hold future symbols while waiting on next_deliver."""
         return bool(self._symbols) or bool(self._equations)
 
     def need_feedback(self) -> bool:
-        # Feedback ASAP when HOL-blocked — critical on lossy WAN
         if self.has_holes() and self._packets_since_feedback >= 8:
             return True
         return self._packets_since_feedback >= self.cfg.feedback_every_packets
 
     def build_feedback(self, sack_bits: int = 256) -> WindowUpdatePacket:
         """
-        SACK/PLR only cover symbols we have *evidence* were sent
-        (up to highest_seen). Counting not-yet-sent ids as losses
-        falsely reports ~100% PLR and collapses sender pacing.
+        SACK bits are truthful (held vs absent).
+
+        PLR / nb_missing count only *aged* gaps (older than reorder_s) so
+        reordering is not reported as loss. Server still sees raw SACK zeros
+        and applies its own delayed-NACK timer before retransmit.
         """
         self._packets_since_feedback = 0
         base = self.next_deliver
-        # End of observed range (inclusive). If nothing seen ahead, no holes.
         observed_end = max(self.highest_seen, base - 1)
         span = max(0, observed_end - base + 1)
-        # Extended SACK: up to 65535 bits (~8KiB) — covers a full WAN window.
         sack_bits = min(max(sack_bits, 0), 65535)
         span = min(span, sack_bits)
         if self.total_symbols is not None:
@@ -204,21 +211,28 @@ class TetrysDecoder:
 
         n_bytes = (span + 7) // 8 if span > 0 else 0
         sack = bytearray(n_bytes)
-        missing = 0
+        now = time.monotonic()
+        reorder_s = max(0.0, self.cfg.reorder_s)
+        missing_aged = 0
         for i in range(span):
             sid = base + i
             if sid in self._symbols:
                 sack[i // 8] |= 1 << (i % 8)
+                self._gap_t.pop(sid, None)
             else:
-                missing += 1
-        # Leave unused high bits in the last byte as 0; sack_span gates them.
+                t0 = self._gap_t.get(sid)
+                if t0 is None:
+                    self._gap_t[sid] = now
+                    t0 = now
+                if reorder_s <= 0.0 or (now - t0) >= reorder_s:
+                    missing_aged += 1
 
         denom = max(span, 1)
-        plr_pct = min(100.0, 100.0 * missing / denom) if span > 0 else 0.0
+        plr_pct = min(100.0, 100.0 * missing_aged / denom) if span > 0 else 0.0
         plr_byte = int(plr_pct * 256 / 100)
         return WindowUpdatePacket(
             cumulative_ack=self.next_deliver,
-            nb_missing_src=missing,
+            nb_missing_src=missing_aged,
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
             sack=bytes(sack),
@@ -239,4 +253,5 @@ class TetrysDecoder:
             "source_rx": self._total_source_rx,
             "coded_rx": self._total_coded_rx,
             "recovered": self._total_recovered,
+            "gaps": len(self._gap_t),
         }
