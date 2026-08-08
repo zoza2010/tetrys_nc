@@ -52,7 +52,7 @@ def run_server(
     skip_hash: bool = False,
     wan: bool = False,
     rate_mbit: float = 0.0,
-    reorder_ms: float | None = None,
+    reorder_ms: float = 0.0,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
@@ -61,8 +61,6 @@ def run_server(
 
     if coded_burst <= 0:
         coded_burst = 1
-    if reorder_ms is None:
-        reorder_ms = 20.0 if wan else 0.0
     if wan:
         # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
@@ -290,14 +288,9 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # Promote aged gaps → NACK; only stall-path uses retransmit_oldest.
+                    # HOL holes → repair gets the pipe; new data only if room remains.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
-                    # Adapt reorder wait: at least configured, up to 0.2×RTT (cap 50ms).
-                    if float(reorder_ms) > 0 and ack_progress["rtt_us"] > 0:
-                        enc.reorder_s = max(
-                            float(reorder_ms) / 1000.0,
-                            min(0.05, 0.2 * rtt_s),
-                        )
+                    plr = int(ack_progress["plr"])
                     with enc_lock:
                         enc.promote_delayed_nacks()
                         win = enc.window_size
@@ -307,18 +300,16 @@ def run_server(
                             and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        if stalled:
-                            repair_n = 512
-                        elif nack_pending > 0:
-                            repair_n = 256
+                        holey = wan and (stalled or nack_pending > 0 or plr >= 16)
+                        if holey:
+                            repair_n = 2048 if stalled else 1024
                         else:
-                            repair_n = 64 if wan else 4
+                            repair_n = 128 if wan else 4
                         repairs = enc.pop_nack_retransmit(limit=repair_n)
-                        # Bypass reorder delay only on true HOL stall / full window.
-                        if stalled or win >= enc.cfg.max_window:
+                        if holey or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(64, repair_n - len(repairs))
+                                    limit=max(128, repair_n - len(repairs))
                                 )
                             )
                         room = enc.cfg.max_window - enc.window_size
@@ -327,8 +318,9 @@ def run_server(
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    if stalled:
-                        n_take = min(n_take, max(256, batch // 4))
+                    # While repairing holes, throttle new admits — keep pipe on frontier.
+                    if holey and repairs:
+                        n_take = min(n_take, max(64, batch // 8))
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -355,7 +347,8 @@ def run_server(
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
-                    if stalled:
+                    # Repair first whenever holes exist (unblocks cumack / window).
+                    if holey:
                         send_batch(repairs)
                         send_batch(wires)
                     else:
@@ -419,8 +412,7 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
-                            f"nack={st['nack_q']}+{st.get('nack_pending', 0)} "
-                            f"plr={st['plr_byte']} "
+                            f"nack={st['nack_q']}+{st.get('nack_pending', 0)} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
                             f"app={rate:.1f} MiB/s"
@@ -483,8 +475,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--reorder-ms",
         type=float,
-        default=None,
-        help="delay before NACK retransmit (default: 20 WAN / 0 LAN); absorbs OOOrder",
+        default=0.0,
+        help="delay NACK retransmit by N ms to absorb reordering (0=off, default)",
     )
     args = p.parse_args(argv)
     return run_server(

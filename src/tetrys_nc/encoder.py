@@ -38,14 +38,14 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        # NACK queue from receiver SACK holes (after reorder delay)
+        # NACK queue from receiver SACK holes
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
-        # sid -> first time reported missing (reorder tolerance)
+        # Optional delayed NACK (--reorder-ms): sid -> first-seen missing time
         self._pending_nack: dict[int, float] = {}
+        self.reorder_s: float = 0.0
         self.last_plr_byte = 0
         self._send_ts_us = 0
-        self.reorder_s = 0.0
 
     def stamp(self) -> int:
         """Refresh send timestamp (monotonic µs, uint32)."""
@@ -174,8 +174,6 @@ class TetrysEncoder:
                     self._nack_set.discard(sid)
                     removed += 1
 
-        # Missing bits → suspect loss. Promote to NACK only after reorder_s
-        # (RACK-style: gap ≠ loss until it ages). reorder_s=0 → immediate.
         if missing_ids:
             now = time.monotonic()
             for sid in missing_ids:
@@ -208,11 +206,11 @@ class TetrysEncoder:
         return removed
 
     def promote_delayed_nacks(self) -> int:
-        """Move aged pending gaps into the NACK retransmit queue."""
+        """Move gaps older than reorder_s into the NACK queue. No-op if reorder_s=0."""
         if self.reorder_s <= 0 or not self._pending_nack:
             return 0
         now = time.monotonic()
-        promoted = 0
+        n = 0
         for sid, t0 in list(self._pending_nack.items()):
             if now - t0 < self.reorder_s:
                 continue
@@ -220,8 +218,8 @@ class TetrysEncoder:
             if sid in self._window and sid not in self._nack_set:
                 self._nack_set.add(sid)
                 self._nack_q.append(sid)
-                promoted += 1
-        return promoted
+                n += 1
+        return n
 
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
         """Pack SOURCE packets for NACKed ids still in the window."""
@@ -237,7 +235,8 @@ class TetrysEncoder:
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
         """
         Retransmit the oldest unacked SOURCE symbols (HOL frontier).
-        Use only on true stall — bypasses reorder delay intentionally.
+        This is what unblocks the receiver when the window is full of
+        future data waiting on early holes — better than coded spam.
         """
         out: list[bytearray] = []
         if limit <= 0 or not self._window:
