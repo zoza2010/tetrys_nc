@@ -32,12 +32,12 @@ App (file) → Tetrys Encoder → UDP → Tetrys Decoder → App (file)
 1. **Source packet** — исходный символ с ID (систематическая передача).
 2. **Coded packet** — линейная комбинация неподтверждённых символов из elastic window; коэффициенты Vandermonde GF(256) (`CCGI=0b01`).
 3. **Window update** — клиент периодически шлёт SACK + echo timestamp; сервер вычищает ACKed символы и чинит дыры (NACK retransmit / coded).
-4. **FASP-style rate control** — blast at `--rate`; standing queue only soft-biases (≥90% of target); потери **не** режут скорость, усиливают NACK + FEC repair.
+4. **FASP-style rate control** — blast at `--rate`; standing queue only soft-biases (≥90% of target); потери **не** режут скорость, только усиливают repair.
 5. **GF(2⁸)** — NumPy (готовые wheels, без своей компиляции) на hot path.
 
 Параметры по умолчанию (оптимизированы под localhost / быстрый тест 1 ГиБ):
 payload **32768** B, window **8192**, redundancy **32**.
-Для WAN/MTU 1500: `--wan` (payload 1350, window 16384, redundancy **8**, blast `--rate`).
+Для WAN/MTU 1500: `--wan` (или `--payload-size 1400 --rate 800`).
 
 ## Опции
 
@@ -46,7 +46,7 @@ server:
   --file PATH          файл для отправки
   --port PORT          UDP порт (default 9000)
   --window N           размер elastic window
-  --redundancy N       coded packet каждые N source (WAN default 8; 0=off)
+  --redundancy N       coded packet каждые N source
   --payload-size N     размер символа (байты)
   --pace-us US         пауза после каждого source (throttle)
   --rate / --rate-mbit целевая скорость UDP (Mbit/s)
@@ -72,24 +72,22 @@ bash scripts/run_bench.sh
 
 ## WAN (потери, большой RTT)
 
-Как FASP: забиваем канал до `--rate`; loss → NACK retransmit + coded over HOL frontier (SACK освобождает уже принятые символы из окна).
+Как FASP: забиваем канал до `--rate`, loss → NACK retransmit (не fairness / не обвал rate).
 
 ```bash
-# сервер (в Испании) — --rate ≈ чуть ниже ёмкости линка (iperf3 UDP)
-uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --rate 600 --skip-hash
+# сервер (в Испании) — --rate ≈ ёмкости линка (iperf3 UDP)
+uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --rate 800 --skip-hash
 
 # клиент (в РФ)
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=8** (выкл: `--redundancy 0`), window **16384**, **BLAST** на `--rate` (default **1000** Mbit/s).  
-SACK-free + contiguous coded — FEC и скользящее окно работают вместе. В логе клиента `nc_recovered` > 0 при реальных дырах.
+`--wan`: payload 1350, **redundancy=0**, window 65536, **BLAST** на весь `--rate` (default **1000** Mbit/s).  
+Потери → NACK retransmit. Цель — забить канал. GF: NumPy (`gf=numpy`).
 
 ```bash
---wan --rate 600 --window 16384
+--wan --rate 800
 ```
-
-Часто goodput выше при `--rate` чуть ниже iperf (меньше потерь/HOL), чем при 1000.
 
 ## Замечания
 
