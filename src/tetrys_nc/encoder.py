@@ -38,14 +38,11 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        # NACK queue from receiver SACK holes (after reorder delay)
+        # NACK queue from receiver SACK holes
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
-        # sid -> first time reported missing (reorder tolerance)
-        self._pending_nack: dict[int, float] = {}
         self.last_plr_byte = 0
         self._send_ts_us = 0
-        self.reorder_s = 0.0
 
     def stamp(self) -> int:
         """Refresh send timestamp (monotonic µs, uint32)."""
@@ -162,30 +159,21 @@ class TetrysEncoder:
         while self._window and next(iter(self._window)) < self._cumulative_ack:
             sid, _ = self._window.popitem(last=False)
             self._nack_set.discard(sid)
-            self._pending_nack.pop(sid, None)
             removed += 1
 
         # With FEC off: free SACKed symbols immediately so HOL holes don't pin
         # the entire elastic window (FASP-like — don't stall on already-delivered).
         if held_ids and self.cfg.redundancy_every <= 0:
             for sid in held_ids:
-                self._pending_nack.pop(sid, None)
                 if self._window.pop(sid, None) is not None:
                     self._nack_set.discard(sid)
                     removed += 1
 
-        # Missing bits → suspect loss. Promote to NACK only after reorder_s
-        # (RACK-style: gap ≠ loss until it ages). reorder_s=0 → immediate.
         if missing_ids:
-            now = time.monotonic()
             for sid in missing_ids:
-                if sid not in self._window or sid in self._nack_set:
-                    continue
-                if self.reorder_s <= 0:
+                if sid in self._window and sid not in self._nack_set:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
-                elif sid not in self._pending_nack:
-                    self._pending_nack[sid] = now
 
         # Adaptive FEC around configured base. Loss → slightly denser coded over
         # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
@@ -207,22 +195,6 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
-    def promote_delayed_nacks(self) -> int:
-        """Move aged pending gaps into the NACK retransmit queue."""
-        if self.reorder_s <= 0 or not self._pending_nack:
-            return 0
-        now = time.monotonic()
-        promoted = 0
-        for sid, t0 in list(self._pending_nack.items()):
-            if now - t0 < self.reorder_s:
-                continue
-            del self._pending_nack[sid]
-            if sid in self._window and sid not in self._nack_set:
-                self._nack_set.add(sid)
-                self._nack_q.append(sid)
-                promoted += 1
-        return promoted
-
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
         """Pack SOURCE packets for NACKed ids still in the window."""
         out: list[bytearray] = []
@@ -237,7 +209,8 @@ class TetrysEncoder:
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
         """
         Retransmit the oldest unacked SOURCE symbols (HOL frontier).
-        Use only on true stall — bypasses reorder delay intentionally.
+        This is what unblocks the receiver when the window is full of
+        future data waiting on early holes — better than coded spam.
         """
         out: list[bytearray] = []
         if limit <= 0 or not self._window:
@@ -270,6 +243,5 @@ class TetrysEncoder:
             "coded_burst": self._coded_burst,
             "cumulative_ack": self._cumulative_ack,
             "nack_q": len(self._nack_q),
-            "nack_pending": len(self._pending_nack),
             "plr_byte": self.last_plr_byte,
         }

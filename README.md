@@ -82,11 +82,11 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=0**, window 65536, **BLAST** на `--rate`, **`--reorder-ms 20`** (delayed NACK vs OOOrder).
-Потери → NACK после reorder timer. В логе `nack=Q+P`.
+`--wan`: payload 1350, **redundancy=0**, window 65536, **BLAST** на весь `--rate` (default **1000** Mbit/s).  
+Потери → NACK retransmit. Цель — забить канал. GF: NumPy (`gf=numpy`).
 
 ```bash
---wan --rate 600 --reorder-ms 20
+--wan --rate 800
 ```
 
 ## Замечания
