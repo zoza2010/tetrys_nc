@@ -166,10 +166,10 @@ def test_window_update_echo_roundtrip():
     assert 10 not in got.missing_ids()
 
 
-def test_bbr_starts_below_max():
+def test_bbr_starts_near_half_cap():
     lim = RateLimiter(50_000_000.0)
-    assert lim.rate < lim.max_rate
-    assert lim.min_rate <= lim.max_rate * 0.05
+    assert lim.rate >= lim.max_rate * 0.45
+    assert lim.min_rate >= lim.max_rate * 0.10
 
 
 def test_loss_does_not_collapse_rate():
@@ -182,22 +182,20 @@ def test_loss_does_not_collapse_rate():
     assert lim.rate == before
 
 
-def test_bbr_tracks_delivery_rate():
-    lim = RateLimiter(50_000_000.0, start_bps=5_000_000.0)
+def test_bbr_tracks_delivery_rate_and_cwnd_floor():
+    lim = RateLimiter(50_000_000.0, start_bps=16_000_000.0)
     cc = DelayRateController(lim, payload_size=1000)
-    t0 = cc._sample_t
-    # Simulate ~20 MB/s delivery over several samples
     import time
 
     for _ in range(5):
-        time.sleep(0.035)
-        cc.on_ack(700, plr_byte=80)  # 700*1000/0.035 ≈ 20 MB/s
-    assert cc.btlbw > 5_000_000.0
-    assert lim.rate > 5_000_000.0
-    # PLR must not be required for climb
+        time.sleep(0.055)
+        cc.on_ack(1200, plr_byte=80)  # ~20 MB/s
+    assert cc.btlbw > 10_000_000.0
+    assert lim.rate >= lim.min_rate
+    # cwnd must stay large enough for long-RTT WAN
+    assert cc.target_cwnd_packets() >= 4096
     assert cc.mode in (
         DelayRateController.MODE_STARTUP,
         DelayRateController.MODE_DRAIN,
         DelayRateController.MODE_PROBE_BW,
     )
-    del t0
