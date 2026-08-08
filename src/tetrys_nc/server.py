@@ -199,23 +199,19 @@ def run_server(
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
-                    if wan and delta > 0:
-                        # Grow flight with ACKs (full delta — pipe needs ~2k+ pkts @76ms)
+                    if wan and delta > 0 and pkt.plr_byte < 20:
                         ack_progress["flight"] = min(
                             enc.cfg.max_window,
                             ack_progress["flight"] + max(delta, 1),
                         )
-                    if wan and pkt.plr_byte >= 80:
-                        # Only severe loss shrinks cwnd; never below packets already in flight
-                        with enc_lock:
-                            in_flight = enc.window_size
+                    if wan and pkt.plr_byte >= 40:
+                        # Lossy without delay: shrink cwnd so we stop flooding
                         ack_progress["flight"] = max(
-                            in_flight,
-                            max(256, ack_progress["flight"] * 3 // 4),
+                            256, min(ack_progress["flight"], 1024) * 3 // 4
                         )
                     if delay_cc is not None:
-                        # Climb on healthy ACK progress even if RTT echo is missing
-                        # (old Windows client without echo_ts → rtt stays 0 otherwise).
+                        # This path drops without RTT bloat — must cut on PLR
+                        delay_cc.on_loss(pkt.plr_byte)
                         if delta > 0:
                             delay_cc.on_ack(delta, pkt.plr_byte)
                         if pkt.echo_ts_us:

@@ -197,3 +197,11 @@ def test_ack_climb_without_rtt_echo():
         cc.on_ack(64, plr_byte=0)
     assert lim.rate > start * 2
     assert lim.rate <= lim.max_rate
+
+
+def test_loss_cuts_rate_on_high_plr():
+    lim = RateLimiter(50_000_000.0, start_bps=40_000_000.0)
+    cc = DelayRateController(lim)
+    before = lim.rate
+    cc.on_loss(120)
+    assert lim.rate < before * 0.6

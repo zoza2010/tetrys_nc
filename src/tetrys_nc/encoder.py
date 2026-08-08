@@ -163,22 +163,24 @@ class TetrysEncoder:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
 
-        # PLR only drives repair intensity — never sender rate (FASP-style).
-        # If user set redundancy=0 (WAN default), keep periodic coding OFF and
-        # rely on NACK retransmit + on-demand coded; only extreme loss turns
-        # periodic coding back on temporarily.
+        # Repair schedule. WAN default redundancy=0: NEVER enable periodic coded
+        # on loss — coded flood on a drop-congested path makes PLR worse.
+        # Holes are fixed via NACK retransmit (+ at most one on-demand coded).
         self.last_plr_byte = plr_byte
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
         base_red = self.cfg.redundancy_every
-        if plr >= 40:
-            self._redundancy_every = 1
-            self._coded_burst = max(self.cfg.coded_burst, 3)
-        elif plr >= 25 and base_red > 0:
+        if base_red <= 0:
+            self._redundancy_every = 0
+            self._coded_burst = 1
+        elif plr >= 40:
             self._redundancy_every = 1
             self._coded_burst = max(self.cfg.coded_burst, 2)
-        elif plr >= 12 and base_red > 0:
-            self._redundancy_every = max(1, base_red // 4)
+        elif plr >= 25:
+            self._redundancy_every = 1
             self._coded_burst = max(self.cfg.coded_burst, 1)
+        elif plr >= 12:
+            self._redundancy_every = max(1, base_red // 4)
+            self._coded_burst = self.cfg.coded_burst
         else:
             self._redundancy_every = base_red
             self._coded_burst = self.cfg.coded_burst

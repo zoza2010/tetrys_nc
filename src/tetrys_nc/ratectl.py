@@ -1,4 +1,4 @@
-"""FASP-inspired delay-based rate control with slow start (loss ≠ congestion)."""
+"""Hybrid rate control: delay + loss (this WAN drops without RTT inflation)."""
 
 from __future__ import annotations
 
@@ -15,13 +15,10 @@ class RateLimiter:
         burst: float | None = None,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # Steady-state floor after MD — keep modest so false RTT can't pin us here
         self.min_rate = min(self.max_rate, max(2_500_000.0, self.max_rate * 0.05))
         if start_bps is None:
-            # Open gently: ~3% of target, capped at ~80 Mbit
             start_bps = min(self.max_rate, max(1_250_000.0, self.max_rate * 0.03))
             start_bps = min(start_bps, 10_000_000.0)
-        # Start may be below min_rate; set_rate() will enforce floor later
         self.rate = min(self.max_rate, max(start_bps, 1_000_000.0))
         self.burst = burst if burst is not None else max(self.rate * 0.02, 32_000.0)
         self.tokens = min(self.burst, 64_000.0)
@@ -46,10 +43,11 @@ class RateLimiter:
 
 class DelayRateController:
     """
-    Adjust send rate from RTT / queuing delay, not packet loss.
+    Rate control for paths that may signal congestion via loss OR delay.
 
-    Slow-start: climb while queueing delay stays near zero.
-    Congestion avoidance: gentler increase; MD on queue growth (never on loss).
+    - plr≈0 and low queue → climb
+    - high plr → cut (this Spain↔RU path drops without RTT bloat)
+    - high queuing delay → cut
     """
 
     __slots__ = (
@@ -84,23 +82,34 @@ class DelayRateController:
         if self.limiter.rate >= self.limiter.max_rate * 0.98:
             self.slow_start = False
 
+    def on_loss(self, plr_byte: int) -> None:
+        """Cut rate when receiver reports holes (lossy path without delay signal)."""
+        if plr_byte < 20:
+            return
+        self.slow_start = False
+        rate = self.limiter.rate
+        if plr_byte >= 100:
+            self.limiter.set_rate(rate * 0.5)
+        elif plr_byte >= 60:
+            self.limiter.set_rate(rate * 0.65)
+        elif plr_byte >= 40:
+            self.limiter.set_rate(rate * 0.8)
+        else:
+            self.limiter.set_rate(rate * 0.9)
+
     def on_ack(self, acked: int, plr_byte: int = 0) -> None:
-        """
-        Climb send rate from ACK progress when the path looks healthy.
-        Primary climb signal when plr≈0 (delay signal is secondary).
-        """
+        """Climb only when path looks healthy."""
         if acked <= 0 or plr_byte >= 16:
             return
         queue_us = 0.0
         if self.srtt_us is not None and self.base_rtt_us is not None:
             queue_us = max(0.0, self.srtt_us - self.base_rtt_us)
-        # Only hold back ACK-climb on severe standing queue
         if queue_us > 200_000:
             return
         if self.slow_start or self.samples == 0:
-            self._bump_rate(1.12, additive=200_000.0)
+            self._bump_rate(1.10, additive=150_000.0)
         else:
-            self._bump_rate(1.05, additive=100_000.0)
+            self._bump_rate(1.03, additive=80_000.0)
 
     def on_echo(self, echo_ts_us: int, now_us: int | None = None) -> float | None:
         if not echo_ts_us:
@@ -115,8 +124,7 @@ class DelayRateController:
         self.samples += 1
         if self.base_rtt_us is None or rtt < self.base_rtt_us:
             self.base_rtt_us = float(rtt)
-        elif self.base_rtt_us is not None and rtt < self.base_rtt_us * 1.05:
-            # Slowly track improving baseline (path variance)
+        elif rtt < self.base_rtt_us * 1.05:
             self.base_rtt_us = 0.95 * self.base_rtt_us + 0.05 * float(rtt)
         if self.srtt_us is None:
             self.srtt_us = float(rtt)
@@ -129,12 +137,10 @@ class DelayRateController:
 
         if self.warmup_left > 0:
             self.warmup_left -= 1
-            # Warmup: never MD — establish baseline only
             if inst_queue < 30_000:
-                self._bump_rate(1.12, additive=150_000.0)
+                self._bump_rate(1.10, additive=120_000.0)
             return float(rtt)
 
-        # Soft MD — high thresholds (WAN RTT often 100–200ms+jitter)
         if inst_queue > 250_000 or queue_us > 200_000:
             self.slow_start = False
             self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.90))
@@ -142,9 +148,9 @@ class DelayRateController:
             self.slow_start = False
             self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.95))
         elif self.slow_start and queue_us < 40_000 and inst_queue < 50_000:
-            self._bump_rate(1.15, additive=200_000.0)
+            self._bump_rate(1.12, additive=150_000.0)
         elif queue_us < 30_000 and inst_queue < 40_000:
-            self._bump_rate(1.04, additive=80_000.0)
+            self._bump_rate(1.03, additive=60_000.0)
         return float(rtt)
 
     def stats(self) -> dict:
