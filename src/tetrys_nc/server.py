@@ -63,16 +63,16 @@ def run_server(
     if max_window is None:
         max_window = 16384 if wan else 8192
     if wan:
-        # WAN: MTU-sized symbols, moderate proactive FEC + NACK/HOL repair.
+        # WAN: MTU-sized symbols, NACK/HOL repair. FEC opt-in (--redundancy N):
+        # proactive coded still costs rate; default off until it beats pure NACK.
         if payload_size >= 8000:
             payload_size = 1350
-        # Default argparse redundancy=32 → treat as "auto" for WAN → every 8.
+        # Default argparse redundancy=32 → "auto" for WAN → NACK-only.
         if redundancy_every >= 32:
-            redundancy_every = 8
+            redundancy_every = 0
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
-        # Default target ≈ typical WAN NIC; override with --rate to match link.
         if rate_mbit <= 0:
             rate_mbit = 1000.0
     else:
@@ -287,7 +287,7 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL holes → repair gets the pipe; new data only if room remains.
+                    # HOL holes → repair gets priority, but keep blasting new data.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     plr = int(ack_progress["plr"])
                     with enc_lock:
@@ -299,31 +299,33 @@ def run_server(
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
                         holey = wan and (stalled or nack_pending > 0 or plr >= 16)
-                        if holey:
-                            repair_n = 2048 if stalled else 1024
+                        # Cap repair so it cannot monopolize the --rate budget.
+                        if stalled:
+                            repair_n = 512
+                        elif holey:
+                            repair_n = 256
                         else:
-                            repair_n = 128 if wan else 4
+                            repair_n = 64 if wan else 4
                         repairs = enc.pop_nack_retransmit(limit=repair_n)
-                        if holey or win >= enc.cfg.max_window:
+                        if stalled or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(128, repair_n - len(repairs))
+                                    limit=max(64, repair_n - len(repairs))
                                 )
                             )
-                        # Modest coded repair over HOL (known+missing mix) — not a flood.
+                        # FEC repair only when explicitly enabled and truly stalled.
                         coded_repair: list[bytes] = []
-                        if holey and enc.fec_enabled:
-                            n_coded = 8 if stalled else 4
-                            coded_repair = enc.emit_coded(n_coded)
+                        if stalled and enc.fec_enabled:
+                            coded_repair = enc.emit_coded(2)
                         room = enc.cfg.max_window - enc.window_size
 
                     flight_cap = max(int(ack_progress["flight"]), win)
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # While repairing holes, throttle new admits — keep pipe on frontier.
-                    if holey and (repairs or coded_repair):
-                        n_take = min(n_take, max(64, batch // 8))
+                    # Only throttle admits on true HOL stall — not on every NACK.
+                    if stalled:
+                        n_take = min(n_take, max(256, batch // 4))
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -349,8 +351,8 @@ def run_server(
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
-                    # Repair first whenever holes exist (unblocks cumack / window).
-                    if holey:
+                    # Repair first when stalled; otherwise new data first (fill pipe).
+                    if stalled:
                         send_batch(repairs)
                         send_batch(coded_repair)
                         send_batch(wires)
@@ -462,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         "--redundancy",
         type=int,
         default=32,
-        help="coded every N source packets (0=off; WAN auto/default 8)",
+        help="coded every N source packets (0=off; WAN auto/default 0=NACK-only)",
     )
     p.add_argument(
         "--coded-burst",
@@ -475,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, blast pacing, FEC+NACK/HOL repair",
+        help="WAN: payload 1350, blast pacing, NACK/HOL repair (FEC via --redundancy)",
     )
     p.add_argument(
         "--rate-mbit",

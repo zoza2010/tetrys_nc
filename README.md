@@ -82,11 +82,13 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=8** (`--redundancy 0` = только NACK), window **16384**, **BLAST** на `--rate`.  
-SACK освобождает *admission*; payloads для FEC держатся до cumack — coded мешает known+missing на HOL. В логе: `coding=…`, `nc_recovered>0`.
+`--wan`: payload 1350, **redundancy=0** (NACK-only; FEC: `--redundancy 8`), window **16384**, **BLAST** на `--rate`.  
+На этом линке proactive FEC пока обычно **хуже** чистого NACK (~20 MiB/s vs ~14).
 
 ```bash
 --wan --rate 600 --window 16384
+# FEC только если сознательно сравниваете:
+# --wan --rate 600 --redundancy 8
 ```
 
 **Почему не как iperf3:** iperf3 — ненадёжный UDP без repair. У вас ~20–30% потерь в SACK (plr) + ACK/window; даже идеальный repair не даст line rate. Цель — goodput близкий к `(1−loss)×capacity`, не к iperf.
