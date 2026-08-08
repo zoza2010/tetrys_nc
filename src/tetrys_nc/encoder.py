@@ -71,6 +71,10 @@ class TetrysEncoder:
     def coded_burst(self) -> int:
         return self._coded_burst
 
+    @property
+    def fec_enabled(self) -> bool:
+        return self.cfg.redundancy_every > 0
+
     def can_accept(self) -> bool:
         return len(self._window) < self.cfg.max_window
 
@@ -109,7 +113,7 @@ class TetrysEncoder:
         return self.emit_coded(self._coded_burst)
 
     def emit_coded(self, n: int = 1) -> list[bytes]:
-        """Force N coded packets over the oldest window (HOL repair)."""
+        """Force N coded packets over the oldest contiguous HOL run."""
         out: list[bytes] = []
         if n <= 0 or not self._window:
             return out
@@ -120,20 +124,49 @@ class TetrysEncoder:
             out.append(pkt.pack())
         return out
 
+    def _oldest_contiguous(self, degree: int) -> list[tuple[int, bytes]]:
+        """
+        Longest contiguous run starting at the oldest in-window symbol, capped
+        at degree. After SACK-free the window is sparse; coding MUST only mix
+        ids that are still present so [first,last] matches encoder terms
+        (decoder assumes every id in the span participates).
+        """
+        if not self._window or degree <= 0:
+            return []
+        start = next(iter(self._window))
+        chosen: list[tuple[int, bytes]] = [(start, self._window[start])]
+        for sid in range(start + 1, start + degree):
+            data = self._window.get(sid)
+            if data is None:
+                break
+            chosen.append((sid, data))
+        return chosen
+
     def make_coded(self, prefer_oldest: bool = True) -> CodedPacket | None:
         """
         Build coded packet over the elastic window.
-        For WAN/HOL recovery we MUST mix the oldest unacked symbols
-        (near the delivery frontier), not the newest ones.
+        WAN/HOL: contiguous oldest run (safe with SACK-free sparse window).
         """
         if not self._window:
             return None
-        items = list(self._window.items())
-        degree = min(self.cfg.code_degree, len(items))
+        degree = min(self.cfg.code_degree, len(self._window))
         if prefer_oldest:
-            chosen = items[:degree]
+            chosen = self._oldest_contiguous(degree)
         else:
+            items = list(self._window.items())
             chosen = items[-degree:]
+            # Newest path may be sparse too — keep contiguous from first chosen.
+            if len(chosen) >= 2:
+                base = chosen[0][0]
+                contig = [(base, self._window[base])]
+                for sid in range(base + 1, chosen[-1][0] + 1):
+                    data = self._window.get(sid)
+                    if data is None:
+                        break
+                    contig.append((sid, data))
+                chosen = contig[:degree]
+        if not chosen:
+            return None
         first, last = chosen[0][0], chosen[-1][0]
         cid = self._next_coded_id
         self._next_coded_id += 1
@@ -161,9 +194,9 @@ class TetrysEncoder:
             self._nack_set.discard(sid)
             removed += 1
 
-        # With FEC off: free SACKed symbols immediately so HOL holes don't pin
-        # the entire elastic window (FASP-like — don't stall on already-delivered).
-        if held_ids and self.cfg.redundancy_every <= 0:
+        # Free SACKed symbols so they don't pin admission. Coded packets only
+        # mix contiguous in-window runs, so gaps from SACK-free are safe.
+        if held_ids:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
                     self._nack_set.discard(sid)
@@ -175,8 +208,7 @@ class TetrysEncoder:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
 
-        # Adaptive FEC around configured base. Loss → slightly denser coded over
-        # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
+        # Adaptive FEC around configured base. Loss → denser coded over HOL.
         self.last_plr_byte = plr_byte
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
         base_red = self.cfg.redundancy_every
@@ -184,11 +216,10 @@ class TetrysEncoder:
             self._redundancy_every = 0
             self._coded_burst = 1
         elif plr >= 25:
-            # ~more FEC, still bounded (every 4 sources × burst 2 ≈ 50% coded)
-            self._redundancy_every = max(4, base_red // 2)
+            self._redundancy_every = max(3, base_red // 2)
             self._coded_burst = max(self.cfg.coded_burst, 2)
         elif plr >= 10:
-            self._redundancy_every = max(6, base_red)
+            self._redundancy_every = max(4, min(base_red, 6))
             self._coded_burst = max(self.cfg.coded_burst, 1)
         else:
             self._redundancy_every = base_red
@@ -210,7 +241,7 @@ class TetrysEncoder:
         """
         Retransmit the oldest unacked SOURCE symbols (HOL frontier).
         This is what unblocks the receiver when the window is full of
-        future data waiting on early holes — better than coded spam.
+        future data waiting on early holes — better than coded spam alone.
         """
         out: list[bytearray] = []
         if limit <= 0 or not self._window:

@@ -45,7 +45,7 @@ def run_server(
     port: int,
     file_path: Path,
     payload_size: int = 32768,
-    max_window: int = 8192,
+    max_window: int | None = None,
     redundancy_every: int = 32,
     coded_burst: int = 0,
     pace_us: float = 0.0,
@@ -60,14 +60,15 @@ def run_server(
 
     if coded_burst <= 0:
         coded_burst = 1
+    if max_window is None:
+        max_window = 16384 if wan else 8192
     if wan:
-        # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
+        # WAN: MTU-sized symbols, moderate proactive FEC + NACK/HOL repair.
         if payload_size >= 8000:
             payload_size = 1350
-        if max_window < 65536:
-            max_window = 65536
+        # Default argparse redundancy=32 → treat as "auto" for WAN → every 8.
         if redundancy_every >= 32:
-            redundancy_every = 0
+            redundancy_every = 8
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
@@ -308,6 +309,11 @@ def run_server(
                                     limit=max(128, repair_n - len(repairs))
                                 )
                             )
+                        # Extra coded repair over HOL frontier when FEC is on.
+                        coded_repair: list[bytes] = []
+                        if holey and enc.fec_enabled:
+                            n_coded = 64 if stalled else 16
+                            coded_repair = enc.emit_coded(n_coded)
                         room = enc.cfg.max_window - enc.window_size
 
                     flight_cap = max(int(ack_progress["flight"]), win)
@@ -315,7 +321,7 @@ def run_server(
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
                     # While repairing holes, throttle new admits — keep pipe on frontier.
-                    if holey and repairs:
+                    if holey and (repairs or coded_repair):
                         n_take = min(n_take, max(64, batch // 8))
 
                     chunks: list[bytes] = []
@@ -339,18 +345,18 @@ def run_server(
                             if not enc.can_accept():
                                 break
                             wires.append(enc.add_source(chunk))
-                            # maybe_coded only if --redundancy > 0
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
                     # Repair first whenever holes exist (unblocks cumack / window).
                     if holey:
                         send_batch(repairs)
+                        send_batch(coded_repair)
                         send_batch(wires)
                     else:
                         send_batch(wires)
                         send_batch(repairs)
-                    sent = len(wires) + len(repairs)
+                    sent = len(wires) + len(repairs) + len(coded_repair)
 
                     if eof:
                         with enc_lock:
@@ -369,12 +375,16 @@ def run_server(
                             with enc_lock:
                                 tail = enc.retransmit_oldest(limit=256)
                                 tail.extend(enc.pop_nack_retransmit(limit=128))
+                                if enc.fec_enabled:
+                                    tail.extend(enc.emit_coded(32))
                             send_batch(tail)
                             time.sleep(0.00005)
                     elif sent == 0:
                         with enc_lock:
                             tail = enc.retransmit_oldest(limit=256)
                             tail.extend(enc.pop_nack_retransmit(limit=128))
+                            if enc.fec_enabled:
+                                tail.extend(enc.emit_coded(32))
                         send_batch(tail)
 
                     now = time.monotonic()
@@ -440,25 +450,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--file", required=True, type=Path, help="file to send")
     p.add_argument("--payload-size", type=int, default=32768)
-    p.add_argument("--window", type=int, default=8192)
+    p.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="elastic window (default: 16384 WAN / 8192 LAN); client Ready can cap lower",
+    )
     p.add_argument(
         "--redundancy",
         type=int,
         default=32,
-        help="coded every N source packets (0=off; repair still via retransmit)",
+        help="coded every N source packets (0=off; WAN auto/default 8)",
     )
     p.add_argument(
         "--coded-burst",
         type=int,
         default=0,
-        help="coded packets per redundancy tick (0=auto; WAN default 1)",
+        help="coded packets per redundancy tick (0=auto)",
     )
     p.add_argument("--pace-us", type=float, default=0.0)
     p.add_argument("--skip-hash", action="store_true")
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, FASP-style blast pacing, NACK/HOL repair (no FEC)",
+        help="WAN: payload 1350, blast pacing, FEC+NACK/HOL repair",
     )
     p.add_argument(
         "--rate-mbit",

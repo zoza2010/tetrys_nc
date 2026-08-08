@@ -31,16 +31,15 @@ def run_client(
     host: str,
     port: int,
     output: Path,
-    max_window: int = 8192,
+    max_window: int | None = None,
     feedback_every: int = 256,
     wan: bool = False,
 ) -> int:
-    if wan:
-        # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
-        if max_window < 65536:
-            max_window = 65536
-        if feedback_every > 16:
-            feedback_every = 4
+    if max_window is None:
+        # ~2×BDP for ~80ms×800Mbit at 1350B; larger windows inflate HOL buf on lossy paths.
+        max_window = 16384 if wan else 8192
+    if wan and feedback_every > 16:
+        feedback_every = 4
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
@@ -56,7 +55,7 @@ def run_client(
         )
     )
 
-    print(f"connecting to udp://{host}:{port}")
+    print(f"connecting to udp://{host}:{port} window={max_window}")
     ready = ReadyPacket(max_window).pack()
     for _ in range(5):
         sock.sendto(ready, server)
@@ -188,7 +187,8 @@ def run_client(
                     f"progress {bytes_written}/{meta.file_size} ({pct:.1f}%) "
                     f"deliver={st['next_deliver']}/{total_symbols} "
                     f"buf={st['buffered']} eq={st['equations']} "
-                    f"recovered={st['recovered']} {rate:.1f} MiB/s"
+                    f"rx={st['source_rx']}+{st['coded_rx']} "
+                    f"nc_recovered={st['recovered']} {rate:.1f} MiB/s"
                 )
 
             if dec.is_complete() and bytes_written >= meta.file_size:
@@ -222,7 +222,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--output", type=Path, default=Path("received.bin"))
-    p.add_argument("--window", type=int, default=8192)
+    p.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="elastic window (default: 16384 WAN / 8192 LAN)",
+    )
     p.add_argument("--feedback-every", type=int, default=256)
     p.add_argument(
         "--wan",

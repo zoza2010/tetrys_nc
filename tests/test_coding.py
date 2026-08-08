@@ -171,9 +171,9 @@ def test_window_update_echo_roundtrip():
 
 
 def test_sack_release_unpins_window():
-    """WAN/no-FEC: SACKed symbols must leave the encoder window."""
+    """SACKed symbols leave the encoder window (works with or without FEC)."""
     enc = TetrysEncoder(
-        EncoderConfig(max_window=32, redundancy_every=0, payload_size=8)
+        EncoderConfig(max_window=32, redundancy_every=8, payload_size=8)
     )
     for i in range(20):
         enc.add_source(bytes([i]) * 8)
@@ -186,6 +186,83 @@ def test_sack_release_unpins_window():
     assert 5 in enc._window
     assert 5 in enc._nack_set
     assert 11 in enc._window
+
+
+def test_coded_contiguous_after_sack_free():
+    """Coded [first,last] must match in-window contiguous run (no sparse mix)."""
+    enc = TetrysEncoder(
+        EncoderConfig(max_window=64, redundancy_every=4, payload_size=16, code_degree=8)
+    )
+    for i in range(30):
+        enc.add_source(bytes([i]) * 16)
+    # Cumack 0, hold 1..5 and 10..20, leave holes at 0 and 6..9
+    enc.apply_feedback(
+        0,
+        plr_byte=80,
+        missing_ids=[0, 6, 7, 8, 9],
+        held_ids=list(range(1, 6)) + list(range(10, 21)),
+    )
+    assert 0 in enc._window
+    assert 1 not in enc._window
+    pkt = enc.make_coded(prefer_oldest=True)
+    assert pkt is not None
+    # Oldest contiguous run is only symbol 0 (gap before 6)
+    assert pkt.first_source_id == 0
+    assert pkt.last_source_id == 0
+
+
+def test_fec_recovers_with_sack_free_window():
+    """Drop symbols; SACK-free + contiguous coded + retransmit restores file."""
+    enc = TetrysEncoder(
+        EncoderConfig(max_window=128, redundancy_every=4, payload_size=32, code_degree=8)
+    )
+    dec = TetrysDecoder()
+    dec.payload_size = 32
+    n = 40
+    messages = [bytes([i] * 32) for i in range(n)]
+    drop = {2, 5, 8, 12, 15}
+
+    delivered = {}
+    for i, msg in enumerate(messages):
+        wire = enc.add_source(msg)
+        if i not in drop:
+            sid = int.from_bytes(wire[4:8], "big")
+            for s, data in dec.on_source_raw(sid, bytes(wire[SOURCE_HDR_SIZE:])):
+                delivered[s] = data
+        for coded_wire in enc.maybe_coded():
+            coded = parse_packet(coded_wire)
+            assert isinstance(coded, CodedPacket)
+            for s, data in dec.on_coded(coded):
+                delivered[s] = data
+        fb = dec.build_feedback(sack_bits=128)
+        enc.apply_feedback(
+            fb.cumulative_ack, fb.plr_byte, fb.missing_ids(), fb.held_ids()
+        )
+
+    for _ in range(80):
+        for wire in enc.pop_nack_retransmit(limit=8):
+            sid = int.from_bytes(wire[4:8], "big")
+            for s, data in dec.on_source_raw(sid, wire[SOURCE_HDR_SIZE:]):
+                delivered[s] = data
+        for cwire in enc.emit_coded(4):
+            coded = parse_packet(cwire)
+            assert isinstance(coded, CodedPacket)
+            for s, data in dec.on_coded(coded):
+                delivered[s] = data
+        for s, data in dec.pop_deliverable():
+            delivered[s] = data
+        fb = dec.build_feedback(sack_bits=128)
+        enc.apply_feedback(
+            fb.cumulative_ack, fb.plr_byte, fb.missing_ids(), fb.held_ids()
+        )
+        if len(delivered) == n:
+            break
+
+    for s, data in dec.pop_deliverable():
+        delivered[s] = data
+    assert len(delivered) == n
+    for i, msg in enumerate(messages):
+        assert delivered[i] == msg
 
 
 def test_blast_starts_at_cap():
