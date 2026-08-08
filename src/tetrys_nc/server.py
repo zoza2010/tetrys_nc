@@ -122,14 +122,15 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight = max unacked source packets allowed (slow-start cwnd); WAN opens small
+    # flight = max unacked sources (cwnd). WAN: start ~0.5*BDP-ish, grow fast.
+    # At 76ms RTT / 40MiB/s need ~2–3k packets in flight — 64 was starving the pipe.
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": 64 if wan else max_window,
+        "flight": 512 if wan else max_window,
     }
 
     # Pacing: WAN always; optional explicit --rate-mbit
@@ -199,19 +200,18 @@ def run_server(
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
                     if wan and delta > 0:
-                        if delay_cc is not None and delay_cc.slow_start:
-                            ack_progress["flight"] = min(
-                                enc.cfg.max_window,
-                                ack_progress["flight"] + max(delta, 1),
-                            )
-                        else:
-                            ack_progress["flight"] = min(
-                                enc.cfg.max_window,
-                                ack_progress["flight"] + max(delta // 2, 1),
-                            )
-                    if wan and pkt.plr_byte >= 40:
+                        # Grow flight with ACKs (full delta — pipe needs ~2k+ pkts @76ms)
+                        ack_progress["flight"] = min(
+                            enc.cfg.max_window,
+                            ack_progress["flight"] + max(delta, 1),
+                        )
+                    if wan and pkt.plr_byte >= 80:
+                        # Only severe loss shrinks cwnd; never below packets already in flight
+                        with enc_lock:
+                            in_flight = enc.window_size
                         ack_progress["flight"] = max(
-                            64, ack_progress["flight"] // 2
+                            in_flight,
+                            max(256, ack_progress["flight"] * 3 // 4),
                         )
                     if delay_cc is not None:
                         # Climb on healthy ACK progress even if RTT echo is missing
@@ -271,13 +271,12 @@ def run_server(
                         _print_summary(enc, file_size, elapsed)
                         return 0
 
-                    # Repair: NACK retransmit; light coded only on holes (cap flood)
+                    # Repair: NACK first; coded only when there are real holes
                     with enc_lock:
                         repairs = enc.pop_nack_retransmit(limit=16 if wan else 4)
                         plr_b = enc.last_plr_byte
-                        burst = enc.coded_burst
                         need_repair = bool(repairs) or plr_b > 0
-                        n_repair_coded = min(burst, 2) if need_repair else 0
+                        n_repair_coded = 1 if need_repair else 0
                         coded_repairs = []
                         for _ in range(n_repair_coded):
                             c = enc.make_coded(prefer_oldest=True)
@@ -289,38 +288,33 @@ def run_server(
                     for wire in coded_repairs:
                         send_datagram(wire)
 
-                    # ACK stall → retransmit oldest; coded only if holes exist
+                    # ACK stall → retransmit oldest SOURCE only (no coded spam)
                     cur_ack = ack_progress["ack"]
                     if cur_ack == last_ack_seen:
                         stall_repairs += 1
                     else:
                         stall_repairs = 0
                         last_ack_seen = cur_ack
-                    if stall_repairs >= 5 and not eof:
+                    if stall_repairs >= 8 and not eof:
                         with enc_lock:
                             oldest = enc.oldest_id
                             w = enc.pack_source_id(oldest) if oldest is not None else None
-                            c = (
-                                enc.make_coded(prefer_oldest=True)
-                                if enc.last_plr_byte > 0
-                                else None
-                            )
                         if w:
                             send_datagram(w)
-                        if c:
-                            send_datagram(c.pack())
 
                     cur_batch = batch
                     if wan and plr_b == 0 and not repairs:
-                        cur_batch = 512 if (
-                            delay_cc is not None and delay_cc.slow_start
-                        ) else 2048
+                        cur_batch = 2048
 
-                    # Cap by window AND flight (slow-start cwnd) — do not fill 8k at t=0
+                    # Cap new data by flight cwnd (unacked ≈ window_size)
                     flight_cap = int(ack_progress["flight"])
                     with enc_lock:
                         win = enc.window_size
                         room = enc.cfg.max_window - win
+                        # If feedback shrunk flight below current win, raise it
+                        if flight_cap < win:
+                            flight_cap = win
+                            ack_progress["flight"] = win
                         flight_room = flight_cap - win
                     n_take = min(cur_batch, max(room, 0), max(flight_room, 0))
                     chunks: list[bytes] = []
@@ -380,18 +374,27 @@ def run_server(
                                 send_datagram(w)
                             time.sleep(0.001)
                     elif sent == 0:
+                        # Flight-full or waiting on ACK: retransmit holes only, no coded spam
                         with enc_lock:
-                            repairs = enc.pop_nack_retransmit(limit=16)
-                            c = enc.make_coded(prefer_oldest=True)
+                            repairs = enc.pop_nack_retransmit(limit=8)
                             oldest = enc.oldest_id
-                            w = enc.pack_source_id(oldest) if oldest is not None else None
+                            w = (
+                                enc.pack_source_id(oldest)
+                                if oldest is not None and plr_b > 0
+                                else None
+                            )
+                            c = (
+                                enc.make_coded(prefer_oldest=True)
+                                if plr_b > 0
+                                else None
+                            )
                         for wire in repairs:
                             send_datagram(wire)
-                        if c:
-                            send_datagram(c.pack())
                         if w:
                             send_datagram(w)
-                        time.sleep(0.001)
+                        if c:
+                            send_datagram(c.pack())
+                        time.sleep(0.0005)
 
                     now = time.monotonic()
                     if now - last_progress >= 1.0:
