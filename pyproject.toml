@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Tetrys on-the-fly network coding transport over UDP (RFC 9407)"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "numpy>=1.26",
+]
 
 [project.scripts]
 tetrys-server = "tetrys_nc.server:main"

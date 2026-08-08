@@ -31,11 +31,13 @@ App (file) → Tetrys Encoder → UDP → Tetrys Decoder → App (file)
 
 1. **Source packet** — исходный символ с ID (систематическая передача).
 2. **Coded packet** — линейная комбинация неподтверждённых символов из elastic window; коэффициенты Vandermonde GF(256) (`CCGI=0b01`).
-3. **Window update** — клиент периодически шлёт SACK; сервер вычищает ACKed символы из окна и подстраивает частоту redundancy.
+3. **Window update** — клиент периодически шлёт SACK + echo timestamp; сервер вычищает ACKed символы и чинит дыры (NACK retransmit / coded).
+4. **Delay-based rate control** (идея FASP) — pace по RTT/queuing delay; потери **не** режут скорость, только усиливают repair.
+5. **GF(2⁸)** — NumPy (готовые wheels, без своей компиляции) на hot path.
 
 Параметры по умолчанию (оптимизированы под localhost / быстрый тест 1 ГиБ):
-payload **32768** B, window **8192**, redundancy **0** (repair включается по PLR).
-Для WAN/MTU 1500: `--payload-size 1400 --redundancy 8`.
+payload **32768** B, window **8192**, redundancy **32**.
+Для WAN/MTU 1500: `--wan` (или `--payload-size 1400 --redundancy 8 --rate 200`).
 
 ## Опции
 
@@ -79,15 +81,15 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan` стартует **легко** (coded каждые 4 source, degree=12) — иначе pure-Python GF становится bottleneck (~0.2 MiB/s при plr=0).  
-При росте PLR автоматически усиливается до 1 source + 2..4 coded.
+`--wan`: payload 1350, **redundancy=0** (нет periodic coded), delay-based pacing до `--rate` (default 200 Mbit/s).  
+При PLR/NACK — retransmit + coded repair; send rate от loss не режется. GF через NumPy (`gf=numpy` в логе).
 
-Принудительно густо (если потери реально огромные):
 ```bash
---wan --redundancy 1 --coded-burst 3 --rate-mbit 200
+--wan --rate 200
 ```
 
 ## Замечания
 
 - Реализация следует идеям RFC 9407 (elastic window, on-the-fly coding, feedback).
-- Localhost: большие payload; WAN: обязательно `--wan`.
+- Rate control — FASP-подобно: delay-based, loss ≠ congestion.
+- Localhost: большие payload; WAN: обязательно `--wan` на **обоих** концах.

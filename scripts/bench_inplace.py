@@ -97,10 +97,9 @@ def run_once(path: Path, payload: int, window: int, redundancy: int, port: int) 
                                 break
                             except BlockingIOError:
                                 select.select([], [sock], [], 0.005)
-                        coded = enc.maybe_coded()
-                        if coded:
+                        for cwire in enc.maybe_coded():
                             try:
-                                sock.sendto(coded, client)
+                                sock.sendto(cwire, client)
                             except BlockingIOError:
                                 pass
                         sent += 1
@@ -174,11 +173,14 @@ def run_once(path: Path, payload: int, window: int, redundancy: int, port: int) 
         written = 0
         t0 = time.monotonic()
         fin = False
+        last_echo = 0
         with out.open("wb", buffering=8 * 1024 * 1024) as f:
             while written < file_size:
                 r, _, _ = select.select([sock], [], [], 0.1)
                 if not r:
-                    sock.sendto(dec.build_feedback().pack(), server)
+                    fb = dec.build_feedback()
+                    fb.echo_ts_us = last_echo
+                    sock.sendto(fb.pack(), server)
                     continue
                 while True:
                     try:
@@ -190,10 +192,15 @@ def run_once(path: Path, payload: int, window: int, redundancy: int, port: int) 
                     ptype = data[2]
                     delivered = []
                     if ptype == PKT_SOURCE:
-                        sid = struct.unpack_from("!I", data, 4)[0]
-                        delivered = dec.on_source_raw(sid, data[8:])
+                        sid, ts = struct.unpack_from("!II", data, 4)
+                        if ts:
+                            last_echo = ts
+                        delivered = dec.on_source_raw(sid, data[12:])
                     elif ptype == PKT_CODED:
-                        delivered = dec.on_coded(CodedPacket.unpack(data))
+                        coded = CodedPacket.unpack(data)
+                        if coded.send_ts_us:
+                            last_echo = coded.send_ts_us
+                        delivered = dec.on_coded(coded)
                     elif ptype == PKT_FIN:
                         fin = True
                         delivered = dec.pop_deliverable()
@@ -205,7 +212,9 @@ def run_once(path: Path, payload: int, window: int, redundancy: int, port: int) 
                         f.write(chunk)
                         written += len(chunk)
                 if dec.need_feedback():
-                    sock.sendto(dec.build_feedback().pack(), server)
+                    fb = dec.build_feedback()
+                    fb.echo_ts_us = last_echo
+                    sock.sendto(fb.pack(), server)
                 if fin and written >= file_size:
                     break
         elapsed = time.monotonic() - t0

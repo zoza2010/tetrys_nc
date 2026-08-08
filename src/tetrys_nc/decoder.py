@@ -157,8 +157,7 @@ class TetrysDecoder:
                             new_coefs[sid] = v
                     scaled = gf256.scale_bytes(factor, self._equations[i][1])
                     new_payload = bytearray(self._equations[j][1])
-                    for k, b in enumerate(scaled):
-                        new_payload[k] ^= b
+                    gf256.xor_bytes(new_payload, scaled)
                     self._equations[j] = (new_coefs, new_payload)
                     changed = True
             self._equations = [e for e in self._equations if e[0]]
@@ -224,6 +223,7 @@ class TetrysDecoder:
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
             sack=sack,
+            echo_ts_us=0,
         )
 
     def is_complete(self) -> bool:

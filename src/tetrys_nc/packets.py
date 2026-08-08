@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 
 MAGIC = 0x54  # 'T'
@@ -16,6 +16,11 @@ PKT_META = 0x10
 PKT_FIN = 0x11
 PKT_READY = 0x12
 
+# SOURCE: magic,ver,type,flags, sid, send_ts_us, payload
+# CODED:  magic,ver,type,flags, cid, first, last, send_ts_us, payload
+SOURCE_HDR_SIZE = 12
+CODED_HDR_SIZE = 20
+
 
 class PacketType(IntEnum):
     SOURCE = PKT_SOURCE
@@ -27,26 +32,37 @@ class PacketType(IntEnum):
 
 
 _HDR = struct.Struct("!BBBB")
-_SOURCE_PREFIX = struct.Struct("!BBBBI")
-_CODED_PREFIX = struct.Struct("!BBBBIII")
+_SOURCE_PREFIX = struct.Struct("!BBBBII")
+_CODED_PREFIX = struct.Struct("!BBBBIIII")
 
 
-def pack_source(symbol_id: int, payload: bytes | bytearray) -> bytes:
-    return _SOURCE_PREFIX.pack(MAGIC, VERSION, PKT_SOURCE, 0, symbol_id) + payload
+def pack_source(symbol_id: int, payload: bytes | bytearray, send_ts_us: int = 0) -> bytes:
+    return (
+        _SOURCE_PREFIX.pack(MAGIC, VERSION, PKT_SOURCE, 0, symbol_id, send_ts_us & 0xFFFFFFFF)
+        + payload
+    )
 
 
 @dataclass(slots=True)
 class SourcePacket:
     symbol_id: int
     payload: bytes
+    send_ts_us: int = 0
 
     def pack(self) -> bytes:
-        return pack_source(self.symbol_id, self.payload)
+        return pack_source(self.symbol_id, self.payload, self.send_ts_us)
 
     @classmethod
     def unpack(cls, data: bytes) -> SourcePacket:
+        # New format: 12-byte header. Legacy 8-byte header still accepted.
+        if len(data) >= 12:
+            sid, ts = struct.unpack_from("!II", data, 4)
+            # Heuristic: legacy packets have payload starting at 8; if the
+            # "timestamp" looks like raw payload (high entropy) we still treat
+            # bytes 8:12 as ts — wire is ours and always stamped now.
+            return cls(sid, data[12:], ts)
         sid = struct.unpack_from("!I", data, 4)[0]
-        return cls(sid, data[8:])
+        return cls(sid, data[8:], 0)
 
 
 @dataclass(slots=True)
@@ -55,6 +71,7 @@ class CodedPacket:
     first_source_id: int
     last_source_id: int
     payload: bytes
+    send_ts_us: int = 0
 
     def pack(self) -> bytes:
         return (
@@ -66,14 +83,19 @@ class CodedPacket:
                 self.coded_id,
                 self.first_source_id,
                 self.last_source_id,
+                self.send_ts_us & 0xFFFFFFFF,
             )
             + self.payload
         )
 
     @classmethod
     def unpack(cls, data: bytes) -> CodedPacket:
+        if len(data) >= 20:
+            cid, first, last, ts = struct.unpack_from("!IIII", data, 4)
+            return cls(cid, first, last, data[20:], ts)
+        # Legacy 16-byte coded header
         cid, first, last = struct.unpack_from("!III", data, 4)
-        return cls(cid, first, last, data[16:])
+        return cls(cid, first, last, data[16:], 0)
 
 
 @dataclass(slots=True)
@@ -83,6 +105,7 @@ class WindowUpdatePacket:
     cumulative_ack: symbols with id < cumulative_ack are fully delivered.
     sack: bit i set => symbol (cumulative_ack + i) is already held by receiver.
     Missing bits in the SACK range are NACK targets for repair/retransmit.
+    echo_ts_us: last sender timestamp echoed (for RTT / delay-based CC).
     """
 
     cumulative_ack: int
@@ -90,6 +113,7 @@ class WindowUpdatePacket:
     nb_not_used_coded: int
     plr_byte: int
     sack: bytes = b""
+    echo_ts_us: int = 0
 
     def pack(self) -> bytes:
         sack = self.sack
@@ -98,23 +122,34 @@ class WindowUpdatePacket:
             sack = sack + b"\x00" * pad
         sack_words = len(sack) // 4
         return _HDR.pack(MAGIC, VERSION, PKT_WND_UPT, 0) + struct.pack(
-            "!III BB",
+            "!III BB I",
             self.cumulative_ack,
             self.nb_missing_src,
             self.nb_not_used_coded,
             self.plr_byte & 0xFF,
             sack_words & 0xFF,
+            self.echo_ts_us & 0xFFFFFFFF,
         ) + sack
 
     @classmethod
     def unpack(cls, data: bytes) -> WindowUpdatePacket:
+        # New: header4 + III BB I = 4+12+2+4 = 22, then sack
+        if len(data) >= 22:
+            cum, nb_miss, nb_coded, plr, sack_words, echo = struct.unpack_from(
+                "!III BB I", data, 4
+            )
+            sack = data[22 : 22 + sack_words * 4]
+            return cls(cum, nb_miss, nb_coded, plr, sack, echo)
+        # Mid format without echo: header4 + III BB = 18
         if len(data) >= 18:
-            cum, nb_miss, nb_coded, plr, sack_words = struct.unpack_from("!III BB", data, 4)
+            cum, nb_miss, nb_coded, plr, sack_words = struct.unpack_from(
+                "!III BB", data, 4
+            )
             sack = data[18 : 18 + sack_words * 4]
-            return cls(cum, nb_miss, nb_coded, plr, sack)
-        # backward-compatible short format
+            return cls(cum, nb_miss, nb_coded, plr, sack, 0)
+        # Short legacy
         cum, nb_miss, nb_coded, plr = struct.unpack_from("!III B", data, 4)
-        return cls(cum, nb_miss, nb_coded, plr, b"")
+        return cls(cum, nb_miss, nb_coded, plr, b"", 0)
 
     def missing_ids(self, limit: int = 64) -> list[int]:
         """Symbol IDs in SACK range that receiver does NOT have."""

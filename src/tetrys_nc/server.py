@@ -21,6 +21,7 @@ from .packets import (
     WindowUpdatePacket,
     parse_packet,
 )
+from .ratectl import DelayRateController, RateLimiter
 
 
 def file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
@@ -32,34 +33,6 @@ def file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
                 break
             h.update(data)
     return h.hexdigest()
-
-
-class RateLimiter:
-    """Simple token-bucket pacing in bytes/sec."""
-
-    def __init__(self, rate_bps: float, burst: float | None = None) -> None:
-        self.max_rate = max(rate_bps, 1.0)  # hard ceiling from --rate/--rate-mbit
-        self.min_rate = min(2_000_000.0, self.max_rate)  # floor, never above max
-        self.rate = self.max_rate
-        self.burst = burst if burst is not None else self.rate * 0.25
-        self.tokens = self.burst
-        self.updated = time.monotonic()
-
-    def set_rate(self, rate_bps: float) -> None:
-        self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.25, self.rate * 0.05)
-
-    def consume(self, nbytes: int) -> None:
-        now = time.monotonic()
-        elapsed = now - self.updated
-        self.updated = now
-        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-        self.tokens -= nbytes
-        if self.tokens < 0:
-            sleep_s = (-self.tokens) / self.rate
-            time.sleep(sleep_s)
-            self.updated = time.monotonic()
-            self.tokens = 0.0
 
 
 def run_server(
@@ -83,23 +56,28 @@ def run_server(
     if coded_burst <= 0:
         coded_burst = 1
     if wan:
-        # WAN: start LEAN (CPU+bandwidth). Ramp repair only when PLR/NACK appear.
-        # Previous 1x3 + degree=48 made pure-Python GF the bottleneck (~0.2 MiB/s)
-        # even with plr=0.
+        # WAN: no periodic coded on healthy path (NACK/stall repair only).
         if payload_size >= 8000:
             payload_size = 1350
         if max_window < 2048:
             max_window = 2048
         if redundancy_every >= 32:
-            # light periodic repair when healthy; ramps up on PLR
-            redundancy_every = 8
+            redundancy_every = 0
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
         if rate_mbit <= 0:
             rate_mbit = 200.0
+        if redundancy_every > 0:
+            print(
+                f"warning: --redundancy {redundancy_every} on WAN adds coded load; "
+                f"prefer --redundancy 0 (NACK repair only)",
+                file=sys.stderr,
+            )
     else:
         code_degree = 8
+
+    from . import gf256
 
     file_size = file_path.stat().st_size
     if skip_hash:
@@ -114,7 +92,7 @@ def run_server(
     print(
         f"symbols={total_symbols} payload={payload_size} "
         f"window={max_window} redundancy={redundancy_every}x{coded_burst} "
-        f"wan={wan} rate_mbit={rate_mbit or 'unlimited'}"
+        f"wan={wan} rate_mbit={rate_mbit or 'unlimited'} gf={gf256.backend()}"
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -139,13 +117,30 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    ack_progress = {"ack": 0, "plr": 0, "t": time.monotonic()}
+    # flight = max unacked source packets allowed (slow-start cwnd); WAN opens small
+    ack_progress = {
+        "ack": 0,
+        "plr": 0,
+        "t": time.monotonic(),
+        "rtt_us": 0.0,
+        "flight": 64 if wan else max_window,
+    }
 
     # Pacing: WAN always; optional explicit --rate-mbit
+    # Slow-start from a fraction of --rate, then delay-based climb (loss ≠ cut rate).
     limiter: RateLimiter | None = None
+    delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
-        start_rate = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
-        limiter = RateLimiter(start_rate)
+        max_bps = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
+        # Open ~3% of target (cap ~80 Mbit) — avoid flooding BDP before first RTT
+        start_bps = min(max_bps, max(1_250_000.0, max_bps * 0.03))
+        start_bps = min(start_bps, 10_000_000.0)
+        limiter = RateLimiter(max_bps, start_bps=start_bps)
+        delay_cc = DelayRateController(limiter)
+        print(
+            f"pace slow-start {start_bps / (1024 * 1024):.1f} → "
+            f"max {max_bps / (1024 * 1024):.1f} MiB/s"
+        )
 
     deadline = time.monotonic() + 600
     while client_addr is None:
@@ -192,18 +187,32 @@ def run_server(
                     missing = pkt.missing_ids(limit=64)
                     with enc_lock:
                         enc.apply_feedback(pkt.cumulative_ack, pkt.plr_byte, missing)
+                    prev_ack = ack_progress["ack"]
                     ack_progress["ack"] = pkt.cumulative_ack
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
-                    # AIMD within [min_rate, max_rate] — never exceeds --rate-mbit
-                    if limiter is not None:
-                        plr = pkt.plr_byte * 100.0 / 256.0
-                        if plr >= 40 and pkt.nb_missing_src >= 8:
-                            limiter.set_rate(limiter.rate * 0.7)
-                        elif plr >= 20 and pkt.nb_missing_src >= 4:
-                            limiter.set_rate(limiter.rate * 0.9)
-                        elif plr < 5 and pkt.nb_missing_src <= 2:
-                            limiter.set_rate(limiter.rate * 1.05)
+                    # Grow / shrink in-flight cap (packet cwnd) with ACK progress
+                    delta = max(0, pkt.cumulative_ack - prev_ack)
+                    if wan and delta > 0:
+                        if delay_cc is not None and delay_cc.slow_start:
+                            ack_progress["flight"] = min(
+                                enc.cfg.max_window,
+                                ack_progress["flight"] + max(delta, 1),
+                            )
+                        else:
+                            ack_progress["flight"] = min(
+                                enc.cfg.max_window,
+                                ack_progress["flight"] + max(delta // 2, 1),
+                            )
+                    if wan and pkt.plr_byte >= 40:
+                        ack_progress["flight"] = max(
+                            64, ack_progress["flight"] // 2
+                        )
+                    if delay_cc is not None and pkt.echo_ts_us:
+                        now_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+                        rtt = delay_cc.on_echo(pkt.echo_ts_us, now_us)
+                        if rtt is not None:
+                            ack_progress["rtt_us"] = rtt
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -216,12 +225,12 @@ def run_server(
     t0 = time.monotonic()
     last_progress = t0
     fin_sent = False
-    batch = 64 if wan else 2048
+    batch = 128 if wan else 2048
     file_offset = 0
     last_ack_seen = 0
     stall_repairs = 0
 
-    def send_datagram(wire: bytes) -> None:
+    def send_datagram(wire: bytes | memoryview) -> None:
         if limiter is not None:
             limiter.consume(len(wire))
         while True:
@@ -242,13 +251,13 @@ def run_server(
                         _print_summary(enc, file_size, elapsed)
                         return 0
 
-                    # Repair only when there are real holes / losses — not on every WAN tick
+                    # Repair: NACK retransmit; light coded only on holes (cap flood)
                     with enc_lock:
-                        repairs = enc.pop_nack_retransmit(limit=32 if wan else 4)
+                        repairs = enc.pop_nack_retransmit(limit=16 if wan else 4)
                         plr_b = enc.last_plr_byte
                         burst = enc.coded_burst
                         need_repair = bool(repairs) or plr_b > 0
-                        n_repair_coded = burst if need_repair else 0
+                        n_repair_coded = min(burst, 2) if need_repair else 0
                         coded_repairs = []
                         for _ in range(n_repair_coded):
                             c = enc.make_coded(prefer_oldest=True)
@@ -260,7 +269,7 @@ def run_server(
                     for wire in coded_repairs:
                         send_datagram(wire)
 
-                    # Detect ACK stall → light repair (not a coded flood)
+                    # ACK stall → retransmit oldest; coded only if holes exist
                     cur_ack = ack_progress["ack"]
                     if cur_ack == last_ack_seen:
                         stall_repairs += 1
@@ -281,17 +290,21 @@ def run_server(
                         if c:
                             send_datagram(c.pack())
 
-                    # Larger batches when the path is healthy (no holes)
                     cur_batch = batch
                     if wan and plr_b == 0 and not repairs:
-                        cur_batch = 512
+                        cur_batch = 512 if (
+                            delay_cc is not None and delay_cc.slow_start
+                        ) else 2048
 
-                    sent = 0
-                    while not eof and sent < cur_batch:
-                        with enc_lock:
-                            can = enc.can_accept()
-                        if not can:
-                            break
+                    # Cap by window AND flight (slow-start cwnd) — do not fill 8k at t=0
+                    flight_cap = int(ack_progress["flight"])
+                    with enc_lock:
+                        win = enc.window_size
+                        room = enc.cfg.max_window - win
+                        flight_room = flight_cap - win
+                    n_take = min(cur_batch, max(room, 0), max(flight_room, 0))
+                    chunks: list[bytes] = []
+                    for _ in range(n_take):
                         if file_offset >= file_size:
                             eof = True
                             break
@@ -299,19 +312,25 @@ def run_server(
                         raw = mm[file_offset:end]
                         file_offset = end
                         if len(raw) < payload_size:
-                            chunk = bytes(raw) + b"\x00" * (payload_size - len(raw))
+                            chunks.append(
+                                bytes(raw) + b"\x00" * (payload_size - len(raw))
+                            )
                         else:
-                            chunk = bytes(raw)
+                            chunks.append(bytes(raw))
 
-                        with enc_lock:
-                            wire = bytes(enc.add_source(chunk))
-                            coded_list = enc.maybe_coded()
+                    wires: list[bytes] = []
+                    with enc_lock:
+                        for chunk in chunks:
+                            if not enc.can_accept():
+                                break
+                            wires.append(bytes(enc.add_source(chunk)))
+                            wires.extend(enc.maybe_coded())
+
+                    for wire in wires:
                         send_datagram(wire)
-                        for coded in coded_list:
-                            send_datagram(coded)
-                        sent += 1
                         if pace_us > 0:
                             time.sleep(pace_us / 1_000_000.0)
+                    sent = len(chunks)
 
                     if eof:
                         with enc_lock:
@@ -364,12 +383,21 @@ def run_server(
                         rate = file_offset / max(now - t0, 1e-6) / (1024 * 1024)
                         pace = (limiter.rate / (1024 * 1024)) if limiter else 0
                         cap = (limiter.max_rate / (1024 * 1024)) if limiter else 0
+                        rtt_ms = ack_progress["rtt_us"] / 1000.0
+                        q_ms = 0.0
+                        ss = ""
+                        if delay_cc is not None:
+                            if delay_cc.srtt_us and delay_cc.base_rtt_us:
+                                q_ms = max(0.0, delay_cc.srtt_us - delay_cc.base_rtt_us) / 1000.0
+                            ss = " ss" if delay_cc.slow_start else " ca"
+                        flight = int(ack_progress["flight"])
                         print(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
-                            f"win={st['window']} ack={st['cumulative_ack']} "
+                            f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
-                            f"pace={pace:.1f}/{cap:.1f}MiB/s app={rate:.1f} MiB/s"
+                            f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms "
+                            f"pace={pace:.1f}/{cap:.1f}MiB/s{ss} app={rate:.1f} MiB/s"
                         )
 
                     if fin_sent and time.monotonic() - t0 > 3600:
@@ -408,14 +436,14 @@ def main(argv: list[str] | None = None) -> int:
         "--coded-burst",
         type=int,
         default=0,
-        help="coded packets per redundancy tick (0=auto; WAN default 3)",
+        help="coded packets per redundancy tick (0=auto; WAN default 1)",
     )
     p.add_argument("--pace-us", type=float, default=0.0)
     p.add_argument("--skip-hash", action="store_true")
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN profile: payload 1350, window 2048, light repair (ramps up on loss)",
+        help="WAN: payload 1350, delay-based CC, redundancy=0 (NACK repair), NumPy GF",
     )
     p.add_argument(
         "--rate-mbit",

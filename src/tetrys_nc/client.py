@@ -1,4 +1,4 @@
-"""Tetrys NC file client — receives a file from the server over UDP."""
+"""Tetrys NC file client — receives a file from a server over UDP."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .packets import (
     PKT_FIN,
     PKT_META,
     PKT_SOURCE,
+    SOURCE_HDR_SIZE,
     CodedPacket,
     FinPacket,
     MetaPacket,
@@ -100,6 +101,15 @@ def run_client(
     last_progress = t0
     fin_seen = False
     last_fb = 0.0
+    # Last sender timestamp seen — echoed in feedback for delay-based CC
+    last_echo_ts = 0
+
+    def send_feedback() -> None:
+        nonlocal last_fb
+        fb = dec.build_feedback()
+        fb.echo_ts_us = last_echo_ts
+        sock.sendto(fb.pack(), server)
+        last_fb = time.monotonic()
 
     with out_path.open("wb", buffering=8 * 1024 * 1024) as out:
         while True:
@@ -107,8 +117,7 @@ def run_client(
             r, _, _ = select.select([sock], [], [], timeout)
             now = time.monotonic()
             if not r:
-                sock.sendto(dec.build_feedback().pack(), server)
-                last_fb = now
+                send_feedback()
                 if fin_seen and dec.is_complete():
                     break
                 if now - t0 > 3600:
@@ -129,10 +138,19 @@ def run_client(
 
                 delivered: list[tuple[int, bytes]] = []
                 if ptype == PKT_SOURCE:
-                    sid = struct.unpack_from("!I", data, 4)[0]
-                    delivered = dec.on_source_raw(sid, data[8:])
+                    if len(data) >= SOURCE_HDR_SIZE:
+                        sid, ts = struct.unpack_from("!II", data, 4)
+                        if ts:
+                            last_echo_ts = ts
+                        delivered = dec.on_source_raw(sid, data[SOURCE_HDR_SIZE:])
+                    else:
+                        sid = struct.unpack_from("!I", data, 4)[0]
+                        delivered = dec.on_source_raw(sid, data[8:])
                 elif ptype == PKT_CODED:
-                    delivered = dec.on_coded(CodedPacket.unpack(data))
+                    coded = CodedPacket.unpack(data)
+                    if coded.send_ts_us:
+                        last_echo_ts = coded.send_ts_us
+                    delivered = dec.on_coded(coded)
                 elif ptype == PKT_FIN:
                     fin_seen = True
                     dec.total_symbols = struct.unpack_from("!I", data, 4)[0]
@@ -153,14 +171,12 @@ def run_client(
 
                 processed += 1
 
-            # Aggressive feedback when holes or periodically
             if processed and (
                 dec.need_feedback()
                 or (wan and now - last_fb > 0.05)
                 or (dec.has_holes() and now - last_fb > 0.05)
             ):
-                sock.sendto(dec.build_feedback().pack(), server)
-                last_fb = now
+                send_feedback()
 
             if now - last_progress >= 1.0:
                 last_progress = now

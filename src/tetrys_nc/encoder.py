@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import struct
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 from . import gf256
-from .packets import MAGIC, VERSION, CodedPacket
+from .packets import MAGIC, VERSION, SOURCE_HDR_SIZE, CodedPacket
 
 
-_SOURCE_PREFIX = struct.Struct("!BBBBI")
+_SOURCE_PREFIX = struct.Struct("!BBBBII")
 
 
 @dataclass(slots=True)
@@ -37,11 +38,21 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        self._wire = bytearray(8 + self.cfg.payload_size)
+        self._wire = bytearray(SOURCE_HDR_SIZE + self.cfg.payload_size)
         # NACK queue from receiver SACK holes
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
         self.last_plr_byte = 0
+        self._send_ts_us = 0
+
+    def stamp(self) -> int:
+        """Refresh send timestamp (monotonic µs, uint32)."""
+        self._send_ts_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+        return self._send_ts_us
+
+    @property
+    def send_ts_us(self) -> int:
+        return self._send_ts_us
 
     @property
     def window_size(self) -> int:
@@ -82,11 +93,13 @@ class TetrysEncoder:
         self._sources_since_coded += 1
         self._total_sent_source += 1
 
+        ts = self.stamp()
         wire = self._wire
-        if len(wire) != 8 + ps:
-            wire = self._wire = bytearray(8 + ps)
-        _SOURCE_PREFIX.pack_into(wire, 0, MAGIC, VERSION, 0, 0, sid)
-        wire[8:] = payload
+        need = SOURCE_HDR_SIZE + ps
+        if len(wire) != need:
+            wire = self._wire = bytearray(need)
+        _SOURCE_PREFIX.pack_into(wire, 0, MAGIC, VERSION, 0, 0, sid, ts)
+        wire[SOURCE_HDR_SIZE:] = payload
         return memoryview(wire)
 
     def maybe_coded(self) -> list[bytes]:
@@ -119,18 +132,16 @@ class TetrysEncoder:
         else:
             chosen = items[-degree:]
         first, last = chosen[0][0], chosen[-1][0]
-        # Ensure contiguous span for first/last encoding vector
-        # Window is always contiguous by construction.
         cid = self._next_coded_id
         self._next_coded_id += 1
 
-        out = bytearray(self.cfg.payload_size)
-        for sid, data in chosen:
-            coef = gf256.vandermonde_coef(sid + 1, cid)
-            gf256.mul_bytes(coef, data, out)
+        terms = [
+            (gf256.vandermonde_coef(sid + 1, cid), data) for sid, data in chosen
+        ]
+        payload = gf256.linear_combine(terms, self.cfg.payload_size)
 
         self._total_sent_coded += 1
-        return CodedPacket(cid, first, last, bytes(out))
+        return CodedPacket(cid, first, last, payload, send_ts_us=self.stamp())
 
     def apply_feedback(
         self,
@@ -152,6 +163,7 @@ class TetrysEncoder:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
 
+        # PLR only drives repair intensity — never sender rate (FASP-style).
         self.last_plr_byte = plr_byte
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
         if plr >= 40:
@@ -167,7 +179,6 @@ class TetrysEncoder:
             self._redundancy_every = 1
             self._coded_burst = max(self.cfg.coded_burst, 1)
         else:
-            # Healthy path: back off to configured light redundancy (save CPU)
             self._redundancy_every = self.cfg.redundancy_every
             self._coded_burst = self.cfg.coded_burst
         return removed
@@ -190,7 +201,9 @@ class TetrysEncoder:
         payload = self._window.get(symbol_id)
         if payload is None:
             return None
-        return _SOURCE_PREFIX.pack(MAGIC, VERSION, 0, 0, symbol_id) + payload
+        return _SOURCE_PREFIX.pack(
+            MAGIC, VERSION, 0, 0, symbol_id, self.stamp()
+        ) + payload
 
     def stats(self) -> dict:
         return {
