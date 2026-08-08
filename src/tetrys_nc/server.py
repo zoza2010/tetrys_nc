@@ -444,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, FASP/BBR pacing, ~12% HOL FEC + light NACK",
+        help="WAN: payload 1350, FASP/BBR pacing, ~12%% HOL FEC + light NACK",
     )
     p.add_argument(
         "--rate-mbit",
