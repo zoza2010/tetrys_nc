@@ -81,8 +81,8 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=0** (нет periodic coded), delay-based pacing до `--rate` (default 200 Mbit/s).  
-При PLR/NACK — retransmit + coded repair; send rate от loss не режется. GF через NumPy (`gf=numpy` в логе).
+`--wan`: payload 1350, **redundancy=0**, **BLAST pacing** на весь `--rate` (default 200 Mbit/s).  
+Потери → NACK retransmit (не обвал rate). Цель — забить канал, не fairness. GF: NumPy (`gf=numpy`).
 
 ```bash
 --wan --rate 200

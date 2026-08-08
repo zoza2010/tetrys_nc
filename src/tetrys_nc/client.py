@@ -36,10 +36,10 @@ def run_client(
     wan: bool = False,
 ) -> int:
     if wan:
-        if max_window < 2048:
-            max_window = 2048
+        if max_window < 8192:
+            max_window = 8192
         if feedback_every > 32:
-            feedback_every = 16
+            feedback_every = 8
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 4 * 1024 * 1024)

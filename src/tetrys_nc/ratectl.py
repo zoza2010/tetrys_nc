@@ -1,4 +1,4 @@
-"""Hybrid rate control: delay + loss (this WAN drops without RTT inflation)."""
+"""Aggressive fill-pipe rate control (loss → repair, not rate collapse)."""
 
 from __future__ import annotations
 
@@ -15,18 +15,19 @@ class RateLimiter:
         burst: float | None = None,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        self.min_rate = min(self.max_rate, max(2_500_000.0, self.max_rate * 0.05))
+        # High floor — never collapse to a crawl when filling the pipe
+        self.min_rate = min(self.max_rate, max(self.max_rate * 0.35, 8_000_000.0))
         if start_bps is None:
-            start_bps = min(self.max_rate, max(1_250_000.0, self.max_rate * 0.03))
-            start_bps = min(start_bps, 10_000_000.0)
-        self.rate = min(self.max_rate, max(start_bps, 1_000_000.0))
-        self.burst = burst if burst is not None else max(self.rate * 0.02, 32_000.0)
-        self.tokens = min(self.burst, 64_000.0)
+            # Open near target immediately (user wants full channel)
+            start_bps = self.max_rate
+        self.rate = min(self.max_rate, max(start_bps, self.min_rate))
+        self.burst = burst if burst is not None else max(self.rate * 0.1, 200_000.0)
+        self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.08, 65_000.0)
+        self.burst = max(self.rate * 0.1, 200_000.0)
 
     def consume(self, nbytes: int) -> None:
         now = time.monotonic()
@@ -43,11 +44,10 @@ class RateLimiter:
 
 class DelayRateController:
     """
-    Rate control for paths that may signal congestion via loss OR delay.
+    Fill-pipe controller: stay near max_rate.
 
-    - plr≈0 and low queue → climb
-    - high plr → cut (this Spain↔RU path drops without RTT bloat)
-    - high queuing delay → cut
+    Loss is repaired (NACK/coded), not treated as a reason to vacate the channel.
+    Only extreme standing queue slightly eases off — and never below min_rate (~35% cap).
     """
 
     __slots__ = (
@@ -68,48 +68,28 @@ class DelayRateController:
         self.last_rtt_us: float = 0.0
         self.alpha = alpha
         self.samples = 0
-        self.slow_start = True
-        self.warmup_left = 8
+        self.slow_start = False  # already at/near target
+        self.warmup_left = 0
 
     def _bump_rate(self, factor: float, additive: float = 0.0) -> None:
         rate = self.limiter.rate
         nxt = min(self.limiter.max_rate, max(rate * factor, rate + additive))
-        if nxt < self.limiter.min_rate:
-            self.limiter.rate = nxt
-            self.limiter.burst = max(nxt * 0.05, 32_000.0)
-        else:
-            self.limiter.set_rate(nxt)
-        if self.limiter.rate >= self.limiter.max_rate * 0.98:
-            self.slow_start = False
+        self.limiter.set_rate(nxt)
 
     def on_loss(self, plr_byte: int) -> None:
-        """Cut rate when receiver reports holes (lossy path without delay signal)."""
-        if plr_byte < 20:
+        """Loss → keep sending; optional tiny ease only on extreme PLR."""
+        if plr_byte < 200:  # ~78% — ignore normal hole bursts
             return
-        self.slow_start = False
-        rate = self.limiter.rate
-        if plr_byte >= 100:
-            self.limiter.set_rate(rate * 0.5)
-        elif plr_byte >= 60:
-            self.limiter.set_rate(rate * 0.65)
-        elif plr_byte >= 40:
-            self.limiter.set_rate(rate * 0.8)
-        else:
-            self.limiter.set_rate(rate * 0.9)
+        # Still stay high: at most -10%
+        self.limiter.set_rate(self.limiter.rate * 0.9)
 
     def on_ack(self, acked: int, plr_byte: int = 0) -> None:
-        """Climb only when path looks healthy."""
-        if acked <= 0 or plr_byte >= 16:
+        """Push back toward max whenever ACKs advance."""
+        if acked <= 0:
             return
-        queue_us = 0.0
-        if self.srtt_us is not None and self.base_rtt_us is not None:
-            queue_us = max(0.0, self.srtt_us - self.base_rtt_us)
-        if queue_us > 200_000:
-            return
-        if self.slow_start or self.samples == 0:
-            self._bump_rate(1.10, additive=150_000.0)
-        else:
-            self._bump_rate(1.03, additive=80_000.0)
+        # Always climb toward ceiling (ignore plr for rate)
+        if self.limiter.rate < self.limiter.max_rate * 0.99:
+            self._bump_rate(1.08, additive=500_000.0)
 
     def on_echo(self, echo_ts_us: int, now_us: int | None = None) -> float | None:
         if not echo_ts_us:
@@ -124,33 +104,18 @@ class DelayRateController:
         self.samples += 1
         if self.base_rtt_us is None or rtt < self.base_rtt_us:
             self.base_rtt_us = float(rtt)
-        elif rtt < self.base_rtt_us * 1.05:
-            self.base_rtt_us = 0.95 * self.base_rtt_us + 0.05 * float(rtt)
         if self.srtt_us is None:
             self.srtt_us = float(rtt)
         else:
             a = self.alpha
             self.srtt_us = (1.0 - a) * self.srtt_us + a * float(rtt)
 
-        inst_queue = max(0.0, float(rtt) - (self.base_rtt_us or float(rtt)))
-        queue_us = max(0.0, self.srtt_us - self.base_rtt_us)
-
-        if self.warmup_left > 0:
-            self.warmup_left -= 1
-            if inst_queue < 30_000:
-                self._bump_rate(1.10, additive=120_000.0)
-            return float(rtt)
-
-        if inst_queue > 250_000 or queue_us > 200_000:
-            self.slow_start = False
-            self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.90))
-        elif inst_queue > 150_000 or queue_us > 120_000:
-            self.slow_start = False
-            self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.95))
-        elif self.slow_start and queue_us < 40_000 and inst_queue < 50_000:
-            self._bump_rate(1.12, additive=150_000.0)
-        elif queue_us < 30_000 and inst_queue < 40_000:
-            self._bump_rate(1.03, additive=60_000.0)
+        queue_us = max(0.0, self.srtt_us - (self.base_rtt_us or self.srtt_us))
+        # Only ease if queue is enormous; still keep ≥ min_rate (high floor)
+        if queue_us > 400_000:
+            self.limiter.set_rate(self.limiter.rate * 0.95)
+        else:
+            self._bump_rate(1.02, additive=200_000.0)
         return float(rtt)
 
     def stats(self) -> dict:

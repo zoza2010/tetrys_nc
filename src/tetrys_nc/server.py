@@ -122,15 +122,14 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight = max unacked sources (cwnd). WAN: start ~0.5*BDP-ish, grow fast.
-    # At 76ms RTT / 40MiB/s need ~2–3k packets in flight — 64 was starving the pipe.
+    # flight = max unacked sources. Blast mode: open wide, never shrink on loss.
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": 512 if wan else max_window,
+        "flight": (4096 if wan else max_window),
     }
 
     # Pacing: WAN always; optional explicit --rate-mbit
@@ -139,14 +138,12 @@ def run_server(
     delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
         max_bps = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
-        # Open ~3% of target (cap ~80 Mbit) — avoid flooding BDP before first RTT
-        start_bps = min(max_bps, max(1_250_000.0, max_bps * 0.03))
-        start_bps = min(start_bps, 10_000_000.0)
-        limiter = RateLimiter(max_bps, start_bps=start_bps)
+        # Blast: open at full --rate (fill the pipe; loss → NACK repair, not backoff)
+        limiter = RateLimiter(max_bps, start_bps=max_bps)
         delay_cc = DelayRateController(limiter)
         print(
-            f"pace slow-start {start_bps / (1024 * 1024):.1f} → "
-            f"max {max_bps / (1024 * 1024):.1f} MiB/s"
+            f"pace BLAST {max_bps / (1024 * 1024):.1f} MiB/s "
+            f"(loss→repair, no rate collapse)"
         )
 
     deadline = time.monotonic() + 600
@@ -199,18 +196,13 @@ def run_server(
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
-                    if wan and delta > 0 and pkt.plr_byte < 20:
+                    if wan and delta > 0:
+                        # Always grow flight toward full window (never shrink on loss)
                         ack_progress["flight"] = min(
                             enc.cfg.max_window,
-                            ack_progress["flight"] + max(delta, 1),
-                        )
-                    if wan and pkt.plr_byte >= 40:
-                        # Lossy without delay: shrink cwnd so we stop flooding
-                        ack_progress["flight"] = max(
-                            256, min(ack_progress["flight"], 1024) * 3 // 4
+                            max(ack_progress["flight"] + max(delta, 1), 4096),
                         )
                     if delay_cc is not None:
-                        # This path drops without RTT bloat — must cut on PLR
                         delay_cc.on_loss(pkt.plr_byte)
                         if delta > 0:
                             delay_cc.on_ack(delta, pkt.plr_byte)

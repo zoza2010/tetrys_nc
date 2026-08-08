@@ -21,7 +21,6 @@ def test_gf_mul_bytes_matches_scalar():
         out_a = bytearray(len(data))
         out_b = bytearray(len(data))
         gf256.mul_bytes(coef, data, out_a)
-        # scalar reference
         if coef == 0:
             pass
         elif coef == 1:
@@ -163,45 +162,30 @@ def test_window_update_echo_roundtrip():
     assert got.cumulative_ack == 10
     assert got.echo_ts_us == 123456
     assert got.plr_byte == 5
-    assert got.sack[0] & 1  # bit0 set => id 10 held
+    assert got.sack[0] & 1
     assert 10 not in got.missing_ids()
 
 
-def test_slow_start_begins_below_max():
-    lim = RateLimiter(100_000_000.0)  # 100 MB/s ceiling
-    assert lim.rate < lim.max_rate
-    assert lim.rate <= 10_000_000.0  # start capped (~80 Mbit)
+def test_blast_starts_at_max():
+    lim = RateLimiter(50_000_000.0)
+    assert lim.rate == lim.max_rate
+    assert lim.min_rate >= lim.max_rate * 0.3
 
 
-def test_delay_cc_ignores_loss_raises_on_clear_path():
-    lim = RateLimiter(10_000_000.0, start_bps=5_000_000.0)
-    cc = DelayRateController(lim)
-    cc.warmup_left = 0
-    send_ts = 1_000_000
-    assert cc.on_echo(send_ts, send_ts + 20_000) == 20_000.0
-    assert cc.base_rtt_us == 20_000.0
-    before = lim.rate
-    cc.on_echo(send_ts + 1000, send_ts + 1000 + 25_000)
-    assert lim.rate >= before
-    peaked = lim.rate
-    # Severe queue (>250ms inst) should cut
-    cc.on_echo(send_ts + 2000, send_ts + 2000 + 400_000)
-    assert lim.rate < peaked
-
-
-def test_ack_climb_without_rtt_echo():
-    lim = RateLimiter(50_000_000.0, start_bps=1_400_000.0)
-    cc = DelayRateController(lim)
-    start = lim.rate
-    for _ in range(20):
-        cc.on_ack(64, plr_byte=0)
-    assert lim.rate > start * 2
-    assert lim.rate <= lim.max_rate
-
-
-def test_loss_cuts_rate_on_high_plr():
-    lim = RateLimiter(50_000_000.0, start_bps=40_000_000.0)
+def test_loss_does_not_collapse_rate():
+    lim = RateLimiter(50_000_000.0)
     cc = DelayRateController(lim)
     before = lim.rate
-    cc.on_loss(120)
-    assert lim.rate < before * 0.6
+    cc.on_loss(120)  # ~47% — must NOT collapse
+    assert lim.rate >= before * 0.99
+    cc.on_loss(220)  # extreme
+    assert lim.rate >= lim.min_rate
+    assert lim.rate >= before * 0.85
+
+
+def test_ack_climbs_toward_max():
+    lim = RateLimiter(50_000_000.0, start_bps=20_000_000.0)
+    cc = DelayRateController(lim)
+    for _ in range(30):
+        cc.on_ack(64, plr_byte=100)  # plr ignored for climb
+    assert lim.rate >= 40_000_000.0
