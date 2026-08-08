@@ -73,13 +73,41 @@ class DelayRateController:
         self.slow_start = True
         self.warmup_left = 8
 
+    def _bump_rate(self, factor: float, additive: float = 0.0) -> None:
+        rate = self.limiter.rate
+        nxt = min(self.limiter.max_rate, max(rate * factor, rate + additive))
+        if nxt < self.limiter.min_rate:
+            self.limiter.rate = nxt
+            self.limiter.burst = max(nxt * 0.05, 32_000.0)
+        else:
+            self.limiter.set_rate(nxt)
+        if self.limiter.rate >= self.limiter.max_rate * 0.98:
+            self.slow_start = False
+
+    def on_ack(self, acked: int, plr_byte: int = 0) -> None:
+        """
+        Climb send rate from ACK progress when the path looks healthy.
+        Used when RTT echo is missing (old client) or as a parallel signal.
+        """
+        if acked <= 0 or plr_byte >= 16:
+            return
+        # If RTT echo works, only mild assist; otherwise ACK-clock is the sole climb
+        if self.samples > 0:
+            self._bump_rate(1.015, additive=30_000.0)
+            return
+        if self.slow_start:
+            self._bump_rate(1.12, additive=100_000.0)
+        else:
+            self._bump_rate(1.02, additive=50_000.0)
+
     def on_echo(self, echo_ts_us: int, now_us: int | None = None) -> float | None:
         if not echo_ts_us:
             return None
         if now_us is None:
             now_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
         rtt = (now_us - echo_ts_us) & 0xFFFFFFFF
-        if rtt < 50 or rtt > 30_000_000:
+        # Allow up to 5s RTT; reject wrap garbage
+        if rtt < 100 or rtt > 5_000_000:
             return None
 
         self.last_rtt_us = float(rtt)
@@ -94,38 +122,28 @@ class DelayRateController:
 
         inst_queue = max(0.0, float(rtt) - (self.base_rtt_us or float(rtt)))
         queue_us = max(0.0, self.srtt_us - self.base_rtt_us)
-        rate = self.limiter.rate
 
         if self.warmup_left > 0:
             self.warmup_left -= 1
-            if inst_queue < 10_000 and queue_us < 8_000:
-                # Gentle climb; bypass min_rate floor during open
-                self.limiter.rate = min(self.limiter.max_rate, max(rate * 1.08, rate + 50_000))
-                self.limiter.burst = max(self.limiter.rate * 0.05, 32_000.0)
+            if inst_queue < 15_000 and queue_us < 12_000:
+                self._bump_rate(1.10, additive=80_000.0)
             return float(rtt)
 
         if inst_queue > 100_000 or queue_us > 60_000:
             self.slow_start = False
-            self.limiter.set_rate(max(self.limiter.min_rate, rate * 0.75))
+            self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.75))
         elif inst_queue > 50_000 or queue_us > 30_000:
             self.slow_start = False
-            self.limiter.set_rate(max(self.limiter.min_rate, rate * 0.88))
+            self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.88))
         elif inst_queue > 20_000 or queue_us > 12_000:
             self.slow_start = False
-            self.limiter.set_rate(max(self.limiter.min_rate, rate * 0.95))
+            self.limiter.set_rate(max(self.limiter.min_rate, self.limiter.rate * 0.95))
         elif self.slow_start and queue_us < 5_000 and inst_queue < 10_000:
-            nxt = min(self.limiter.max_rate, rate * 1.15)
-            if nxt < self.limiter.min_rate:
-                self.limiter.rate = nxt
-                self.limiter.burst = max(nxt * 0.05, 32_000.0)
-            else:
-                self.limiter.set_rate(nxt)
-            if self.limiter.rate >= self.limiter.max_rate * 0.98:
-                self.slow_start = False
+            self._bump_rate(1.15, additive=100_000.0)
         elif queue_us < 3_000 and inst_queue < 8_000:
-            self.limiter.set_rate(min(self.limiter.max_rate, rate * 1.03))
+            self._bump_rate(1.03, additive=40_000.0)
         elif queue_us < 8_000 and inst_queue < 15_000:
-            self.limiter.set_rate(min(self.limiter.max_rate, rate * 1.01))
+            self._bump_rate(1.01, additive=20_000.0)
         return float(rtt)
 
     def stats(self) -> dict:

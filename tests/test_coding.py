@@ -188,3 +188,13 @@ def test_delay_cc_ignores_loss_raises_on_clear_path():
     cc.on_echo(send_ts + 2000, send_ts + 2000 + 120_000)
     assert lim.rate < peaked
     assert not cc.slow_start
+
+
+def test_ack_climb_without_rtt_echo():
+    lim = RateLimiter(50_000_000.0, start_bps=1_400_000.0)
+    cc = DelayRateController(lim)
+    start = lim.rate
+    for _ in range(20):
+        cc.on_ack(64, plr_byte=0)
+    assert lim.rate > start * 2
+    assert lim.rate <= lim.max_rate

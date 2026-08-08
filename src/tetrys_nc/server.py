@@ -123,6 +123,7 @@ def run_server(
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
+        "echo": 0,
         "flight": 64 if wan else max_window,
     }
 
@@ -191,7 +192,6 @@ def run_server(
                     ack_progress["ack"] = pkt.cumulative_ack
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
-                    # Grow / shrink in-flight cap (packet cwnd) with ACK progress
                     delta = max(0, pkt.cumulative_ack - prev_ack)
                     if wan and delta > 0:
                         if delay_cc is not None and delay_cc.slow_start:
@@ -208,11 +208,17 @@ def run_server(
                         ack_progress["flight"] = max(
                             64, ack_progress["flight"] // 2
                         )
-                    if delay_cc is not None and pkt.echo_ts_us:
-                        now_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                        rtt = delay_cc.on_echo(pkt.echo_ts_us, now_us)
-                        if rtt is not None:
-                            ack_progress["rtt_us"] = rtt
+                    if delay_cc is not None:
+                        # Climb on healthy ACK progress even if RTT echo is missing
+                        # (old Windows client without echo_ts → rtt stays 0 otherwise).
+                        if delta > 0:
+                            delay_cc.on_ack(delta, pkt.plr_byte)
+                        if pkt.echo_ts_us:
+                            now_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+                            rtt = delay_cc.on_echo(pkt.echo_ts_us, now_us)
+                            if rtt is not None:
+                                ack_progress["rtt_us"] = rtt
+                        ack_progress["echo"] = pkt.echo_ts_us
                 elif isinstance(pkt, ReadyPacket):
                     sock.sendto(meta, client_addr)
                 elif isinstance(pkt, FinPacket):
@@ -396,7 +402,7 @@ def run_server(
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
-                            f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms "
+                            f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s{ss} app={rate:.1f} MiB/s"
                         )
 

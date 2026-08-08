@@ -140,16 +140,15 @@ def run_client(
                 if ptype == PKT_SOURCE:
                     if len(data) >= SOURCE_HDR_SIZE:
                         sid, ts = struct.unpack_from("!II", data, 4)
-                        if ts:
-                            last_echo_ts = ts
+                        # Always echo latest stamp (0 only if sender omitted it)
+                        last_echo_ts = ts
                         delivered = dec.on_source_raw(sid, data[SOURCE_HDR_SIZE:])
                     else:
                         sid = struct.unpack_from("!I", data, 4)[0]
                         delivered = dec.on_source_raw(sid, data[8:])
                 elif ptype == PKT_CODED:
                     coded = CodedPacket.unpack(data)
-                    if coded.send_ts_us:
-                        last_echo_ts = coded.send_ts_us
+                    last_echo_ts = coded.send_ts_us
                     delivered = dec.on_coded(coded)
                 elif ptype == PKT_FIN:
                     fin_seen = True
