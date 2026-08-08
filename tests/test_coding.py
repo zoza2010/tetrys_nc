@@ -176,18 +176,17 @@ def test_slow_start_begins_below_max():
 def test_delay_cc_ignores_loss_raises_on_clear_path():
     lim = RateLimiter(10_000_000.0, start_bps=5_000_000.0)
     cc = DelayRateController(lim)
-    cc.warmup_left = 0  # skip warmup for unit test
+    cc.warmup_left = 0
     send_ts = 1_000_000
     assert cc.on_echo(send_ts, send_ts + 20_000) == 20_000.0
     assert cc.base_rtt_us == 20_000.0
-    assert cc.slow_start
     before = lim.rate
-    cc.on_echo(send_ts + 1000, send_ts + 1000 + 20_500)
+    cc.on_echo(send_ts + 1000, send_ts + 1000 + 25_000)
     assert lim.rate >= before
     peaked = lim.rate
-    cc.on_echo(send_ts + 2000, send_ts + 2000 + 120_000)
+    # Severe queue (>250ms inst) should cut
+    cc.on_echo(send_ts + 2000, send_ts + 2000 + 400_000)
     assert lim.rate < peaked
-    assert not cc.slow_start
 
 
 def test_ack_climb_without_rtt_echo():

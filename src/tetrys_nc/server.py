@@ -7,6 +7,7 @@ import hashlib
 import mmap
 import select
 import socket
+import struct
 import sys
 import threading
 import time
@@ -15,6 +16,10 @@ from pathlib import Path
 from .encoder import EncoderConfig, TetrysEncoder
 from .netutil import try_set_buffer
 from .packets import (
+    CODED_HDR_SIZE,
+    PKT_CODED,
+    PKT_SOURCE,
+    SOURCE_HDR_SIZE,
     FinPacket,
     MetaPacket,
     ReadyPacket,
@@ -237,11 +242,20 @@ def run_server(
     stall_repairs = 0
 
     def send_datagram(wire: bytes | memoryview) -> None:
+        # Mutable copy — we stamp AFTER pacing so RTT excludes sender queue delay
+        buf = bytearray(wire)
         if limiter is not None:
-            limiter.consume(len(wire))
+            limiter.consume(len(buf))
+        if len(buf) >= 4:
+            ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+            ptype = buf[2]
+            if ptype == PKT_SOURCE and len(buf) >= SOURCE_HDR_SIZE:
+                struct.pack_into("!I", buf, 8, ts)
+            elif ptype == PKT_CODED and len(buf) >= CODED_HDR_SIZE:
+                struct.pack_into("!I", buf, 16, ts)
         while True:
             try:
-                sock.sendto(wire, client_addr)
+                sock.sendto(buf, client_addr)
                 return
             except BlockingIOError:
                 select.select([], [sock], [], 0.005)
