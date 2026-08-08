@@ -82,14 +82,12 @@ uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan 
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=8** (`--redundancy 0` = только NACK), window **16384**, **BLAST** на `--rate`.  
-SACK освобождает *admission*; payloads для FEC держатся до cumack — coded мешает known+missing на HOL. В логе: `coding=…`, `nc_recovered>0`.
+`--wan`: payload 1350, **redundancy=8** (выкл: `--redundancy 0`), window **16384**, **BLAST** на `--rate` (default **1000** Mbit/s).  
+SACK-free + contiguous coded — FEC и скользящее окно работают вместе. В логе клиента `nc_recovered` > 0 при реальных дырах.
 
 ```bash
 --wan --rate 600 --window 16384
 ```
-
-**Почему не как iperf3:** iperf3 — ненадёжный UDP без repair. У вас ~20–30% потерь в SACK (plr) + ACK/window; даже идеальный repair не даст line rate. Цель — goodput близкий к `(1−loss)×capacity`, не к iperf.
 
 Часто goodput выше при `--rate` чуть ниже iperf (меньше потерь/HOL), чем при 1000.
 
