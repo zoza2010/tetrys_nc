@@ -104,6 +104,7 @@ class WindowUpdatePacket:
     Feedback from decoder.
     cumulative_ack: symbols with id < cumulative_ack are fully delivered.
     sack: bit i set => symbol (cumulative_ack + i) is already held by receiver.
+    sack_span: number of valid SACK bits (padding beyond span must be ignored).
     Missing bits in the SACK range are NACK targets for repair/retransmit.
     echo_ts_us: last sender timestamp echoed (for RTT / delay-based CC).
     """
@@ -114,6 +115,12 @@ class WindowUpdatePacket:
     plr_byte: int
     sack: bytes = b""
     echo_ts_us: int = 0
+    sack_span: int = 0
+
+    # flags bit0: trailer uint16 sack_span after sack bytes
+    # flags bit1: extended word count (uint32 after 22-byte hdr; byte field=0)
+    FLAG_SACK_SPAN = 0x01
+    FLAG_SACK_EXT = 0x02
 
     def pack(self) -> bytes:
         sack = self.sack
@@ -121,43 +128,93 @@ class WindowUpdatePacket:
         if pad:
             sack = sack + b"\x00" * pad
         sack_words = len(sack) // 4
-        return _HDR.pack(MAGIC, VERSION, PKT_WND_UPT, 0) + struct.pack(
+        span = self.sack_span if self.sack_span > 0 else min(len(self.sack) * 8, sack_words * 32)
+        flags = self.FLAG_SACK_SPAN
+        if sack_words <= 255:
+            return _HDR.pack(MAGIC, VERSION, PKT_WND_UPT, flags) + struct.pack(
+                "!III BB I",
+                self.cumulative_ack,
+                self.nb_missing_src,
+                self.nb_not_used_coded,
+                self.plr_byte & 0xFF,
+                sack_words & 0xFF,
+                self.echo_ts_us & 0xFFFFFFFF,
+            ) + sack + struct.pack("!H", min(span, 65535) & 0xFFFF)
+
+        flags |= self.FLAG_SACK_EXT
+        return _HDR.pack(MAGIC, VERSION, PKT_WND_UPT, flags) + struct.pack(
             "!III BB I",
             self.cumulative_ack,
             self.nb_missing_src,
             self.nb_not_used_coded,
             self.plr_byte & 0xFF,
-            sack_words & 0xFF,
+            0,
             self.echo_ts_us & 0xFFFFFFFF,
-        ) + sack
+        ) + struct.pack("!I", sack_words & 0xFFFFFFFF) + sack + struct.pack(
+            "!H", min(span, 65535) & 0xFFFF
+        )
 
     @classmethod
     def unpack(cls, data: bytes) -> WindowUpdatePacket:
-        # New: header4 + III BB I = 4+12+2+4 = 22, then sack
+        flags = data[3] if len(data) > 3 else 0
+        # header4 + III BB I = 22, then optional ext words, sack, optional span
         if len(data) >= 22:
             cum, nb_miss, nb_coded, plr, sack_words, echo = struct.unpack_from(
                 "!III BB I", data, 4
             )
-            sack = data[22 : 22 + sack_words * 4]
-            return cls(cum, nb_miss, nb_coded, plr, sack, echo)
-        # Mid format without echo: header4 + III BB = 18
+            off = 22
+            if flags & cls.FLAG_SACK_EXT:
+                if len(data) < off + 4:
+                    return cls(cum, nb_miss, nb_coded, plr, b"", echo, 0)
+                sack_words = struct.unpack_from("!I", data, off)[0]
+                off += 4
+            sack_end = off + sack_words * 4
+            sack = data[off:sack_end]
+            span = 0
+            if flags & cls.FLAG_SACK_SPAN and len(data) >= sack_end + 2:
+                span = struct.unpack_from("!H", data, sack_end)[0]
+            elif sack:
+                span = len(sack) * 8
+            return cls(cum, nb_miss, nb_coded, plr, sack, echo, span)
         if len(data) >= 18:
             cum, nb_miss, nb_coded, plr, sack_words = struct.unpack_from(
                 "!III BB", data, 4
             )
             sack = data[18 : 18 + sack_words * 4]
-            return cls(cum, nb_miss, nb_coded, plr, sack, 0)
-        # Short legacy
+            return cls(cum, nb_miss, nb_coded, plr, sack, 0, len(sack) * 8)
         cum, nb_miss, nb_coded, plr = struct.unpack_from("!III B", data, 4)
-        return cls(cum, nb_miss, nb_coded, plr, b"", 0)
+        return cls(cum, nb_miss, nb_coded, plr, b"", 0, 0)
+
+    def _span(self) -> int:
+        if self.sack_span > 0:
+            return self.sack_span
+        return len(self.sack) * 8
 
     def missing_ids(self, limit: int = 64) -> list[int]:
         """Symbol IDs in SACK range that receiver does NOT have."""
         out: list[int] = []
+        span = self._span()
         for i, byte in enumerate(self.sack):
             for b in range(8):
                 bit = i * 8 + b
+                if bit >= span:
+                    return out
                 if not (byte & (1 << b)):
+                    out.append(self.cumulative_ack + bit)
+                    if len(out) >= limit:
+                        return out
+        return out
+
+    def held_ids(self, limit: int = 100_000) -> list[int]:
+        """Symbol IDs in SACK range that receiver already holds (bit set)."""
+        out: list[int] = []
+        span = self._span()
+        for i, byte in enumerate(self.sack):
+            for b in range(8):
+                bit = i * 8 + b
+                if bit >= span:
+                    return out
+                if byte & (1 << b):
                     out.append(self.cumulative_ack + bit)
                     if len(out) >= limit:
                         return out

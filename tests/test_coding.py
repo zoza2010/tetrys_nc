@@ -156,14 +156,36 @@ def test_plr_zero_when_in_order():
 
 
 def test_window_update_echo_roundtrip():
-    pkt = WindowUpdatePacket(10, 2, 0, 5, sack=b"\x01\x00\x00\x00", echo_ts_us=123456)
+    pkt = WindowUpdatePacket(
+        10, 2, 0, 5, sack=b"\x01\x00\x00\x00", echo_ts_us=123456, sack_span=8
+    )
     wire = pkt.pack()
     got = WindowUpdatePacket.unpack(wire)
     assert got.cumulative_ack == 10
     assert got.echo_ts_us == 123456
     assert got.plr_byte == 5
+    assert got.sack_span == 8
     assert got.sack[0] & 1
     assert 10 not in got.missing_ids()
+    assert 10 in got.held_ids()
+
+
+def test_sack_release_unpins_window():
+    """WAN/no-FEC: SACKed symbols must leave the encoder window."""
+    enc = TetrysEncoder(
+        EncoderConfig(max_window=32, redundancy_every=0, payload_size=8)
+    )
+    for i in range(20):
+        enc.add_source(bytes([i]) * 8)
+    assert enc.window_size == 20
+    # Receiver delivered 0..4, holds 6..10, missing 5
+    held = list(range(6, 11))
+    missing = [5]
+    enc.apply_feedback(5, plr_byte=40, missing_ids=missing, held_ids=held)
+    assert enc.window_size == 20 - 5 - 5  # freed cumack 0..4 and held 6..10
+    assert 5 in enc._window
+    assert 5 in enc._nack_set
+    assert 11 in enc._window
 
 
 def test_blast_starts_at_cap():

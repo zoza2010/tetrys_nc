@@ -196,11 +196,13 @@ class TetrysDecoder:
         # End of observed range (inclusive). If nothing seen ahead, no holes.
         observed_end = max(self.highest_seen, base - 1)
         span = max(0, observed_end - base + 1)
+        # Extended SACK: up to 65535 bits (~8KiB) — covers a full WAN window.
+        sack_bits = min(max(sack_bits, 0), 65535)
         span = min(span, sack_bits)
         if self.total_symbols is not None:
             span = min(span, max(0, self.total_symbols - base))
 
-        n_bytes = (sack_bits + 7) // 8
+        n_bytes = (span + 7) // 8 if span > 0 else 0
         sack = bytearray(n_bytes)
         missing = 0
         for i in range(span):
@@ -209,11 +211,7 @@ class TetrysDecoder:
                 sack[i // 8] |= 1 << (i % 8)
             else:
                 missing += 1
-        # Bits beyond span must look "present" so missing_ids() won't NACK them.
-        usable_bytes = (span + 7) // 8
-        for i in range(span, usable_bytes * 8):
-            sack[i // 8] |= 1 << (i % 8)
-        sack = bytes(sack[:usable_bytes]) if usable_bytes else b""
+        # Leave unused high bits in the last byte as 0; sack_span gates them.
 
         denom = max(span, 1)
         plr_pct = min(100.0, 100.0 * missing / denom) if span > 0 else 0.0
@@ -223,8 +221,9 @@ class TetrysDecoder:
             nb_missing_src=missing,
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
-            sack=sack,
+            sack=bytes(sack),
             echo_ts_us=0,
+            sack_span=span,
         )
 
     def is_complete(self) -> bool:

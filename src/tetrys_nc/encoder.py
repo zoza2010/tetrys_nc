@@ -151,6 +151,7 @@ class TetrysEncoder:
         cumulative_ack: int,
         plr_byte: int = 0,
         missing_ids: list[int] | None = None,
+        held_ids: list[int] | None = None,
     ) -> int:
         if cumulative_ack > self._cumulative_ack:
             self._cumulative_ack = cumulative_ack
@@ -159,6 +160,14 @@ class TetrysEncoder:
             sid, _ = self._window.popitem(last=False)
             self._nack_set.discard(sid)
             removed += 1
+
+        # With FEC off: free SACKed symbols immediately so HOL holes don't pin
+        # the entire elastic window (FASP-like — don't stall on already-delivered).
+        if held_ids and self.cfg.redundancy_every <= 0:
+            for sid in held_ids:
+                if self._window.pop(sid, None) is not None:
+                    self._nack_set.discard(sid)
+                    removed += 1
 
         if missing_ids:
             for sid in missing_ids:

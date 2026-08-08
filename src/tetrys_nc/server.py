@@ -125,6 +125,7 @@ def run_server(
         "rtt_us": 0.0,
         "echo": 0,
         "flight": max_window if wan else min(8192, max_window),
+        "nack": 0,
     }
 
     # FASP-style: blast at --rate; soft delay bias only; loss → NACK repair.
@@ -182,14 +183,18 @@ def run_server(
                 except ValueError:
                     continue
                 if isinstance(pkt, WindowUpdatePacket):
-                    missing = pkt.missing_ids(limit=512)
+                    missing = pkt.missing_ids(limit=8192)
+                    held = pkt.held_ids(limit=200_000) if wan else []
                     with enc_lock:
-                        enc.apply_feedback(pkt.cumulative_ack, pkt.plr_byte, missing)
+                        enc.apply_feedback(
+                            pkt.cumulative_ack, pkt.plr_byte, missing, held
+                        )
                         win_now = enc.window_size
                     prev_ack = ack_progress["ack"]
                     ack_progress["ack"] = pkt.cumulative_ack
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
+                    ack_progress["nack"] = len(missing)
                     delta = max(0, pkt.cumulative_ack - prev_ack)
                     if delay_cc is not None:
                         # PLR ignored for pacing (FASP); still recorded on encoder
@@ -280,21 +285,27 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL holes → more repair traffic, but NEVER freeze new data (FASP).
+                    # HOL holes → repair gets the pipe; new data only if room remains.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
+                    plr = int(ack_progress["plr"])
                     with enc_lock:
                         win = enc.window_size
+                        nack_pending = len(enc._nack_q)
                         stalled = (
                             wan
-                            and win > 256
+                            and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        repair_n = 256 if stalled else (64 if wan else 4)
+                        holey = wan and (stalled or nack_pending > 0 or plr >= 16)
+                        if holey:
+                            repair_n = 2048 if stalled else 1024
+                        else:
+                            repair_n = 128 if wan else 4
                         repairs = enc.pop_nack_retransmit(limit=repair_n)
-                        if stalled or win >= enc.cfg.max_window:
+                        if holey or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(64, repair_n - len(repairs))
+                                    limit=max(128, repair_n - len(repairs))
                                 )
                             )
                         room = enc.cfg.max_window - enc.window_size
@@ -302,8 +313,10 @@ def run_server(
                     flight_cap = max(int(ack_progress["flight"]), win)
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
-                    # Keep admitting new symbols even when repairing HOL holes.
                     n_take = min(batch, max(room, 0), flight_room)
+                    # While repairing holes, throttle new admits — keep pipe on frontier.
+                    if holey and repairs:
+                        n_take = min(n_take, max(64, batch // 8))
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -330,14 +343,14 @@ def run_server(
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
-                    # When HOL-stalled: repair first so frontier advances, then blast.
-                    if stalled:
+                    # Repair first whenever holes exist (unblocks cumack / window).
+                    if holey:
                         send_batch(repairs)
                         send_batch(wires)
                     else:
                         send_batch(wires)
                         send_batch(repairs)
-                    sent = len(wires)
+                    sent = len(wires) + len(repairs)
 
                     if eof:
                         with enc_lock:

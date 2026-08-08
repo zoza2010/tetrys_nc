@@ -107,7 +107,8 @@ def run_client(
 
     def send_feedback() -> None:
         nonlocal last_fb
-        fb = dec.build_feedback(sack_bits=512 if wan else 256)
+        # Cover the whole decode buffer so sender can free SACKed symbols.
+        fb = dec.build_feedback(sack_bits=65535 if wan else 256)
         fb.echo_ts_us = last_echo_ts
         sock.sendto(fb.pack(), server)
         last_fb = time.monotonic()
@@ -173,8 +174,8 @@ def run_client(
 
             if processed and (
                 dec.need_feedback()
-                or (wan and now - last_fb > 0.05)
-                or (dec.has_holes() and now - last_fb > 0.05)
+                or (wan and now - last_fb > 0.02)
+                or (dec.has_holes() and now - last_fb > 0.02)
             ):
                 send_feedback()
 
