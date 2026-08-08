@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 from tetrys_nc import gf256
-from tetrys_nc.decoder import TetrysDecoder
+from tetrys_nc.decoder import DecoderConfig, TetrysDecoder
 from tetrys_nc.encoder import EncoderConfig, TetrysEncoder
 from tetrys_nc.packets import SOURCE_HDR_SIZE, CodedPacket, WindowUpdatePacket, parse_packet
 from tetrys_nc.ratectl import DelayRateController, RateLimiter
@@ -186,6 +188,46 @@ def test_sack_release_unpins_window():
     assert 5 in enc._window
     assert 5 in enc._nack_set
     assert 11 in enc._window
+
+
+def test_delayed_nack_waits_reorder():
+    """Gaps stay pending until reorder_s elapses; held clears pending."""
+    import time
+
+    enc = TetrysEncoder(
+        EncoderConfig(max_window=32, redundancy_every=0, payload_size=8)
+    )
+    enc.reorder_s = 0.05
+    for i in range(10):
+        enc.add_source(bytes([i]) * 8)
+    enc.apply_feedback(0, missing_ids=[1, 2], held_ids=[3, 4])
+    assert enc._nack_q == deque() or len(enc._nack_q) == 0
+    assert 1 in enc._pending_nack and 2 in enc._pending_nack
+    assert 3 not in enc._window  # SACK-freed
+    assert enc.promote_delayed_nacks() == 0
+    # Age the pending entries
+    enc._pending_nack[1] = time.monotonic() - 1.0
+    enc._pending_nack[2] = time.monotonic() - 1.0
+    assert enc.promote_delayed_nacks() == 2
+    assert 1 in enc._nack_set and 2 in enc._nack_set
+
+
+def test_plr_ignores_young_gaps():
+    """With reorder_s, fresh OOOrder holes do not inflate PLR."""
+    import time
+
+    dec = TetrysDecoder(DecoderConfig(reorder_s=0.05))
+    dec.total_symbols = 100
+    dec.on_source_raw(0, b"\x00" * 8)
+    dec.on_source_raw(2, b"\x02" * 8)  # gap at 1, just created
+    fb = dec.build_feedback(sack_bits=32)
+    assert 1 in fb.missing_ids()  # SACK still truthful
+    assert fb.plr_byte == 0  # too young for PLR
+    assert fb.nb_missing_src == 0
+    dec._gap_t[1] = time.monotonic() - 1.0
+    fb2 = dec.build_feedback(sack_bits=32)
+    assert fb2.plr_byte > 0
+    assert fb2.nb_missing_src == 1
 
 
 def test_blast_starts_at_cap():

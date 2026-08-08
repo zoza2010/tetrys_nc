@@ -34,7 +34,10 @@ def run_client(
     max_window: int = 8192,
     feedback_every: int = 256,
     wan: bool = False,
+    reorder_ms: float | None = None,
 ) -> int:
+    if reorder_ms is None:
+        reorder_ms = 20.0 if wan else 0.0
     if wan:
         # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
         if max_window < 65536:
@@ -53,10 +56,11 @@ def run_client(
             max_decode_window=max_window * 2,
             feedback_every_packets=feedback_every,
             delivered_cache=max_window * 2,
+            reorder_s=max(0.0, float(reorder_ms) / 1000.0),
         )
     )
 
-    print(f"connecting to udp://{host}:{port}")
+    print(f"connecting to udp://{host}:{port} reorder_ms={reorder_ms:g}")
     ready = ReadyPacket(max_window).pack()
     for _ in range(5):
         sock.sendto(ready, server)
@@ -229,6 +233,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="lossy/long-RTT profile: large window, fast SACK/NACK feedback",
     )
+    p.add_argument(
+        "--reorder-ms",
+        type=float,
+        default=None,
+        help="PLR ages gaps this long before counting as loss (default: 20 WAN / 0 LAN)",
+    )
     args = p.parse_args(argv)
     return run_client(
         args.host,
@@ -237,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         max_window=args.window,
         feedback_every=args.feedback_every,
         wan=args.wan,
+        reorder_ms=args.reorder_ms,
     )
 
 
