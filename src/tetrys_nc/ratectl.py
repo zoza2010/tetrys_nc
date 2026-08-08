@@ -1,4 +1,4 @@
-"""Delay-based pacing (BBR-like): queue delay steers rate; loss ≠ congestion."""
+"""FASP-style blast pacing: fill --rate hard; delay only soft-biases; loss ≠ congestion."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections import deque
 
 
 class RateLimiter:
-    """Token-bucket pacing in bytes/sec with a hard ceiling."""
+    """Token-bucket pacing in bytes/sec with a hard ceiling (target rate)."""
 
     def __init__(
         self,
@@ -16,18 +16,19 @@ class RateLimiter:
         burst: float | None = None,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # Allow real drain when RTT blows up (was 50% floor → stuck at 64 MiB/s)
-        self.min_rate = min(self.max_rate, max(self.max_rate * 0.08, 4_000_000.0))
+        # FASP-like: never collapse far below target — keep the pipe full.
+        self.min_rate = min(self.max_rate, max(self.max_rate * 0.90, 8_000_000.0))
         if start_bps is None:
-            start_bps = min(self.max_rate, max(self.max_rate * 0.35, 12_000_000.0))
+            start_bps = self.max_rate
         self.rate = min(self.max_rate, max(start_bps, self.min_rate))
-        self.burst = burst if burst is not None else max(self.rate * 0.08, 200_000.0)
+        # Large burst so we can fill shallow buffers / absorb ACK jitter.
+        self.burst = burst if burst is not None else max(self.rate * 0.25, 2_000_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.08, 200_000.0)
+        self.burst = max(self.rate * 0.25, 2_000_000.0)
 
     def consume(self, nbytes: int) -> None:
         now = time.monotonic()
@@ -37,6 +38,9 @@ class RateLimiter:
         self.tokens -= nbytes
         if self.tokens < 0:
             sleep_s = (-self.tokens) / self.rate
+            # Cap single sleep — prefer short yields over multi-second stalls.
+            if sleep_s > 0.05:
+                sleep_s = 0.05
             time.sleep(sleep_s)
             self.updated = time.monotonic()
             self.tokens = 0.0
@@ -44,17 +48,21 @@ class RateLimiter:
 
 class DelayRateController:
     """
-    Delay-based controller (loss ignored for pacing):
+    FASP-style controller:
 
-    - Track min_RTT (skip first noisy echoes)
-    - Estimate delivery rate from cumulative ACK
-    - Standing queue (srtt − min_rtt) → cut toward delivery rate
-    - Clear path → climb toward --rate
+    - Target = --rate (hard ceiling via RateLimiter.max_rate)
+    - Start at / stay near target (blast)
+    - Standing queue → tiny soft bias only (floor ≈ 90% of target)
+    - Loss ignored for pacing (repair handles reliability)
+    - Large cwnd so elastic window / flight never starve the pipe
     """
 
-    MODE_STARTUP = "Startup"
-    MODE_DRAIN = "Drain"
-    MODE_PROBE_BW = "ProbeBW"
+    MODE_BLAST = "Blast"
+    MODE_SOFT = "Soft"
+    # Aliases kept for older log/tests
+    MODE_STARTUP = MODE_BLAST
+    MODE_DRAIN = MODE_SOFT
+    MODE_PROBE_BW = MODE_BLAST
 
     __slots__ = (
         "limiter",
@@ -89,8 +97,8 @@ class DelayRateController:
         self.last_rtt_us: float = 0.0
         self.alpha = alpha
         self.samples = 0
-        self.slow_start = True
-        self.mode = self.MODE_STARTUP
+        self.slow_start = False
+        self.mode = self.MODE_BLAST
         self.btlbw = 0.0
         self.peak_bw = 0.0
         self._delivered = 0.0
@@ -99,6 +107,8 @@ class DelayRateController:
         self._bw_filter: deque[tuple[float, float]] = deque()
         self._rtt_warmup = 0
         self._min_rtt_stamp = time.monotonic()
+        # Immediate blast at cap
+        self.limiter.set_rate(self.limiter.max_rate)
 
     def on_loss(self, plr_byte: int) -> None:
         return
@@ -131,7 +141,6 @@ class DelayRateController:
         self.samples += 1
         self._rtt_warmup += 1
 
-        # min_RTT: ignore first echoes; also ignore extreme spikes for baseline
         if self._rtt_warmup >= 4 and rtt < 250_000:
             if self.base_rtt_us is None or rtt < self.base_rtt_us:
                 self.base_rtt_us = float(rtt)
@@ -150,17 +159,18 @@ class DelayRateController:
         return float(rtt)
 
     def target_cwnd_packets(self) -> int:
-        min_rtt = self.base_rtt_us or self.srtt_us or 80_000.0
-        bw = max(self.limiter.rate, self.btlbw, self.peak_bw * 0.5)
+        """Oversized flight so sender never waits on ACK while pipe has room."""
+        min_rtt = self.base_rtt_us or self.srtt_us or 40_000.0
+        bw = max(self.limiter.max_rate, self.limiter.rate, self.btlbw, self.peak_bw)
         bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
-        gain = 2.0 if self.mode != self.MODE_DRAIN else 1.25
-        return max(2048, int(bdp * gain))
+        # High gain: keep multiple BDPs in flight (FASP-like aggressiveness).
+        return max(16384, int(bdp * 6.0))
 
     def _offer_bw(self, now: float, sample_bps: float) -> None:
         if sample_bps <= 0:
             return
         self._bw_filter.append((now, sample_bps))
-        min_rtt_s = (self.base_rtt_us or 80_000.0) / 1_000_000.0
+        min_rtt_s = (self.base_rtt_us or 40_000.0) / 1_000_000.0
         horizon = min(8.0, max(1.5, 8.0 * min_rtt_s))
         while self._bw_filter and now - self._bw_filter[0][0] > horizon:
             self._bw_filter.popleft()
@@ -175,55 +185,21 @@ class DelayRateController:
 
     def _update_pacing(self, now: float) -> None:
         q_us = self._queue_us()
-        bw = self.btlbw if self.btlbw > 0 else 0.0
-        floor = self.limiter.min_rate
+        cap = self.limiter.max_rate
 
-        if self.mode == self.MODE_STARTUP:
-            self.slow_start = True
-            if q_us > 25_000:
-                self.mode = self.MODE_DRAIN
-                self.slow_start = False
-                target = max(floor, bw * 0.9) if bw > 0 else self.limiter.rate * 0.5
-                self.limiter.set_rate(target)
-                return
-            self.limiter.set_rate(
-                min(self.limiter.max_rate, max(self.limiter.rate * 1.3, self.limiter.rate + 2_000_000))
-            )
-            if self.limiter.rate >= self.limiter.max_rate * 0.95 and self.samples >= 6:
-                self.mode = self.MODE_PROBE_BW
-                self.slow_start = False
+        # Extreme standing queue only: soft bias, never a real drain.
+        if q_us > 120_000:
+            self.mode = self.MODE_SOFT
+            self.limiter.set_rate(cap * 0.92)
+            return
+        if q_us > 60_000:
+            self.mode = self.MODE_SOFT
+            self.limiter.set_rate(cap * 0.97)
             return
 
-        # Real drain: match delivery rate when we built a standing queue
-        if q_us > 40_000:
-            self.mode = self.MODE_DRAIN
-            self.slow_start = False
-            if bw > 0:
-                target = bw * 0.85
-            else:
-                target = self.limiter.rate * 0.7
-            self.limiter.set_rate(max(floor, min(self.limiter.max_rate, target)))
-            return
-
-        if q_us > 15_000:
-            self.mode = self.MODE_PROBE_BW
-            self.slow_start = False
-            if bw > 0:
-                target = min(self.limiter.rate, max(bw * 1.05, floor))
-            else:
-                target = self.limiter.rate * 0.95
-            self.limiter.set_rate(max(floor, min(self.limiter.max_rate, target)))
-            return
-
-        # Clear path — climb (loss ignored)
-        self.mode = self.MODE_PROBE_BW
-        self.slow_start = False
-        self.limiter.set_rate(
-            min(
-                self.limiter.max_rate,
-                max(self.limiter.rate * 1.08, self.limiter.rate + 1_000_000.0),
-            )
-        )
+        # Clear / mild queue — blast at target rate.
+        self.mode = self.MODE_BLAST
+        self.limiter.set_rate(cap)
 
     def stats(self) -> dict:
         return {

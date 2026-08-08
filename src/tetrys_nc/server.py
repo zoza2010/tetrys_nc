@@ -64,15 +64,16 @@ def run_server(
         # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
             payload_size = 1350
-        if max_window < 16384:
-            max_window = 16384
+        if max_window < 65536:
+            max_window = 65536
         if redundancy_every >= 32:
             redundancy_every = 0
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
+        # Default target ≈ typical WAN NIC; override with --rate to match link.
         if rate_mbit <= 0:
-            rate_mbit = 200.0
+            rate_mbit = 1000.0
     else:
         code_degree = 8
 
@@ -96,8 +97,8 @@ def run_server(
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try_set_buffer(sock, socket.SO_SNDBUF, 32 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_SNDBUF, 64 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 8 * 1024 * 1024)
     sock.bind((host, port))
     sock.setblocking(False)
     print(f"Tetrys server listening on udp://{host}:{port}")
@@ -116,28 +117,27 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight ≈ BDP×gain from delay CC
+    # Large initial flight — fill the pipe before first ACKs arrive.
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": min(4096, max_window),
+        "flight": max_window if wan else min(8192, max_window),
     }
 
-    # Delay-BBR: climb toward --rate; standing queue cuts rate; loss → NACK only
+    # FASP-style: blast at --rate; soft delay bias only; loss → NACK repair.
     limiter: RateLimiter | None = None
     delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
-        max_bps = (rate_mbit if rate_mbit > 0 else 80.0) * 1_000_000 / 8
-        start_bps = min(max_bps, max(max_bps * 0.35, 12_000_000.0))
-        limiter = RateLimiter(max_bps, start_bps=start_bps)
+        max_bps = (rate_mbit if rate_mbit > 0 else 1000.0) * 1_000_000 / 8
+        limiter = RateLimiter(max_bps, start_bps=max_bps)
         delay_cc = DelayRateController(limiter, payload_size=payload_size)
         print(
-            f"pace BBR start {start_bps / (1024 * 1024):.1f} "
+            f"pace BLAST start {max_bps / (1024 * 1024):.1f} "
             f"cap {max_bps / (1024 * 1024):.1f} MiB/s "
-            f"(delay steers rate; loss→NACK only)"
+            f"(FASP-style; loss→NACK only)"
         )
 
     deadline = time.monotonic() + 600
@@ -192,7 +192,7 @@ def run_server(
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
                     if delay_cc is not None:
-                        # PLR ignored for pacing (BBR); still recorded on encoder
+                        # PLR ignored for pacing (FASP); still recorded on encoder
                         delay_cc.on_loss(pkt.plr_byte)
                         if delta > 0:
                             delay_cc.on_ack(delta, pkt.plr_byte)
@@ -205,7 +205,7 @@ def run_server(
                         # Never shrink cwnd below current flight (avoids admit deadlock)
                         cwnd = delay_cc.target_cwnd_packets()
                         ack_progress["flight"] = min(
-                            enc.cfg.max_window, max(cwnd, win_now)
+                            enc.cfg.max_window, max(cwnd, win_now, ack_progress["flight"])
                         )
                     elif delta > 0:
                         ack_progress["flight"] = min(
@@ -224,8 +224,8 @@ def run_server(
     t0 = time.monotonic()
     last_progress = t0
     fin_sent = False
-    # Large batches: new data first; modest NACK repair after (not repair-first).
-    batch = 2048 if wan else 2048
+    # Large batches: keep blasting new data; repair rides alongside.
+    batch = 4096 if wan else 2048
     file_offset = 0
     last_ack_seen = 0
     last_ack_advance_t = t0
@@ -239,11 +239,16 @@ def run_server(
         elif ptype == PKT_CODED and len(buf) >= CODED_HDR_SIZE:
             struct.pack_into("!I", buf, 16, ts)
 
-    def send_batch(wires: list[bytes | memoryview]) -> None:
-        """Stamp after pacing, then sendmmsg/sendto in one go."""
+    def send_batch(wires: list[bytes | bytearray | memoryview]) -> None:
+        """Stamp in-place when possible, pace, then sendmmsg/sendto."""
         if not wires:
             return
-        bufs: list[bytearray] = [bytearray(w) for w in wires]
+        bufs: list[bytearray] = []
+        for w in wires:
+            if isinstance(w, bytearray):
+                bufs.append(w)
+            else:
+                bufs.append(bytearray(w))
         total = sum(len(b) for b in bufs)
         if limiter is not None:
             limiter.consume(total)
@@ -255,7 +260,7 @@ def run_server(
         if pace_us > 0:
             time.sleep(pace_us * len(bufs) / 1_000_000.0)
 
-    def send_datagram(wire: bytes | memoryview) -> None:
+    def send_datagram(wire: bytes | bytearray | memoryview) -> None:
         send_batch([wire])
 
     try:
@@ -275,7 +280,7 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL: ACK stuck → prioritized SOURCE repair; no coded flood
+                    # HOL holes → more repair traffic, but NEVER freeze new data (FASP).
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     with enc_lock:
                         win = enc.window_size
@@ -284,12 +289,12 @@ def run_server(
                             and win > 256
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        repair_n = 128 if stalled else (32 if wan else 4)
+                        repair_n = 256 if stalled else (64 if wan else 4)
                         repairs = enc.pop_nack_retransmit(limit=repair_n)
                         if stalled or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(32, repair_n - len(repairs))
+                                    limit=max(64, repair_n - len(repairs))
                                 )
                             )
                         room = enc.cfg.max_window - enc.window_size
@@ -297,10 +302,8 @@ def run_server(
                     flight_cap = max(int(ack_progress["flight"]), win)
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
-                    if stalled:
-                        n_take = 0
-                    else:
-                        n_take = min(batch, max(room, 0), flight_room)
+                    # Keep admitting new symbols even when repairing HOL holes.
+                    n_take = min(batch, max(room, 0), flight_room)
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -317,16 +320,17 @@ def run_server(
                         else:
                             chunks.append(bytes(raw))
 
-                    wires: list[bytes] = []
+                    wires: list[bytearray | bytes] = []
                     with enc_lock:
                         for chunk in chunks:
                             if not enc.can_accept():
                                 break
-                            wires.append(bytes(enc.add_source(chunk)))
+                            wires.append(enc.add_source(chunk))
                             # maybe_coded only if --redundancy > 0
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
+                    # When HOL-stalled: repair first so frontier advances, then blast.
                     if stalled:
                         send_batch(repairs)
                         send_batch(wires)
@@ -350,14 +354,14 @@ def run_server(
                             send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                tail = enc.retransmit_oldest(limit=128)
-                                tail.extend(enc.pop_nack_retransmit(limit=64))
+                                tail = enc.retransmit_oldest(limit=256)
+                                tail.extend(enc.pop_nack_retransmit(limit=128))
                             send_batch(tail)
-                            time.sleep(0.0002)
+                            time.sleep(0.00005)
                     elif sent == 0:
                         with enc_lock:
-                            tail = enc.retransmit_oldest(limit=128)
-                            tail.extend(enc.pop_nack_retransmit(limit=64))
+                            tail = enc.retransmit_oldest(limit=256)
+                            tail.extend(enc.pop_nack_retransmit(limit=128))
                         send_batch(tail)
 
                     now = time.monotonic()
@@ -383,7 +387,8 @@ def run_server(
                             peak_m = delay_cc.peak_bw / (1024 * 1024)
                             cwnd = delay_cc.target_cwnd_packets()
                             ack_progress["flight"] = min(
-                                enc.cfg.max_window, max(cwnd, st["window"])
+                                enc.cfg.max_window,
+                                max(cwnd, st["window"], ack_progress["flight"]),
                             )
                         flight = int(ack_progress["flight"])
                         print(
@@ -440,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, delay-BBR pacing, NACK/HOL repair (no FEC)",
+        help="WAN: payload 1350, FASP-style blast pacing, NACK/HOL repair (no FEC)",
     )
     p.add_argument(
         "--rate-mbit",
@@ -448,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="max UDP send rate in Mbit/s (alias: --rate). 0=unlimited unless --wan",
+        help="target UDP send rate in Mbit/s (alias: --rate). WAN default 1000",
     )
     args = p.parse_args(argv)
     return run_server(

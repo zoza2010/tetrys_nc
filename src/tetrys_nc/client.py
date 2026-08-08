@@ -36,17 +36,15 @@ def run_client(
     wan: bool = False,
 ) -> int:
     if wan:
-        # Larger window = more BDP; server is capped by client's Ready max_window.
-        # ~32k symbols ≈ 43 MiB at 1350B — enough for ~80ms×400Mbit with margin.
-        # Huge windows (100k+) waste RAM and amplify HOL buffering.
-        if max_window < 16384:
-            max_window = 16384
+        # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
+        if max_window < 65536:
+            max_window = 65536
         if feedback_every > 16:
             feedback_every = 4
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_RCVBUF, 64 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_SNDBUF, 4 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_SNDBUF, 8 * 1024 * 1024)
     sock.setblocking(False)
     server = (host, port)
 
@@ -228,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="lossy/long-RTT profile: smaller window, faster SACK/NACK feedback",
+        help="lossy/long-RTT profile: large window, fast SACK/NACK feedback",
     )
     args = p.parse_args(argv)
     return run_client(

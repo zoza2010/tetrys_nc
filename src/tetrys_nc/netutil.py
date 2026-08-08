@@ -27,7 +27,7 @@ def send_datagrams(
     addr: tuple[str, int],
     buffers: Sequence[bytes | bytearray | memoryview],
     *,
-    chunk: int = 64,
+    chunk: int = 256,
 ) -> int:
     """
     Send many UDP datagrams efficiently.
@@ -58,7 +58,7 @@ def send_datagrams(
                 except BlockingIOError:
                     import select
 
-                    select.select([], [sock], [], 0.005)
+                    select.select([], [sock], [], 0.0005)
                 except OSError:
                     # Fall back per-datagram for this chunk
                     for buf in batch[pos:]:
@@ -86,4 +86,4 @@ def _sendto_retry(
             sock.sendto(buf, addr)
             return
         except BlockingIOError:
-            select.select([], [sock], [], 0.005)
+            select.select([], [sock], [], 0.0005)

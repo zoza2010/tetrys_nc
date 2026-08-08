@@ -166,14 +166,14 @@ def test_window_update_echo_roundtrip():
     assert 10 not in got.missing_ids()
 
 
-def test_bbr_starts_below_cap():
+def test_blast_starts_at_cap():
     lim = RateLimiter(50_000_000.0)
-    assert lim.rate < lim.max_rate
-    assert lim.min_rate <= lim.max_rate * 0.15
+    assert lim.rate == lim.max_rate
+    assert lim.min_rate >= lim.max_rate * 0.90
 
 
 def test_loss_does_not_collapse_rate():
-    lim = RateLimiter(50_000_000.0, start_bps=20_000_000.0)
+    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
     cc = DelayRateController(lim, payload_size=1350)
     before = lim.rate
     cc.on_loss(120)
@@ -182,19 +182,19 @@ def test_loss_does_not_collapse_rate():
     assert lim.rate == before
 
 
-def test_bbr_drains_on_standing_queue():
-    lim = RateLimiter(50_000_000.0, start_bps=40_000_000.0)
+def test_soft_bias_keeps_near_cap():
+    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
     cc = DelayRateController(lim, payload_size=1000)
     import time
 
     for _ in range(4):
         time.sleep(0.055)
         cc.on_ack(800, plr_byte=40)
-    # Establish min_rtt ~80ms then a large queue via high srtt
+    # Establish min_rtt then a large standing queue
     cc.base_rtt_us = 80_000.0
-    cc.srtt_us = 200_000.0  # 120ms standing queue
-    cc.mode = DelayRateController.MODE_PROBE_BW
-    cc.slow_start = False
+    cc.srtt_us = 220_000.0  # 140ms standing queue
     cc._update_pacing(time.monotonic())
-    assert cc.mode == DelayRateController.MODE_DRAIN
-    assert lim.rate < 40_000_000.0
+    assert cc.mode == DelayRateController.MODE_SOFT
+    # Soft bias only — still ≥90% of target (FASP floor)
+    assert lim.rate >= 50_000_000.0 * 0.90
+    assert lim.rate <= 50_000_000.0

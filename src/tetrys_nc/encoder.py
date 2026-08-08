@@ -38,7 +38,6 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        self._wire = bytearray(SOURCE_HDR_SIZE + self.cfg.payload_size)
         # NACK queue from receiver SACK holes
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
@@ -75,7 +74,8 @@ class TetrysEncoder:
     def can_accept(self) -> bool:
         return len(self._window) < self.cfg.max_window
 
-    def add_source(self, payload: bytes) -> memoryview:
+    def add_source(self, payload: bytes) -> bytearray:
+        """Pack SOURCE into an owned bytearray (mutable for late timestamp stamp)."""
         ps = self.cfg.payload_size
         if len(payload) > ps:
             raise ValueError("payload too large")
@@ -94,13 +94,10 @@ class TetrysEncoder:
         self._total_sent_source += 1
 
         ts = self.stamp()
-        wire = self._wire
-        need = SOURCE_HDR_SIZE + ps
-        if len(wire) != need:
-            wire = self._wire = bytearray(need)
+        wire = bytearray(SOURCE_HDR_SIZE + ps)
         _SOURCE_PREFIX.pack_into(wire, 0, MAGIC, VERSION, 0, 0, sid, ts)
         wire[SOURCE_HDR_SIZE:] = payload
-        return memoryview(wire)
+        return wire
 
     def maybe_coded(self) -> list[bytes]:
         """Return 0..N packed coded packets according to redundancy schedule."""
@@ -189,9 +186,9 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
-    def pop_nack_retransmit(self, limit: int = 8) -> list[bytes]:
+    def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
         """Pack SOURCE packets for NACKed ids still in the window."""
-        out: list[bytes] = []
+        out: list[bytearray] = []
         while self._nack_q and len(out) < limit:
             sid = self._nack_q.popleft()
             self._nack_set.discard(sid)
@@ -200,13 +197,13 @@ class TetrysEncoder:
                 out.append(wire)
         return out
 
-    def retransmit_oldest(self, limit: int = 64) -> list[bytes]:
+    def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
         """
         Retransmit the oldest unacked SOURCE symbols (HOL frontier).
         This is what unblocks the receiver when the window is full of
         future data waiting on early holes — better than coded spam.
         """
-        out: list[bytes] = []
+        out: list[bytearray] = []
         if limit <= 0 or not self._window:
             return out
         for sid in list(self._window.keys())[:limit]:
@@ -218,13 +215,14 @@ class TetrysEncoder:
     def get_source(self, symbol_id: int) -> bytes | None:
         return self._window.get(symbol_id)
 
-    def pack_source_id(self, symbol_id: int) -> bytes | None:
+    def pack_source_id(self, symbol_id: int) -> bytearray | None:
         payload = self._window.get(symbol_id)
         if payload is None:
             return None
-        return _SOURCE_PREFIX.pack(
-            MAGIC, VERSION, 0, 0, symbol_id, self.stamp()
-        ) + payload
+        wire = bytearray(SOURCE_HDR_SIZE + len(payload))
+        _SOURCE_PREFIX.pack_into(wire, 0, MAGIC, VERSION, 0, 0, symbol_id, self.stamp())
+        wire[SOURCE_HDR_SIZE:] = payload
+        return wire
 
     def stats(self) -> dict:
         return {

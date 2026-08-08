@@ -32,12 +32,12 @@ App (file) → Tetrys Encoder → UDP → Tetrys Decoder → App (file)
 1. **Source packet** — исходный символ с ID (систематическая передача).
 2. **Coded packet** — линейная комбинация неподтверждённых символов из elastic window; коэффициенты Vandermonde GF(256) (`CCGI=0b01`).
 3. **Window update** — клиент периодически шлёт SACK + echo timestamp; сервер вычищает ACKed символы и чинит дыры (NACK retransmit / coded).
-4. **Delay-based rate control** (идея FASP) — pace по RTT/queuing delay; потери **не** режут скорость, только усиливают repair.
+4. **FASP-style rate control** — blast at `--rate`; standing queue only soft-biases (≥90% of target); потери **не** режут скорость, только усиливают repair.
 5. **GF(2⁸)** — NumPy (готовые wheels, без своей компиляции) на hot path.
 
 Параметры по умолчанию (оптимизированы под localhost / быстрый тест 1 ГиБ):
 payload **32768** B, window **8192**, redundancy **32**.
-Для WAN/MTU 1500: `--wan` (или `--payload-size 1400 --redundancy 8 --rate 200`).
+Для WAN/MTU 1500: `--wan` (или `--payload-size 1400 --rate 800`).
 
 ## Опции
 
@@ -49,6 +49,7 @@ server:
   --redundancy N       coded packet каждые N source
   --payload-size N     размер символа (байты)
   --pace-us US         пауза после каждого source (throttle)
+  --rate / --rate-mbit целевая скорость UDP (Mbit/s)
 
 client:
   --host HOST --port PORT
@@ -71,25 +72,26 @@ bash scripts/run_bench.sh
 
 ## WAN (потери, большой RTT)
 
-Без pacing UDP забивает путь → ещё больше потерь; coded по «хвосту» окна не лечит HOL-дыру в начале.
+Как FASP: забиваем канал до `--rate`, loss → NACK retransmit (не fairness / не обвал rate).
 
 ```bash
-# сервер (в Испании)
-uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --skip-hash
+# сервер (в Испании) — --rate ≈ ёмкости линка (iperf3 UDP)
+uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --rate 800 --skip-hash
 
 # клиент (в РФ)
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan --output testdata/received_1g.bin
 ```
 
-`--wan`: payload 1350, **redundancy=0**, **BLAST pacing** на весь `--rate` (default 200 Mbit/s).  
-Потери → NACK retransmit (не обвал rate). Цель — забить канал, не fairness. GF: NumPy (`gf=numpy`).
+`--wan`: payload 1350, **redundancy=0**, window 65536, **BLAST** на весь `--rate` (default **1000** Mbit/s).  
+Потери → NACK retransmit. Цель — забить канал. GF: NumPy (`gf=numpy`).
 
 ```bash
---wan --rate 200
+--wan --rate 800
 ```
 
 ## Замечания
 
 - Реализация следует идеям RFC 9407 (elastic window, on-the-fly coding, feedback).
-- Rate control — FASP-подобно: delay-based, loss ≠ congestion.
+- Rate control — FASP-подобно: blast to target, soft delay bias, loss ≠ congestion.
 - Localhost: большие payload; WAN: обязательно `--wan` на **обоих** концах.
+- Ставьте `--rate` по результату `iperf3 -u` на том же пути.
