@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from .encoder import EncoderConfig, TetrysEncoder
-from .netutil import try_set_buffer
+from .netutil import send_datagrams, try_set_buffer
 from .packets import (
     CODED_HDR_SIZE,
     PKT_CODED,
@@ -64,8 +64,8 @@ def run_server(
         # WAN: no periodic coded on healthy path (NACK/stall repair only).
         if payload_size >= 8000:
             payload_size = 1350
-        if max_window < 2048:
-            max_window = 2048
+        if max_window < 16384:
+            max_window = 16384
         if redundancy_every >= 32:
             redundancy_every = 0
         if coded_burst <= 1:
@@ -102,8 +102,8 @@ def run_server(
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try_set_buffer(sock, socket.SO_SNDBUF, 4 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_RCVBUF, 1 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_SNDBUF, 32 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 4 * 1024 * 1024)
     sock.bind((host, port))
     sock.setblocking(False)
     print(f"Tetrys server listening on udp://{host}:{port}")
@@ -122,14 +122,14 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # flight = max unacked sources. Blast mode: open wide, never shrink on loss.
+    # flight = display/cap of unacked sources. WAN blast: open at full window.
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": (4096 if wan else max_window),
+        "flight": max_window if wan else min(4096, max_window),
     }
 
     # Pacing: WAN always; optional explicit --rate-mbit
@@ -188,7 +188,7 @@ def run_server(
                 except ValueError:
                     continue
                 if isinstance(pkt, WindowUpdatePacket):
-                    missing = pkt.missing_ids(limit=64)
+                    missing = pkt.missing_ids(limit=256)
                     with enc_lock:
                         enc.apply_feedback(pkt.cumulative_ack, pkt.plr_byte, missing)
                     prev_ack = ack_progress["ack"]
@@ -196,11 +196,13 @@ def run_server(
                     ack_progress["plr"] = pkt.plr_byte
                     ack_progress["t"] = time.monotonic()
                     delta = max(0, pkt.cumulative_ack - prev_ack)
-                    if wan and delta > 0:
-                        # Always grow flight toward full window (never shrink on loss)
+                    if wan:
+                        # BLAST: stay at full window; never shrink on loss
+                        ack_progress["flight"] = enc.cfg.max_window
+                    elif delta > 0:
                         ack_progress["flight"] = min(
                             enc.cfg.max_window,
-                            max(ack_progress["flight"] + max(delta, 1), 4096),
+                            max(ack_progress["flight"] + max(delta, 1), 1024),
                         )
                     if delay_cc is not None:
                         delay_cc.on_loss(pkt.plr_byte)
@@ -224,29 +226,39 @@ def run_server(
     t0 = time.monotonic()
     last_progress = t0
     fin_sent = False
-    batch = 128 if wan else 2048
+    # Large batches: new data first; modest NACK repair after (not repair-first).
+    batch = 2048 if wan else 2048
     file_offset = 0
     last_ack_seen = 0
-    stall_repairs = 0
+    last_ack_advance_t = t0
+
+    def _stamp(buf: bytearray, ts: int) -> None:
+        if len(buf) < 4:
+            return
+        ptype = buf[2]
+        if ptype == PKT_SOURCE and len(buf) >= SOURCE_HDR_SIZE:
+            struct.pack_into("!I", buf, 8, ts)
+        elif ptype == PKT_CODED and len(buf) >= CODED_HDR_SIZE:
+            struct.pack_into("!I", buf, 16, ts)
+
+    def send_batch(wires: list[bytes | memoryview]) -> None:
+        """Stamp after pacing, then sendmmsg/sendto in one go."""
+        if not wires:
+            return
+        bufs: list[bytearray] = [bytearray(w) for w in wires]
+        total = sum(len(b) for b in bufs)
+        if limiter is not None:
+            limiter.consume(total)
+        ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+        for buf in bufs:
+            _stamp(buf, ts)
+        assert client_addr is not None
+        send_datagrams(sock, client_addr, bufs)
+        if pace_us > 0:
+            time.sleep(pace_us * len(bufs) / 1_000_000.0)
 
     def send_datagram(wire: bytes | memoryview) -> None:
-        # Mutable copy — we stamp AFTER pacing so RTT excludes sender queue delay
-        buf = bytearray(wire)
-        if limiter is not None:
-            limiter.consume(len(buf))
-        if len(buf) >= 4:
-            ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-            ptype = buf[2]
-            if ptype == PKT_SOURCE and len(buf) >= SOURCE_HDR_SIZE:
-                struct.pack_into("!I", buf, 8, ts)
-            elif ptype == PKT_CODED and len(buf) >= CODED_HDR_SIZE:
-                struct.pack_into("!I", buf, 16, ts)
-        while True:
-            try:
-                sock.sendto(buf, client_addr)
-                return
-            except BlockingIOError:
-                select.select([], [sock], [], 0.005)
+        send_batch([wire])
 
     try:
         with file_path.open("rb") as f:
@@ -259,52 +271,31 @@ def run_server(
                         _print_summary(enc, file_size, elapsed)
                         return 0
 
-                    # Repair: NACK first; coded only when there are real holes
-                    with enc_lock:
-                        repairs = enc.pop_nack_retransmit(limit=16 if wan else 4)
-                        plr_b = enc.last_plr_byte
-                        need_repair = bool(repairs) or plr_b > 0
-                        n_repair_coded = 1 if need_repair else 0
-                        coded_repairs = []
-                        for _ in range(n_repair_coded):
-                            c = enc.make_coded(prefer_oldest=True)
-                            if c is None:
-                                break
-                            coded_repairs.append(c.pack())
-                    for wire in repairs:
-                        send_datagram(wire)
-                    for wire in coded_repairs:
-                        send_datagram(wire)
-
-                    # ACK stall → retransmit oldest SOURCE only (no coded spam)
                     cur_ack = ack_progress["ack"]
-                    if cur_ack == last_ack_seen:
-                        stall_repairs += 1
-                    else:
-                        stall_repairs = 0
+                    now_loop = time.monotonic()
+                    if cur_ack != last_ack_seen:
                         last_ack_seen = cur_ack
-                    if stall_repairs >= 8 and not eof:
-                        with enc_lock:
-                            oldest = enc.oldest_id
-                            w = enc.pack_source_id(oldest) if oldest is not None else None
-                        if w:
-                            send_datagram(w)
+                        last_ack_advance_t = now_loop
 
-                    cur_batch = batch
-                    if wan and plr_b == 0 and not repairs:
-                        cur_batch = 2048
-
-                    # Cap new data by flight cwnd (unacked ≈ window_size)
-                    flight_cap = int(ack_progress["flight"])
+                    # HOL only when cumulative ACK is stuck for ~1 RTT — NOT on
+                    # every NACK/PLR. Old repair-first mode starved new data.
+                    rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     with enc_lock:
                         win = enc.window_size
-                        room = enc.cfg.max_window - win
-                        # If feedback shrunk flight below current win, raise it
-                        if flight_cap < win:
-                            flight_cap = win
-                            ack_progress["flight"] = win
-                        flight_room = flight_cap - win
-                    n_take = min(cur_batch, max(room, 0), max(flight_room, 0))
+                        stalled = (
+                            wan
+                            and win > 256
+                            and (now_loop - last_ack_advance_t > rtt_s)
+                        )
+                        # Modest NACK repair; HOL retransmit only when stalled
+                        repairs = enc.pop_nack_retransmit(
+                            limit=(256 if stalled else (64 if wan else 4))
+                        )
+                        if stalled or win >= enc.cfg.max_window:
+                            repairs.extend(enc.retransmit_oldest(limit=512))
+                        room = enc.cfg.max_window - enc.window_size
+                    # WAN blast: window is the only admit limit (no flight choke)
+                    n_take = min(batch, max(room, 0))
                     chunks: list[bytes] = []
                     for _ in range(n_take):
                         if file_offset >= file_size:
@@ -326,13 +317,11 @@ def run_server(
                             if not enc.can_accept():
                                 break
                             wires.append(bytes(enc.add_source(chunk)))
-                            wires.extend(enc.maybe_coded())
 
-                    for wire in wires:
-                        send_datagram(wire)
-                        if pace_us > 0:
-                            time.sleep(pace_us / 1_000_000.0)
-                    sent = len(chunks)
+                    # New data first, then repairs (keeps goodput high)
+                    send_batch(wires)
+                    send_batch(repairs)
+                    sent = len(wires)
 
                     if eof:
                         with enc_lock:
@@ -340,8 +329,7 @@ def run_server(
                         if win == 0:
                             if not fin_sent:
                                 fin = FinPacket(True, total_symbols).pack()
-                                for _ in range(3):
-                                    send_datagram(fin)
+                                send_batch([fin, fin, fin])
                                 fin_sent = True
                             if fin_from_client.wait(0.1):
                                 elapsed = time.monotonic() - t0
@@ -350,39 +338,15 @@ def run_server(
                             send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                repairs = enc.pop_nack_retransmit(limit=16)
-                                c = enc.make_coded(prefer_oldest=True)
-                                oldest = enc.oldest_id
-                                w = enc.pack_source_id(oldest) if oldest is not None else None
-                            for wire in repairs:
-                                send_datagram(wire)
-                            if c:
-                                send_datagram(c.pack())
-                            if w:
-                                send_datagram(w)
-                            time.sleep(0.001)
+                                tail = enc.retransmit_oldest(limit=256)
+                                tail.extend(enc.pop_nack_retransmit(limit=128))
+                            send_batch(tail)
+                            time.sleep(0.0002)
                     elif sent == 0:
-                        # Flight-full or waiting on ACK: retransmit holes only, no coded spam
                         with enc_lock:
-                            repairs = enc.pop_nack_retransmit(limit=8)
-                            oldest = enc.oldest_id
-                            w = (
-                                enc.pack_source_id(oldest)
-                                if oldest is not None and plr_b > 0
-                                else None
-                            )
-                            c = (
-                                enc.make_coded(prefer_oldest=True)
-                                if plr_b > 0
-                                else None
-                            )
-                        for wire in repairs:
-                            send_datagram(wire)
-                        if w:
-                            send_datagram(w)
-                        if c:
-                            send_datagram(c.pack())
-                        time.sleep(0.0005)
+                            tail = enc.retransmit_oldest(limit=512)
+                            tail.extend(enc.pop_nack_retransmit(limit=256))
+                        send_batch(tail)
 
                     now = time.monotonic()
                     if now - last_progress >= 1.0:
@@ -409,6 +373,7 @@ def run_server(
                             f"nack={st['nack_q']} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s{ss} app={rate:.1f} MiB/s"
+                            f"{' HOL' if stalled else ''}"
                         )
 
                     if fin_sent and time.monotonic() - t0 > 3600:

@@ -36,14 +36,17 @@ def run_client(
     wan: bool = False,
 ) -> int:
     if wan:
-        if max_window < 8192:
-            max_window = 8192
-        if feedback_every > 32:
-            feedback_every = 8
+        # Larger window = more BDP; server is capped by client's Ready max_window.
+        # ~32k symbols ≈ 43 MiB at 1350B — enough for ~80ms×400Mbit with margin.
+        # Huge windows (100k+) waste RAM and amplify HOL buffering.
+        if max_window < 16384:
+            max_window = 16384
+        if feedback_every > 16:
+            feedback_every = 4
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_RCVBUF, 4 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_SNDBUF, 1 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 64 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_SNDBUF, 4 * 1024 * 1024)
     sock.setblocking(False)
     server = (host, port)
 
@@ -106,7 +109,7 @@ def run_client(
 
     def send_feedback() -> None:
         nonlocal last_fb
-        fb = dec.build_feedback()
+        fb = dec.build_feedback(sack_bits=512 if wan else 256)
         fb.echo_ts_us = last_echo_ts
         sock.sendto(fb.pack(), server)
         last_fb = time.monotonic()

@@ -197,6 +197,21 @@ class TetrysEncoder:
                 out.append(wire)
         return out
 
+    def retransmit_oldest(self, limit: int = 64) -> list[bytes]:
+        """
+        Retransmit the oldest unacked SOURCE symbols (HOL frontier).
+        This is what unblocks the receiver when the window is full of
+        future data waiting on early holes — better than coded spam.
+        """
+        out: list[bytes] = []
+        if limit <= 0 or not self._window:
+            return out
+        for sid in list(self._window.keys())[:limit]:
+            wire = self.pack_source_id(sid)
+            if wire is not None:
+                out.append(wire)
+        return out
+
     def get_source(self, symbol_id: int) -> bytes | None:
         return self._window.get(symbol_id)
 
