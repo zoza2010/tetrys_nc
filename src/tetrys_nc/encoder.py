@@ -109,8 +109,14 @@ class TetrysEncoder:
         if self._sources_since_coded < self._redundancy_every:
             return []
         self._sources_since_coded = 0
+        return self.emit_coded(self._coded_burst)
+
+    def emit_coded(self, n: int = 1) -> list[bytes]:
+        """Force N coded packets over the oldest window (HOL repair)."""
         out: list[bytes] = []
-        for _ in range(self._coded_burst):
+        if n <= 0 or not self._window:
+            return out
+        for _ in range(n):
             pkt = self.make_coded(prefer_oldest=True)
             if pkt is None:
                 break
@@ -163,24 +169,21 @@ class TetrysEncoder:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
 
-        # Repair schedule. WAN default redundancy=0: NEVER enable periodic coded
-        # on loss — coded flood on a drop-congested path makes PLR worse.
-        # Holes are fixed via NACK retransmit (+ at most one on-demand coded).
+        # Adaptive FEC around configured base. Loss → slightly denser coded over
+        # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
         self.last_plr_byte = plr_byte
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
         base_red = self.cfg.redundancy_every
         if base_red <= 0:
             self._redundancy_every = 0
             self._coded_burst = 1
-        elif plr >= 40:
-            self._redundancy_every = 1
-            self._coded_burst = max(self.cfg.coded_burst, 2)
         elif plr >= 25:
-            self._redundancy_every = 1
+            # ~more FEC, still bounded (every 4 sources × burst 2 ≈ 50% coded)
+            self._redundancy_every = max(4, base_red // 2)
+            self._coded_burst = max(self.cfg.coded_burst, 2)
+        elif plr >= 10:
+            self._redundancy_every = max(6, base_red)
             self._coded_burst = max(self.cfg.coded_burst, 1)
-        elif plr >= 12:
-            self._redundancy_every = max(1, base_red // 4)
-            self._coded_burst = self.cfg.coded_burst
         else:
             self._redundancy_every = base_red
             self._coded_burst = self.cfg.coded_burst

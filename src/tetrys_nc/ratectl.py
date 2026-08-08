@@ -16,18 +16,18 @@ class RateLimiter:
         burst: float | None = None,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # Floor high enough to fill a long-RTT pipe; BBR must not crawl
-        self.min_rate = min(self.max_rate, max(self.max_rate * 0.12, 8_000_000.0))
+        # FASP-like: stay hot; only delay (not loss) may ease slightly
+        self.min_rate = min(self.max_rate, max(self.max_rate * 0.5, 16_000_000.0))
         if start_bps is None:
-            start_bps = min(self.max_rate, max(self.max_rate * 0.5, 16_000_000.0))
+            start_bps = self.max_rate
         self.rate = min(self.max_rate, max(start_bps, self.min_rate))
-        self.burst = burst if burst is not None else max(self.rate * 0.08, 200_000.0)
+        self.burst = burst if burst is not None else max(self.rate * 0.1, 400_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.08, 200_000.0)
+        self.burst = max(self.rate * 0.1, 400_000.0)
 
     def consume(self, nbytes: int) -> None:
         now = time.monotonic()
@@ -165,19 +165,11 @@ class DelayRateController:
         return float(rtt)
 
     def target_cwnd_packets(self) -> int:
-        """Inflight ≈ BDP×gain, floored for WAN BDP at a useful rate."""
+        """Inflight ≈ several BDPs at cap — fill the pipe (FASP-style)."""
         min_rtt = self.base_rtt_us or self.srtt_us or 80_000.0
-        # Use peak/max pacing so cwnd doesn't collapse when ACK rate dips on HOL
-        bw = max(self.btlbw, self.peak_bw * 0.85, self.limiter.rate)
-        bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
-        gain = 2.5 if self.mode == self.MODE_STARTUP else 2.0
-        if self.mode == self.MODE_DRAIN:
-            gain = 1.5
-        # Floor: enough for ~200 Mbit @ 80ms ≈ 1500 pkts; aim ≥ half-cap BDP
-        floor_bw = max(self.limiter.min_rate, self.limiter.max_rate * 0.35)
-        floor = int(floor_bw * (min_rtt / 1_000_000.0) / self.payload_size * 2.0)
-        floor = max(4096, floor)
-        return max(floor, int(bdp * gain))
+        bdp = self.limiter.max_rate * (min_rtt / 1_000_000.0) / self.payload_size
+        gain = 4.0 if self.mode != self.MODE_DRAIN else 2.5
+        return max(8192, int(bdp * gain))
 
     def _offer_bw(self, now: float, sample_bps: float) -> None:
         if sample_bps <= 0:
@@ -202,70 +194,37 @@ class DelayRateController:
             return 1.0
         return self.srtt_us / self.base_rtt_us
 
-    def _pacing_floor(self) -> float:
-        # Hold near peak once we've seen real throughput (iperf-class paths)
-        if self.peak_bw > self.limiter.min_rate:
-            return max(self.limiter.min_rate, self.peak_bw * 0.7)
-        return self.limiter.min_rate
-
     def _update_pacing(self, now: float) -> None:
+        """
+        FASP-like: run at --rate unless standing queue is large.
+        Delivery-rate samples update btlbw/peak for logs & cwnd only.
+        Loss never cuts pacing.
+        """
         q = self._queue_ratio()
         q_us = self._queue_us()
-        bw = max(self.btlbw, self.peak_bw * 0.8) if self.peak_bw > 0 else self.btlbw
-        floor = self._pacing_floor()
+        heavy_queue = q > 1.6 and q_us > 50_000
 
         if self.mode == self.MODE_STARTUP:
             self.slow_start = True
-            # Climb hard toward cap (like filling the pipe in iperf)
-            target = min(self.limiter.max_rate, max(self.limiter.rate * 1.35, (bw or 0) * 2.0))
-            if target < self.limiter.rate:
-                target = min(self.limiter.max_rate, self.limiter.rate * 1.2)
-            self.limiter.set_rate(max(target, floor))
-
-            growing = self.btlbw > self._full_bw * 1.2
-            if growing:
-                self._full_bw = self.btlbw
-                self._full_bw_count = 0
-            elif self.btlbw > 0:
-                self._full_bw_count += 1
-
-            # Exit only with clear queue OR BW plateau near a useful rate
-            useful = self.btlbw >= self.limiter.max_rate * 0.25 or self.limiter.rate >= self.limiter.max_rate * 0.9
-            heavy_queue = q > 1.5 and q_us > 40_000  # >40ms standing queue
-            plateau = self._full_bw_count >= 5 and useful
-            if heavy_queue or plateau:
+            self.limiter.set_rate(self.limiter.max_rate)
+            if self.samples >= 8:
                 self.mode = self.MODE_DRAIN if heavy_queue else self.MODE_PROBE_BW
                 self.slow_start = False
-                if heavy_queue:
-                    self.limiter.set_rate(max(floor, min(self.limiter.max_rate, bw * 0.9)))
-                return
             return
 
-        if self.mode == self.MODE_DRAIN:
-            self.slow_start = False
-            self.limiter.set_rate(max(floor, min(self.limiter.max_rate, bw * 0.85)))
-            if q < 1.2 or q_us < 20_000:
-                self.mode = self.MODE_PROBE_BW
-                self._cycle_idx = 0
-                self._cycle_t = now
-            return
-
-        # ProbeBW (no harsh ProbeRTT — it collapsed this path to ~2 MiB/s)
-        self.slow_start = False
-        min_rtt_s = (self.base_rtt_us or 80_000.0) / 1_000_000.0
-        if now - self._cycle_t >= max(min_rtt_s, 0.1):
-            self._cycle_idx = (self._cycle_idx + 1) % len(self._PROBE_GAINS)
-            self._cycle_t = now
-        gain = self._PROBE_GAINS[self._cycle_idx]
-        # Delay-based ease only on real standing queue — not on loss
-        if q > 1.5 and q_us > 40_000:
-            gain = min(gain, 0.85)
+        if heavy_queue:
             self.mode = self.MODE_DRAIN
-        target = (bw * gain) if bw > 0 else self.limiter.rate
-        # If we're below cap and queue is fine, keep probing up
-        if q < 1.25 and q_us < 25_000 and self.limiter.rate < self.limiter.max_rate * 0.95:
-            target = max(target, self.limiter.rate * 1.05, floor)
-        self.limiter.set_rate(min(self.limiter.max_rate, max(target, floor)))
+            self.slow_start = False
+            # Mild ease only — still keep the pipe busy
+            self.limiter.set_rate(self.limiter.max_rate * 0.9)
+            return
+
+        self.mode = self.MODE_PROBE_BW
+        self.slow_start = False
+        # Probe slightly above measured peak toward cap (never below min_rate)
+        peak = max(self.peak_bw, self.btlbw, self.limiter.min_rate)
+        target = min(self.limiter.max_rate, max(peak * 1.15, self.limiter.max_rate * 0.95))
+        self.limiter.set_rate(target)
 
     def stats(self) -> dict:
         return {

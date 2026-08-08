@@ -166,14 +166,14 @@ def test_window_update_echo_roundtrip():
     assert 10 not in got.missing_ids()
 
 
-def test_bbr_starts_near_half_cap():
+def test_fasp_starts_at_cap():
     lim = RateLimiter(50_000_000.0)
-    assert lim.rate >= lim.max_rate * 0.45
-    assert lim.min_rate >= lim.max_rate * 0.10
+    assert lim.rate == lim.max_rate
+    assert lim.min_rate >= lim.max_rate * 0.45
 
 
 def test_loss_does_not_collapse_rate():
-    lim = RateLimiter(50_000_000.0, start_bps=20_000_000.0)
+    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
     cc = DelayRateController(lim, payload_size=1350)
     before = lim.rate
     cc.on_loss(120)  # ~47% — must NOT change rate
@@ -182,20 +182,15 @@ def test_loss_does_not_collapse_rate():
     assert lim.rate == before
 
 
-def test_bbr_tracks_delivery_rate_and_cwnd_floor():
-    lim = RateLimiter(50_000_000.0, start_bps=16_000_000.0)
+def test_bbr_tracks_delivery_and_keeps_pipe_full():
+    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
     cc = DelayRateController(lim, payload_size=1000)
     import time
 
     for _ in range(5):
         time.sleep(0.055)
-        cc.on_ack(1200, plr_byte=80)  # ~20 MB/s
+        cc.on_ack(1200, plr_byte=80)
     assert cc.btlbw > 10_000_000.0
-    assert lim.rate >= lim.min_rate
-    # cwnd must stay large enough for long-RTT WAN
-    assert cc.target_cwnd_packets() >= 4096
-    assert cc.mode in (
-        DelayRateController.MODE_STARTUP,
-        DelayRateController.MODE_DRAIN,
-        DelayRateController.MODE_PROBE_BW,
-    )
+    # FASP: still near cap despite lossy ACKs
+    assert lim.rate >= lim.max_rate * 0.9
+    assert cc.target_cwnd_packets() >= 8192
