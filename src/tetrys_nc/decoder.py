@@ -46,8 +46,18 @@ class TetrysDecoder:
             return got
         return self._delivered.get(sid)
 
+    def _stamp_gaps_before(self, sid: int) -> None:
+        """Record first-seen time for holes below a newly arrived/seen id."""
+        if sid <= self.next_deliver:
+            return
+        now = time.monotonic()
+        for g in range(self.next_deliver, sid):
+            if g not in self._symbols and g not in self._gap_t:
+                self._gap_t[g] = now
+
     def _note_seen(self, sid: int) -> None:
         if sid > self.highest_seen:
+            self._stamp_gaps_before(sid)
             self.highest_seen = sid
 
     def on_source_raw(self, sid: int, payload: bytes | memoryview | bytearray) -> list[tuple[int, bytes]]:
@@ -65,6 +75,7 @@ class TetrysDecoder:
             self.next_deliver = sid + 1
             return [(sid, payload_b)]
 
+        self._stamp_gaps_before(sid)
         self._symbols[sid] = payload_b
         if self._equations:
             self._reduce_equations_with(sid, payload_b)
