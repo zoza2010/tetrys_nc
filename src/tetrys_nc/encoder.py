@@ -25,14 +25,11 @@ class EncoderConfig:
     code_degree: int = 8
     payload_size: int = 32768
     # Wait this long after first SACK-hole sighting before retransmit (reorder grace).
-    # 0 = immediate NACK (legacy). Applied only outside the HOL-urgent zone.
+    # 0 = immediate NACK (legacy). WAN typically 20–80ms.
     nack_reorder_ms: float = 0.0
     # Only NACK holes in [cum_ack, cum_ack + horizon). Farther gaps are usually
     # still in-flight / reorder, not loss — repairing them floods the pipe.
     nack_horizon: int = 0  # 0 = no extra filter (use all missing_ids passed in)
-    # Holes this close to cum_ack are repaired immediately (true HOL). Delay
-    # only applies to holes further ahead (likely reorder).
-    nack_hol_urgent: int = 256
 
 
 class TetrysEncoder:
@@ -196,7 +193,6 @@ class TetrysEncoder:
         if missing_ids:
             now = time.monotonic()
             horizon = int(self.cfg.nack_horizon)
-            urgent_n = max(0, int(self.cfg.nack_hol_urgent))
             cum = self._cumulative_ack
             for sid in missing_ids:
                 if sid not in self._window or sid in self._nack_set:
@@ -204,9 +200,7 @@ class TetrysEncoder:
                 if horizon > 0 and sid >= cum + horizon:
                     # Still far ahead of delivery — likely reorder/in-flight.
                     continue
-                # HOL frontier: repair now. Deeper holes: wait reorder grace.
-                if self._nack_reorder_s <= 0 or sid < cum + urgent_n:
-                    self._nack_pending.pop(sid, None)
+                if self._nack_reorder_s <= 0:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
                 else:
@@ -256,22 +250,16 @@ class TetrysEncoder:
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
         """Pack SOURCE packets for NACKed ids still in the window."""
         out: list[bytearray] = []
-        urgent_n = max(0, int(self.cfg.nack_hol_urgent))
-        cum = self._cumulative_ack
         while self._nack_q and len(out) < limit:
             sid = self._nack_q.popleft()
             self._nack_set.discard(sid)
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
-                # Re-arm delay only for non-HOL holes. HOL is re-queued from the
-                # next SACK immediately if still missing (need fast true-loss repair).
-                if (
-                    self._nack_reorder_s > 0
-                    and sid in self._window
-                    and sid >= cum + urgent_n
-                ):
-                    self._nack_pending[sid] = time.monotonic()
+                # After send, start a fresh reorder timer so we do not immediately
+                # re-NACK the same id on the next SACK (wait for the repair to land).
+                if self._nack_reorder_s > 0 and sid in self._window:
+                    self._nack_pending.setdefault(sid, time.monotonic())
         return out
 
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
