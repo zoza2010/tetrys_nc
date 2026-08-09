@@ -24,6 +24,12 @@ class EncoderConfig:
     # How many oldest unacked symbols to mix into each coded packet
     code_degree: int = 8
     payload_size: int = 32768
+    # Wait this long after first SACK-hole sighting before retransmit (reorder grace).
+    # 0 = immediate NACK (legacy). WAN typically 20–80ms.
+    nack_reorder_ms: float = 0.0
+    # Only NACK holes in [cum_ack, cum_ack + horizon). Farther gaps are usually
+    # still in-flight / reorder, not loss — repairing them floods the pipe.
+    nack_horizon: int = 0  # 0 = no extra filter (use all missing_ids passed in)
 
 
 class TetrysEncoder:
@@ -38,11 +44,22 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        # NACK queue from receiver SACK holes
+        # Ready-to-send NACK retransmit queue
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
+        # sid -> monotonic time when hole was first reported (reorder delay)
+        self._nack_pending: dict[int, float] = {}
+        self._nack_reorder_s = max(0.0, float(self.cfg.nack_reorder_ms)) / 1000.0
         self.last_plr_byte = 0
         self._send_ts_us = 0
+
+    def set_nack_reorder_ms(self, ms: float) -> None:
+        self.cfg.nack_reorder_ms = max(0.0, float(ms))
+        self._nack_reorder_s = self.cfg.nack_reorder_ms / 1000.0
+
+    @property
+    def nack_pending_count(self) -> int:
+        return len(self._nack_pending)
 
     def stamp(self) -> int:
         """Refresh send timestamp (monotonic µs, uint32)."""
@@ -146,6 +163,10 @@ class TetrysEncoder:
         self._total_sent_coded += 1
         return CodedPacket(cid, first, last, payload, send_ts_us=self.stamp())
 
+    def _clear_nack(self, sid: int) -> None:
+        self._nack_set.discard(sid)
+        self._nack_pending.pop(sid, None)
+
     def apply_feedback(
         self,
         cumulative_ack: int,
@@ -158,22 +179,33 @@ class TetrysEncoder:
         removed = 0
         while self._window and next(iter(self._window)) < self._cumulative_ack:
             sid, _ = self._window.popitem(last=False)
-            self._nack_set.discard(sid)
+            self._clear_nack(sid)
             removed += 1
 
         # With FEC off: free SACKed symbols immediately so HOL holes don't pin
         # the entire elastic window (FASP-like — don't stall on already-delivered).
         if held_ids and self.cfg.redundancy_every <= 0:
             for sid in held_ids:
+                self._clear_nack(sid)
                 if self._window.pop(sid, None) is not None:
-                    self._nack_set.discard(sid)
                     removed += 1
 
         if missing_ids:
+            now = time.monotonic()
+            horizon = int(self.cfg.nack_horizon)
+            cum = self._cumulative_ack
             for sid in missing_ids:
-                if sid in self._window and sid not in self._nack_set:
+                if sid not in self._window or sid in self._nack_set:
+                    continue
+                if horizon > 0 and sid >= cum + horizon:
+                    # Still far ahead of delivery — likely reorder/in-flight.
+                    continue
+                if self._nack_reorder_s <= 0:
                     self._nack_set.add(sid)
                     self._nack_q.append(sid)
+                else:
+                    # Keep first-seen time; do not reset on every SACK.
+                    self._nack_pending.setdefault(sid, now)
 
         # Adaptive FEC around configured base. Loss → slightly denser coded over
         # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
@@ -195,6 +227,26 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
+    def promote_nacks(self, now: float | None = None) -> int:
+        """Move aged SACK holes from pending → retransmit queue. Returns promoted count."""
+        if self._nack_reorder_s <= 0 or not self._nack_pending:
+            return 0
+        now = time.monotonic() if now is None else now
+        ready = [
+            sid
+            for sid, t0 in self._nack_pending.items()
+            if (now - t0) >= self._nack_reorder_s
+        ]
+        promoted = 0
+        for sid in ready:
+            del self._nack_pending[sid]
+            if sid not in self._window or sid in self._nack_set:
+                continue
+            self._nack_set.add(sid)
+            self._nack_q.append(sid)
+            promoted += 1
+        return promoted
+
     def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
         """Pack SOURCE packets for NACKed ids still in the window."""
         out: list[bytearray] = []
@@ -204,6 +256,10 @@ class TetrysEncoder:
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                # After send, start a fresh reorder timer so we do not immediately
+                # re-NACK the same id on the next SACK (wait for the repair to land).
+                if self._nack_reorder_s > 0 and sid in self._window:
+                    self._nack_pending.setdefault(sid, time.monotonic())
         return out
 
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
@@ -243,5 +299,6 @@ class TetrysEncoder:
             "coded_burst": self._coded_burst,
             "cumulative_ack": self._cumulative_ack,
             "nack_q": len(self._nack_q),
+            "nack_pending": len(self._nack_pending),
             "plr_byte": self.last_plr_byte,
         }

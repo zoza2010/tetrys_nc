@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from tetrys_nc import gf256
 from tetrys_nc.decoder import TetrysDecoder
 from tetrys_nc.encoder import EncoderConfig, TetrysEncoder
@@ -186,6 +188,45 @@ def test_sack_release_unpins_window():
     assert 5 in enc._window
     assert 5 in enc._nack_set
     assert 11 in enc._window
+
+
+def test_nack_reorder_delay_and_horizon():
+    enc = TetrysEncoder(
+        EncoderConfig(
+            max_window=64,
+            redundancy_every=0,
+            payload_size=8,
+            nack_reorder_ms=50,
+            nack_horizon=10,
+        )
+    )
+    for i in range(40):
+        enc.add_source(bytes([i]) * 8)
+
+    # Hole at 5 (near HOL) and 25 (beyond horizon of cum_ack+10).
+    enc.apply_feedback(5, missing_ids=[5, 25], held_ids=list(range(6, 20)))
+    assert 5 not in enc._nack_set
+    assert 5 in enc._nack_pending
+    assert 25 not in enc._nack_pending
+    assert enc.pop_nack_retransmit(limit=8) == []
+
+    # Too early to promote.
+    assert enc.promote_nacks(now=time.monotonic()) == 0
+
+    # Age the pending timestamp and promote.
+    enc._nack_pending[5] = time.monotonic() - 0.06
+    assert enc.promote_nacks() == 1
+    assert 5 in enc._nack_set
+    wires = enc.pop_nack_retransmit(limit=8)
+    assert len(wires) == 1
+    # After send, a fresh pending timer is armed (no immediate re-NACK storm).
+    assert 5 in enc._nack_pending
+    assert 5 not in enc._nack_set
+
+    # Held cancels pending.
+    enc.apply_feedback(5, missing_ids=[], held_ids=[5])
+    assert 5 not in enc._nack_pending
+    assert 5 not in enc._window
 
 
 def test_blast_starts_at_cap():
