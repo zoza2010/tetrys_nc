@@ -31,15 +31,16 @@ def run_client(
     host: str,
     port: int,
     output: Path,
-    max_window: int | None = None,
+    max_window: int = 8192,
     feedback_every: int = 256,
     wan: bool = False,
 ) -> int:
-    if max_window is None:
-        # ~2–3×BDP for ~80ms×800Mbit @ 1350B; do not inflate — large windows hurt WAN.
-        max_window = 16384 if wan else 8192
-    if wan and feedback_every > 16:
-        feedback_every = 4
+    if wan:
+        # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
+        if max_window < 65536:
+            max_window = 65536
+        if feedback_every > 16:
+            feedback_every = 4
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
@@ -55,7 +56,7 @@ def run_client(
         )
     )
 
-    print(f"connecting to udp://{host}:{port} window={max_window}")
+    print(f"connecting to udp://{host}:{port}")
     ready = ReadyPacket(max_window).pack()
     for _ in range(5):
         sock.sendto(ready, server)
@@ -221,17 +222,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--output", type=Path, default=Path("received.bin"))
-    p.add_argument(
-        "--window",
-        type=int,
-        default=None,
-        help="elastic window (default: 16384 WAN / 8192 LAN); sent in READY to server",
-    )
+    p.add_argument("--window", type=int, default=8192)
     p.add_argument("--feedback-every", type=int, default=256)
     p.add_argument(
         "--wan",
         action="store_true",
-        help="lossy/long-RTT profile: faster SACK feedback (does not override --window)",
+        help="lossy/long-RTT profile: large window, fast SACK/NACK feedback",
     )
     args = p.parse_args(argv)
     return run_client(

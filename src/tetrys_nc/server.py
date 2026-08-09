@@ -45,7 +45,7 @@ def run_server(
     port: int,
     file_path: Path,
     payload_size: int = 32768,
-    max_window: int | None = None,
+    max_window: int = 8192,
     redundancy_every: int = 32,
     coded_burst: int = 0,
     pace_us: float = 0.0,
@@ -60,18 +60,18 @@ def run_server(
 
     if coded_burst <= 0:
         coded_burst = 1
-    if max_window is None:
-        max_window = 16384 if wan else 8192
     if wan:
         # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
             payload_size = 1350
-        # Do not inflate --window; client READY caps further.
+        if max_window < 65536:
+            max_window = 65536
         if redundancy_every >= 32:
             redundancy_every = 0
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
+        # Default target ≈ typical WAN NIC; override with --rate to match link.
         if rate_mbit <= 0:
             rate_mbit = 1000.0
     else:
@@ -158,9 +158,6 @@ def run_server(
             client_addr = addr
             if pkt.max_window > 0:
                 enc.cfg.max_window = min(enc.cfg.max_window, pkt.max_window)
-            ack_progress["flight"] = min(
-                int(ack_progress["flight"]), enc.cfg.max_window
-            )
             print(f"client ready from {addr}, window={enc.cfg.max_window}")
 
     assert client_addr is not None
@@ -443,12 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--file", required=True, type=Path, help="file to send")
     p.add_argument("--payload-size", type=int, default=32768)
-    p.add_argument(
-        "--window",
-        type=int,
-        default=None,
-        help="elastic window (default: 16384 WAN / 8192 LAN); capped by client READY",
-    )
+    p.add_argument("--window", type=int, default=8192)
     p.add_argument(
         "--redundancy",
         type=int,
