@@ -52,8 +52,6 @@ def run_server(
     skip_hash: bool = False,
     wan: bool = False,
     rate_mbit: float = 0.0,
-    reorder_ms: float | None = None,
-    nack_horizon: int | None = None,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
@@ -64,15 +62,6 @@ def run_server(
         coded_burst = 1
     if max_window is None:
         max_window = 16384 if wan else 8192
-    # reorder_ms: None → auto (WAN) / 0 (LAN); <0 → auto; 0 → immediate NACK
-    reorder_auto = False
-    if reorder_ms is None:
-        reorder_ms = -1.0 if wan else 0.0
-    if reorder_ms < 0:
-        reorder_auto = wan
-        reorder_ms = 40.0 if wan else 0.0
-    if nack_horizon is None:
-        nack_horizon = 4096 if wan else 0
     if wan:
         # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
@@ -103,9 +92,7 @@ def run_server(
     print(
         f"symbols={total_symbols} payload={payload_size} "
         f"window={max_window} redundancy={redundancy_every}x{coded_burst} "
-        f"wan={wan} rate_mbit={rate_mbit or 'unlimited'} "
-        f"reorder_ms={reorder_ms:.0f}{'~auto' if reorder_auto else ''} "
-        f"nack_horizon={nack_horizon} gf={gf256.backend()}"
+        f"wan={wan} rate_mbit={rate_mbit or 'unlimited'} gf={gf256.backend()}"
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -125,8 +112,6 @@ def run_server(
             coded_burst=coded_burst,
             payload_size=payload_size,
             code_degree=code_degree,
-            nack_reorder_ms=reorder_ms,
-            nack_horizon=nack_horizon,
         )
     )
     enc_lock = threading.Lock()
@@ -224,11 +209,6 @@ def run_server(
                             rtt = delay_cc.on_echo(pkt.echo_ts_us, now_us)
                             if rtt is not None:
                                 ack_progress["rtt_us"] = rtt
-                                if reorder_auto and rtt > 0:
-                                    # ~1/4 RTT reorder grace, clamped for WAN paths.
-                                    auto_ms = min(80.0, max(20.0, (rtt / 1000.0) * 0.25))
-                                    with enc_lock:
-                                        enc.set_nack_reorder_ms(auto_ms)
                         ack_progress["echo"] = pkt.echo_ts_us
                         # Never shrink cwnd below current flight (avoids admit deadlock)
                         cwnd = delay_cc.target_cwnd_packets()
@@ -309,18 +289,17 @@ def run_server(
                         last_ack_advance_t = now_loop
 
                     # HOL holes → repair gets the pipe; new data only if room remains.
-                    # Do NOT use inflated SACK-span PLR as holey — it counts in-flight.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
+                    plr = int(ack_progress["plr"])
                     with enc_lock:
-                        enc.promote_nacks()
                         win = enc.window_size
-                        nack_ready = len(enc._nack_q)
+                        nack_pending = len(enc._nack_q)
                         stalled = (
                             wan
                             and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s)
                         )
-                        holey = wan and (stalled or nack_ready > 0)
+                        holey = wan and (stalled or nack_pending > 0 or plr >= 16)
                         if holey:
                             repair_n = 2048 if stalled else 1024
                         else:
@@ -432,7 +411,7 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
-                            f"nack={st['nack_q']}+{st['nack_pending']} plr={st['plr_byte']} "
+                            f"nack={st['nack_q']} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
                             f"app={rate:.1f} MiB/s"
@@ -497,19 +476,6 @@ def main(argv: list[str] | None = None) -> int:
         dest="rate_mbit",
         help="target UDP send rate in Mbit/s (alias: --rate). WAN default 1000",
     )
-    p.add_argument(
-        "--reorder-ms",
-        type=float,
-        default=None,
-        help="delay before NACK retransmit (ms). WAN default: auto ~0.25*RTT "
-        "(start 40). 0=immediate. Negative=force auto on WAN",
-    )
-    p.add_argument(
-        "--nack-horizon",
-        type=int,
-        default=None,
-        help="only NACK holes within this many ids of cum_ack (WAN default 4096)",
-    )
     args = p.parse_args(argv)
     return run_server(
         args.host,
@@ -523,8 +489,6 @@ def main(argv: list[str] | None = None) -> int:
         skip_hash=args.skip_hash,
         wan=args.wan,
         rate_mbit=args.rate_mbit,
-        reorder_ms=args.reorder_ms,
-        nack_horizon=args.nack_horizon,
     )
 
 
