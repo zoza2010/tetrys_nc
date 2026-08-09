@@ -198,35 +198,51 @@ def test_nack_reorder_delay_and_horizon():
             payload_size=8,
             nack_reorder_ms=50,
             nack_horizon=10,
+            nack_hol_urgent=2,  # only cum_ack, cum_ack+1 are immediate
         )
     )
     for i in range(40):
         enc.add_source(bytes([i]) * 8)
 
-    # Hole at 5 (near HOL) and 25 (beyond horizon of cum_ack+10).
-    enc.apply_feedback(5, missing_ids=[5, 25], held_ids=list(range(6, 20)))
-    assert 5 not in enc._nack_set
-    assert 5 in enc._nack_pending
+    # Hole at 12 (outside urgent=2, inside horizon=10) and 25 (beyond horizon).
+    enc.apply_feedback(5, missing_ids=[12, 25], held_ids=list(range(6, 12)))
+    assert 12 not in enc._nack_set
+    assert 12 in enc._nack_pending
     assert 25 not in enc._nack_pending
     assert enc.pop_nack_retransmit(limit=8) == []
 
-    # Too early to promote.
-    assert enc.promote_nacks(now=time.monotonic()) == 0
+    # HOL-urgent hole is immediate.
+    enc2 = TetrysEncoder(
+        EncoderConfig(
+            max_window=64,
+            redundancy_every=0,
+            payload_size=8,
+            nack_reorder_ms=50,
+            nack_horizon=32,
+            nack_hol_urgent=8,
+        )
+    )
+    for i in range(20):
+        enc2.add_source(bytes([i]) * 8)
+    enc2.apply_feedback(3, missing_ids=[3, 4, 12], held_ids=list(range(5, 11)))
+    assert 3 in enc2._nack_set and 4 in enc2._nack_set
+    assert 12 in enc2._nack_pending
+    assert 12 not in enc2._nack_set
 
     # Age the pending timestamp and promote.
-    enc._nack_pending[5] = time.monotonic() - 0.06
+    enc._nack_pending[12] = time.monotonic() - 0.06
     assert enc.promote_nacks() == 1
-    assert 5 in enc._nack_set
+    assert 12 in enc._nack_set
     wires = enc.pop_nack_retransmit(limit=8)
     assert len(wires) == 1
-    # After send, a fresh pending timer is armed (no immediate re-NACK storm).
-    assert 5 in enc._nack_pending
-    assert 5 not in enc._nack_set
+    # Non-HOL re-arms delay after send.
+    assert 12 in enc._nack_pending
+    assert 12 not in enc._nack_set
 
     # Held cancels pending.
-    enc.apply_feedback(5, missing_ids=[], held_ids=[5])
-    assert 5 not in enc._nack_pending
-    assert 5 not in enc._window
+    enc.apply_feedback(5, missing_ids=[], held_ids=[12])
+    assert 12 not in enc._nack_pending
+    assert 12 not in enc._window
 
 
 def test_blast_starts_at_cap():

@@ -70,9 +70,10 @@ def run_server(
         reorder_ms = -1.0 if wan else 0.0
     if reorder_ms < 0:
         reorder_auto = wan
-        reorder_ms = 40.0 if wan else 0.0
+        # Short fixed start; auto tracks *base* RTT (not queued srtt).
+        reorder_ms = 15.0 if wan else 0.0
     if nack_horizon is None:
-        nack_horizon = 4096 if wan else 0
+        nack_horizon = 2048 if wan else 0
     if wan:
         # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
         if payload_size >= 8000:
@@ -224,9 +225,13 @@ def run_server(
                             rtt = delay_cc.on_echo(pkt.echo_ts_us, now_us)
                             if rtt is not None:
                                 ack_progress["rtt_us"] = rtt
-                                if reorder_auto and rtt > 0:
-                                    # ~1/4 RTT reorder grace, clamped for WAN paths.
-                                    auto_ms = min(80.0, max(20.0, (rtt / 1000.0) * 0.25))
+                                if reorder_auto:
+                                    # Use min RTT (base), not inflated queued RTT —
+                                    # otherwise delay grows exactly when holes hurt most.
+                                    base = delay_cc.base_rtt_us or rtt
+                                    auto_ms = min(
+                                        25.0, max(8.0, (base / 1000.0) * 0.12)
+                                    )
                                     with enc_lock:
                                         enc.set_nack_reorder_ms(auto_ms)
                         ack_progress["echo"] = pkt.echo_ts_us
@@ -501,14 +506,15 @@ def main(argv: list[str] | None = None) -> int:
         "--reorder-ms",
         type=float,
         default=None,
-        help="delay before NACK retransmit (ms). WAN default: auto ~0.25*RTT "
-        "(start 40). 0=immediate. Negative=force auto on WAN",
+        help="delay before NACK for non-HOL holes (ms). WAN default: auto from "
+        "base RTT (~0.12×, clamp 8–25; start 15). HOL (<256 of cum_ack) is immediate. "
+        "0=all immediate. Negative=force auto on WAN",
     )
     p.add_argument(
         "--nack-horizon",
         type=int,
         default=None,
-        help="only NACK holes within this many ids of cum_ack (WAN default 4096)",
+        help="only NACK holes within this many ids of cum_ack (WAN default 2048)",
     )
     args = p.parse_args(argv)
     return run_server(
