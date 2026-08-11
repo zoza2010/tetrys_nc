@@ -307,11 +307,11 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # Tip: ~2.5×RTT (OOO often >1 RTT). Far: full reorder hold.
-                    # iperf ~30% OOO / ~0.3% loss — tip_age=1×RTT was false-NACK heavy.
+                    # Tip/far ages gate on *first-send* time (encoder), not NACK sighting.
+                    # iperf ~40% OOO — wait most of reorder-hold before SOURCE rtx.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     if wan:
-                        tip_age = max(0.20, min(float(reorder_hold_s) * 0.5, rtt_s * 2.5))
+                        tip_age = max(0.25, min(float(reorder_hold_s) * 0.75, rtt_s * 3.0))
                         far_age = max(tip_age, float(reorder_hold_s))
                     else:
                         tip_age = 0.0
@@ -325,9 +325,10 @@ def run_server(
                         stalled = (
                             wan
                             and win > 64
-                            and (now_loop - last_ack_advance_t > rtt_s * 2.0)
+                            and (now_loop - last_ack_advance_t > rtt_s * 2.5)
                         )
-                        tip_cd = (rtt_s * 0.75) if stalled else (rtt_s * 1.25)
+                        # After a rtx, wait ~1 RTT+ for the repair to land (cut duplicates).
+                        tip_cd = max(rtt_s * 1.5, tip_age * 0.5) if wan else 0.0
                         tip_ready = enc.nack_ready_count(
                             min_age=tip_age,
                             far_age=far_age,
@@ -335,16 +336,18 @@ def run_server(
                             cooldown=tip_cd,
                         )
                         if stalled:
-                            repair_n = 256
-                        elif tip_ready > 0 or win_fat:
                             repair_n = 64
+                        elif tip_ready > 0 or win_fat:
+                            repair_n = 32
                         else:
-                            repair_n = 8 if wan else 4
+                            repair_n = 4 if wan else 4
                         repairs: list[bytearray] = []
                         if stalled:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=repair_n, cooldown=tip_cd
+                                    limit=repair_n,
+                                    cooldown=tip_cd,
+                                    min_age=tip_age,
                                 )
                             )
                             repairs.extend(
@@ -365,7 +368,7 @@ def run_server(
                                 cooldown=tip_cd,
                             )
                             if repairs and tip_ready == 0 and not win_fat:
-                                repairs = repairs[: max(8, batch // 10)]
+                                repairs = repairs[: max(4, batch // 16)]
                         room = enc.cfg.max_window - enc.window_size
 
                     flight_cap = min(enc.cfg.max_window, max(int(ack_progress["flight"]), 1024))
@@ -433,7 +436,7 @@ def run_server(
                         else:
                             with enc_lock:
                                 tail = enc.retransmit_oldest(
-                                    limit=128, cooldown=tip_cd
+                                    limit=64, cooldown=tip_cd, min_age=tip_age
                                 )
                                 tail.extend(
                                     enc.pop_nack_retransmit(
@@ -453,10 +456,10 @@ def run_server(
                                 far_age=far_age,
                                 cooldown=tip_cd,
                             )
-                            if stalled or win_fat or win_full or not tail:
+                            if stalled or win_full or not tail:
                                 tail.extend(
                                     enc.retransmit_oldest(
-                                        limit=64, cooldown=tip_cd
+                                        limit=32, cooldown=tip_cd, min_age=tip_age
                                     )
                                 )
                         send_batch(tail)
@@ -492,7 +495,8 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
-                            f"nack={tip_ready}/{st['nack_q']} rtx={st['rexmit']} "
+                            f"nack={tip_ready}/{st['nack_q']} "
+                            f"rtx={st['rexmit']}/{st.get('rexmit_unique', st['rexmit'])} "
                             f"tip={tip_age * 1000:.0f}ms far={far_age * 1000:.0f}ms "
                             f"plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
@@ -516,7 +520,8 @@ def _print_summary(enc: TetrysEncoder, file_size: int, elapsed: float) -> None:
     goodput = file_size / max(elapsed, 1e-6) / (1024 * 1024)
     print(
         f"done in {elapsed:.2f}s — goodput {goodput:.2f} MiB/s — "
-        f"source={st['sent_source']} coded={st['sent_coded']} rtx={st['rexmit']}"
+        f"source={st['sent_source']} coded={st['sent_coded']} "
+        f"rtx={st['rexmit']}/{st.get('rexmit_unique', st['rexmit'])}"
     )
 
 

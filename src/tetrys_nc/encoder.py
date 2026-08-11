@@ -45,7 +45,10 @@ class TetrysEncoder:
         self._nack_set: set[int] = set()
         # sid -> last SOURCE retransmit time (cooldown against spam)
         self._rexmit_at: dict[int, float] = {}
+        # sid -> first time this SOURCE was put on the wire
+        self._first_sent_at: dict[int, float] = {}
         self._total_rexmit = 0
+        self._unique_rexmit = 0
         self.last_plr_byte = 0
         self._send_ts_us = 0
 
@@ -95,6 +98,7 @@ class TetrysEncoder:
         sid = self._next_source_id
         self._next_source_id += 1
         self._window[sid] = payload
+        self._first_sent_at[sid] = time.monotonic()
         self._sources_since_coded += 1
         self._total_sent_source += 1
 
@@ -163,8 +167,7 @@ class TetrysEncoder:
         removed = 0
         while self._window and next(iter(self._window)) < self._cumulative_ack:
             sid, _ = self._window.popitem(last=False)
-            self._drop_nack(sid)
-            self._rexmit_at.pop(sid, None)
+            self._forget_sid(sid)
             removed += 1
 
         # With FEC off: free SACKed symbols immediately so HOL holes don't pin
@@ -172,8 +175,7 @@ class TetrysEncoder:
         if held_ids and self.cfg.redundancy_every <= 0:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
-                    self._drop_nack(sid)
-                    self._rexmit_at.pop(sid, None)
+                    self._forget_sid(sid)
                     removed += 1
 
         # Drop stale NACK entries (SACKed / cumacked / not in window)
@@ -210,9 +212,26 @@ class TetrysEncoder:
         self._nack_set.discard(sid)
         self._nack_pending.pop(sid, None)
 
+    def _forget_sid(self, sid: int) -> None:
+        self._drop_nack(sid)
+        self._rexmit_at.pop(sid, None)
+        self._first_sent_at.pop(sid, None)
+
+    def _sent_age(self, sid: int, now: float) -> float:
+        t0 = self._first_sent_at.get(sid)
+        if t0 is None:
+            return 1e9
+        return now - t0
+
+    def _note_rexmit(self, sid: int, now: float) -> None:
+        if sid not in self._rexmit_at:
+            self._unique_rexmit += 1
+        self._rexmit_at[sid] = now
+        self._total_rexmit += 1
+
     def _prune_nack_q(self) -> None:
         """Remove NACK ids we can no longer repair (not in window / already ACKed)."""
-        if not self._nack_q:
+        if not self._nack_q and not self._nack_pending:
             return
         base = self._cumulative_ack
         kept: deque[int] = deque()
@@ -221,12 +240,12 @@ class TetrysEncoder:
             if sid < base or sid not in self._window:
                 self._nack_pending.pop(sid, None)
                 self._rexmit_at.pop(sid, None)
+                self._first_sent_at.pop(sid, None)
                 continue
             if sid not in self._nack_set:
                 self._nack_set.add(sid)
                 kept.append(sid)
         self._nack_q = kept
-        # Pending for gone symbols
         for sid in list(self._nack_pending):
             if sid < base or sid not in self._window:
                 self._nack_pending.pop(sid, None)
@@ -238,32 +257,38 @@ class TetrysEncoder:
         frontier: int | None = None,
         cooldown: float = 0.0,
     ) -> int:
-        """Count NACKs old enough to repair (respects tip/far age + cooldown)."""
+        """Count NACKs old enough to repair (first-send age + cooldown)."""
         now = time.monotonic()
         base = self._cumulative_ack
         far = min_age if far_age is None else far_age
+        tip_frontier = 512 if frontier is None else frontier
         n = 0
+        seen: set[int] = set()
         for sid in self._nack_q:
             if sid < base or sid not in self._window:
                 continue
             dist = max(0, sid - base)
             if frontier is not None and dist >= frontier:
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if cooldown > 0 and (now - last) < cooldown:
+            need = min_age if dist < tip_frontier else far
+            if self._sent_age(sid, now) < need:
                 continue
+            last = self._rexmit_at.get(sid, 0.0)
+            if last and cooldown > 0 and (now - last) < cooldown:
+                continue
+            seen.add(sid)
             n += 1
-        for sid, t0 in self._nack_pending.items():
-            if sid not in self._window or sid < base:
+        for sid in self._nack_pending:
+            if sid in seen or sid not in self._window or sid < base:
                 continue
             dist = max(0, sid - base)
             if frontier is not None and dist >= frontier:
                 continue
-            need = min_age if dist < 512 else far
-            if (now - t0) < need:
+            need = min_age if dist < tip_frontier else far
+            if self._sent_age(sid, now) < need:
                 continue
             last = self._rexmit_at.get(sid, 0.0)
-            if cooldown > 0 and (now - last) < cooldown:
+            if last and cooldown > 0 and (now - last) < cooldown:
                 continue
             n += 1
         return n
@@ -276,10 +301,7 @@ class TetrysEncoder:
         frontier: int = 512,
         cooldown: float = 0.0,
     ) -> list[bytearray]:
-        """Pack SOURCE retransmits; tip ages with min_age, far with far_age.
-
-        Prefer oldest first. Skip ids still in retransmit cooldown.
-        """
+        """Pack SOURCE retransmits; gate on first-send age (OOO hold)."""
         out: list[bytearray] = []
         if limit <= 0:
             return out
@@ -288,16 +310,16 @@ class TetrysEncoder:
         far = min_age if far_age is None else far_age
 
         ready: list[int] = []
-        for sid, t0 in list(self._nack_pending.items()):
+        for sid in list(self._nack_pending):
             if sid < base or sid not in self._window:
                 self._nack_pending.pop(sid, None)
                 continue
             dist = max(0, sid - base)
             need = min_age if dist < frontier else far
-            if (now - t0) < need:
+            if self._sent_age(sid, now) < need:
                 continue
             last = self._rexmit_at.get(sid, 0.0)
-            if cooldown > 0 and (now - last) < cooldown:
+            if last and cooldown > 0 and (now - last) < cooldown:
                 continue
             ready.append(sid)
         ready.sort()
@@ -316,19 +338,22 @@ class TetrysEncoder:
             if sid < base or sid not in self._window:
                 self._rexmit_at.pop(sid, None)
                 continue
+            dist = max(0, sid - base)
+            need = min_age if dist < frontier else far
+            if self._sent_age(sid, now) < need:
+                leftover.append(sid)
+                continue
             if len(out) >= limit:
                 leftover.append(sid)
                 continue
             last = self._rexmit_at.get(sid, 0.0)
-            if cooldown > 0 and (now - last) < cooldown:
+            if last and cooldown > 0 and (now - last) < cooldown:
                 leftover.append(sid)
                 continue
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
-                self._rexmit_at[sid] = now
-                self._total_rexmit += 1
-            # else: symbol gone — drop, do not re-queue
+                self._note_rexmit(sid, now)
         for sid in leftover:
             if sid not in self._nack_set and sid in self._window and sid >= base:
                 self._nack_set.add(sid)
@@ -336,12 +361,12 @@ class TetrysEncoder:
         return out
 
     def retransmit_oldest(
-        self, limit: int = 64, cooldown: float = 0.0
+        self,
+        limit: int = 64,
+        cooldown: float = 0.0,
+        min_age: float = 0.0,
     ) -> list[bytearray]:
-        """
-        Retransmit the oldest unacked SOURCE symbols (HOL frontier).
-        Skips ids still in retransmit cooldown.
-        """
+        """Retransmit oldest unacked SOURCE; requires min_age since first send."""
         out: list[bytearray] = []
         if limit <= 0 or not self._window:
             return out
@@ -349,14 +374,15 @@ class TetrysEncoder:
         for sid in list(self._window.keys()):
             if len(out) >= limit:
                 break
+            if min_age > 0 and self._sent_age(sid, now) < min_age:
+                continue
             last = self._rexmit_at.get(sid, 0.0)
-            if cooldown > 0 and (now - last) < cooldown:
+            if last and cooldown > 0 and (now - last) < cooldown:
                 continue
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
-                self._rexmit_at[sid] = now
-                self._total_rexmit += 1
+                self._note_rexmit(sid, now)
         return out
 
     def get_source(self, symbol_id: int) -> bytes | None:
@@ -380,7 +406,8 @@ class TetrysEncoder:
             "redundancy_every": self._redundancy_every,
             "coded_burst": self._coded_burst,
             "cumulative_ack": self._cumulative_ack,
-            "nack_q": len(self._nack_q),
+            "nack_q": len(self._nack_q) + len(self._nack_pending),
             "rexmit": self._total_rexmit,
+            "rexmit_unique": self._unique_rexmit,
             "plr_byte": self.last_plr_byte,
         }

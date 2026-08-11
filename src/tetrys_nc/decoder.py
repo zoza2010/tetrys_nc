@@ -243,10 +243,10 @@ class TetrysDecoder:
             else:
                 missing += 1
                 t0 = self._gap_open_at.setdefault(sid, now)
-                # Tip ages faster (~150ms @ hold=0.6) so true HOL loss shows in PLR;
-                # far gaps keep full hold (OOO-heavy path).
-                if hold > 0 and i < 256:
-                    hold_eff = min(hold, max(0.15, hold * 0.25))
+                # Tip ages at half hold (~300ms @ 0.6) — match server first-send gate.
+                # Old 0.25*hold (~150ms) screamed HOL loss under 30–40% OOO.
+                if hold > 0 and i < 512:
+                    hold_eff = min(hold, max(0.25, hold * 0.50))
                 else:
                     hold_eff = hold
                 if hold <= 0 or (now - t0) >= hold_eff:
