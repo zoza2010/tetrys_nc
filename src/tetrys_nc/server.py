@@ -62,18 +62,24 @@ def run_server(
 
     if coded_burst <= 0:
         coded_burst = 1
+    adaptive_fec = False
     if wan:
-        # WAN: NACK/HOL retransmit; no proactive FEC (coded burned CPU + inflated RTT).
+        # WAN: small payloads, blast pacing, adaptive FEC by default.
         if payload_size >= 8000:
             payload_size = 1350
         if max_window < 65536:
             max_window = 65536
-        if redundancy_every >= 32:
+        # redundancy: omit/0/≥32 → adaptive; 1..31 fixed; negative → FEC off
+        if redundancy_every < 0:
+            adaptive_fec = False
             redundancy_every = 0
+        elif redundancy_every == 0 or redundancy_every >= 32:
+            adaptive_fec = True
+            redundancy_every = 30  # start ≈3% (proven on this path)
+        # else: 1..31 keep fixed
         if coded_burst <= 1:
             coded_burst = 1
         code_degree = 8
-        # Default target ≈ typical WAN NIC; override with --rate to match link.
         if rate_mbit <= 0:
             rate_mbit = 1000.0
     else:
@@ -91,9 +97,14 @@ def run_server(
         print(f"file={file_path.name} size={file_size} sha256={digest[:16]}...")
 
     total_symbols = (file_size + payload_size - 1) // payload_size if file_size else 0
+    red_label = (
+        f"adaptive~{redundancy_every}x{coded_burst}"
+        if adaptive_fec
+        else f"{redundancy_every}x{coded_burst}"
+    )
     print(
         f"symbols={total_symbols} payload={payload_size} "
-        f"window={max_window} redundancy={redundancy_every}x{coded_burst} "
+        f"window={max_window} redundancy={red_label} "
         f"wan={wan} rate_mbit={rate_mbit or 'unlimited'} gf={gf256.backend()}"
     )
 
@@ -114,6 +125,7 @@ def run_server(
             coded_burst=coded_burst,
             payload_size=payload_size,
             code_degree=code_degree,
+            adaptive_fec=adaptive_fec,
         )
     )
     enc_lock = threading.Lock()
@@ -495,6 +507,8 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
+                            f"fec=1/{st['redundancy_every']}"
+                            f"{'*' if st.get('adaptive_fec') else ''} "
                             f"nack={tip_ready}/{st['nack_q']} "
                             f"rtx={st['rexmit']}/{st.get('rexmit_unique', st['rexmit'])} "
                             f"tip={tip_age * 1000:.0f}ms far={far_age * 1000:.0f}ms "
@@ -536,7 +550,10 @@ def main(argv: list[str] | None = None) -> int:
         "--redundancy",
         type=int,
         default=32,
-        help="coded every N source packets (0=off; repair still via retransmit)",
+        help=(
+            "coded every N sources. WAN: omit/0/32=adaptive (starts ~1/30); "
+            "N=1..31 fixed; negative=FEC off"
+        ),
     )
     p.add_argument(
         "--coded-burst",
@@ -549,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: payload 1350, FASP-style blast pacing, NACK/HOL repair (no FEC)",
+        help="WAN: payload 1350, blast pacing, adaptive FEC + NACK/HOL repair",
     )
     p.add_argument(
         "--rate-mbit",

@@ -24,6 +24,10 @@ class EncoderConfig:
     # How many oldest unacked symbols to mix into each coded packet
     code_degree: int = 8
     payload_size: int = 32768
+    # When True, redundancy_every is the starting point; density follows PLR.
+    adaptive_fec: bool = False
+    adaptive_red_min: int = 8   # densest ≈12% coded
+    adaptive_red_max: int = 50  # sparsest ≈2% coded
 
 
 class TetrysEncoder:
@@ -35,8 +39,12 @@ class TetrysEncoder:
         self._sources_since_coded = 0
         self._total_sent_source = 0
         self._total_sent_coded = 0
-        self._redundancy_every = self.cfg.redundancy_every
+        start_red = self.cfg.redundancy_every
+        if self.cfg.adaptive_fec and start_red <= 0:
+            start_red = 30
+        self._redundancy_every = start_red
         self._coded_burst = max(1, self.cfg.coded_burst)
+        self._plr_ewma = 0.0
         self._cumulative_ack = 0
         # NACK queue: age missing ids before repair (reorder hold on sender).
         # sid -> first time reported missing
@@ -194,9 +202,8 @@ class TetrysEncoder:
             self._forget_sid(sid)
             removed += 1
 
-        # With FEC off: free SACKed symbols immediately so HOL holes don't pin
-        # the entire elastic window (FASP-like — don't stall on already-delivered).
-        if held_ids and self.cfg.redundancy_every <= 0:
+        # Keep symbols for coding while FEC is active (adaptive or fixed).
+        if held_ids and self._redundancy_every <= 0:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
                     self._forget_sid(sid)
@@ -212,25 +219,46 @@ class TetrysEncoder:
                     # First sighting starts reorder timer; do not NACK yet
                     self._nack_pending.setdefault(sid, now)
 
-        # Adaptive FEC around configured base. Loss → slightly denser coded over
-        # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
         self.last_plr_byte = plr_byte
+        nack_hint = len(missing_ids) if missing_ids else 0
+        self._update_fec(plr_byte, nack_hint=nack_hint)
+        return removed
+
+    def _update_fec(self, plr_byte: int, nack_hint: int = 0) -> None:
+        """Adjust periodic coding density from loss / NACK pressure."""
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
+        self._plr_ewma = (0.85 * self._plr_ewma) + (0.15 * plr)
+
+        if self.cfg.adaptive_fec:
+            # Target coded fraction ≈ 2% + 2×PLR, clamped to ~2–12%.
+            # Matches the good --redundancy 30 (~3%) on a ~0.5% loss path.
+            target_frac = min(0.12, max(0.02, 0.02 + 2.0 * (self._plr_ewma / 100.0)))
+            every = int(round(1.0 / target_frac))
+            if nack_hint > 128:
+                every = max(self.cfg.adaptive_red_min, every // 2)
+            elif nack_hint > 32:
+                every = max(self.cfg.adaptive_red_min, (every * 3) // 4)
+            every = max(
+                self.cfg.adaptive_red_min,
+                min(self.cfg.adaptive_red_max, every),
+            )
+            self._redundancy_every = every
+            self._coded_burst = 2 if self._plr_ewma >= 5.0 else max(1, self.cfg.coded_burst)
+            return
+
         base_red = self.cfg.redundancy_every
         if base_red <= 0:
             self._redundancy_every = 0
             self._coded_burst = 1
-        elif plr >= 25:
-            # ~more FEC, still bounded (every 4 sources × burst 2 ≈ 50% coded)
+        elif self._plr_ewma >= 25:
             self._redundancy_every = max(4, base_red // 2)
             self._coded_burst = max(self.cfg.coded_burst, 2)
-        elif plr >= 10:
+        elif self._plr_ewma >= 10:
             self._redundancy_every = max(6, base_red)
             self._coded_burst = max(self.cfg.coded_burst, 1)
         else:
             self._redundancy_every = base_red
             self._coded_burst = self.cfg.coded_burst
-        return removed
 
     def _drop_nack(self, sid: int) -> None:
         self._nack_set.discard(sid)
@@ -429,6 +457,8 @@ class TetrysEncoder:
             "sent_coded": self._total_sent_coded,
             "redundancy_every": self._redundancy_every,
             "coded_burst": self._coded_burst,
+            "adaptive_fec": self.cfg.adaptive_fec,
+            "plr_ewma": self._plr_ewma,
             "cumulative_ack": self._cumulative_ack,
             "nack_q": len(self._nack_q) + len(self._nack_pending),
             "rexmit": self._total_rexmit,
