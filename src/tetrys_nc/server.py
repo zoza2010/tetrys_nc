@@ -320,8 +320,7 @@ def run_server(
                     win_fat = False
                     with enc_lock:
                         win = enc.window_size
-                        # Throttle well before max_window — 90% was too late (rtx storm).
-                        win_fat = wan and win >= 8192
+                        win_fat = wan and win >= 16384
                         win_full = wan and win >= int(enc.cfg.max_window * 0.90)
                         stalled = (
                             wan
@@ -343,7 +342,6 @@ def run_server(
                             repair_n = 8 if wan else 4
                         repairs: list[bytearray] = []
                         if stalled:
-                            # True HOL: repair tip first. Avoid win_full→oldest spam.
                             repairs.extend(
                                 enc.retransmit_oldest(
                                     limit=repair_n, cooldown=tip_cd
@@ -370,18 +368,20 @@ def run_server(
                                 repairs = repairs[: max(8, batch // 10)]
                         room = enc.cfg.max_window - enc.window_size
 
-                    # Flight from cwnd only — do not expand to holey win size
                     flight_cap = min(enc.cfg.max_window, max(int(ack_progress["flight"]), 1024))
                     ack_progress["flight"] = flight_cap
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # Keep occupancy near flight_cap (good run lived at win≪65k).
+                    # WAN: pace elastic growth (~good 35MiB/s run = ~64–96/loop).
+                    # Hard-stop only on true stall / absolute full — not win≈small flight.
+                    if wan and n_take:
+                        n_take = min(n_take, 96)
                     if win == 0:
                         pass
-                    elif stalled or win_full or win >= flight_cap or tip_ready > 128:
+                    elif stalled or win_full:
                         n_take = 0
-                    elif win_fat or tip_ready > 32 or win > flight_cap * 3 // 4:
-                        n_take = min(n_take, 64)
+                    elif tip_ready > 64 or win_fat:
+                        n_take = min(n_take, 32)
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
