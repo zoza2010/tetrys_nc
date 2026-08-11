@@ -246,16 +246,14 @@ class TetrysEncoder:
             target_frac = min(0.12, max(0.03, 0.03 + 2.5 * (eff_plr / 100.0)))
             every = int(round(1.0 / target_frac))
 
-            # NACK queue under OOO ≠ loss. Only densify from holes when PLR agrees;
-            # otherwise stay ~1/32 and let hold/rtx handle reorder (1/12 burned goodput).
+            # Hole pressure matters even when PLR byte is 0 (reorder hold).
             pressure = max(nack_hint, pending)
-            if eff_plr >= 1.0:
-                if pressure > 256:
-                    every = min(every, 12)
-                elif pressure > 64:
-                    every = min(every, 20)
-                elif pressure > 16:
-                    every = min(every, 28)
+            if pressure > 256:
+                every = min(every, 12)
+            elif pressure > 64:
+                every = min(every, 20)
+            elif pressure > 16:
+                every = min(every, 28)
 
             every = max(
                 self.cfg.adaptive_red_min,
@@ -263,7 +261,7 @@ class TetrysEncoder:
             )
             self._redundancy_every = every
             self._coded_burst = (
-                2 if eff_plr >= 5.0 else max(1, self.cfg.coded_burst)
+                2 if (eff_plr >= 5.0 or pressure > 128) else max(1, self.cfg.coded_burst)
             )
             return
 

@@ -41,8 +41,8 @@ def run_client(
             max_window = 65536
         if feedback_every > 64:
             feedback_every = 64
-        # ~30–40% OOO: hold long enough that gaps are real loss, not reorder.
-        reorder_hold_s = 0.60
+        # ~40% OOO but WAN defaults to FEC — shorter hold, less false-stall.
+        reorder_hold_s = 0.45
     else:
         reorder_hold_s = 0.0
 
@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: large window, reorder hold 0.6s, feedback every 64",
+        help="WAN: large window, reorder hold 0.45s, feedback every 64",
     )
     args = p.parse_args(argv)
     return run_client(

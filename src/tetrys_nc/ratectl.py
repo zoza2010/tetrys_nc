@@ -186,10 +186,10 @@ class DelayRateController:
             floor = 1024
             ceil = 12288
         else:
-            # Good ~48MiB/s run: modest gain; larger ceil + short hold caused rtx storms.
-            gain = 2.5
+            # Headroom for 600–800M paths; occupancy stays lower via admit pacing.
+            gain = 3.0
             floor = 4096
-            ceil = 24576
+            ceil = 32768
         bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
         return max(floor, min(ceil, int(bdp * gain)))
 
