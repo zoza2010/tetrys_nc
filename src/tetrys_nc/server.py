@@ -374,8 +374,11 @@ def run_server(
                     ack_progress["flight"] = flight_cap
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # HOL / tip backlog: stop admitting — repair must drain first
-                    if stalled or win_full or tip_ready > 128:
+                    # HOL / tip backlog: stop admitting — repair must drain first.
+                    # Never block when window empty (ghost NACKs used to deadlock here).
+                    if win == 0:
+                        pass
+                    elif stalled or win_full or tip_ready > 128:
                         n_take = 0
                     elif tip_ready > 32:
                         n_take = min(n_take, 64)

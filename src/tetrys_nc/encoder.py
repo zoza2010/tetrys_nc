@@ -163,8 +163,7 @@ class TetrysEncoder:
         removed = 0
         while self._window and next(iter(self._window)) < self._cumulative_ack:
             sid, _ = self._window.popitem(last=False)
-            self._nack_set.discard(sid)
-            self._nack_pending.pop(sid, None)
+            self._drop_nack(sid)
             self._rexmit_at.pop(sid, None)
             removed += 1
 
@@ -173,10 +172,12 @@ class TetrysEncoder:
         if held_ids and self.cfg.redundancy_every <= 0:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
-                    self._nack_set.discard(sid)
-                    self._nack_pending.pop(sid, None)
+                    self._drop_nack(sid)
                     self._rexmit_at.pop(sid, None)
                     removed += 1
+
+        # Drop stale NACK entries (SACKed / cumacked / not in window)
+        self._prune_nack_q()
 
         now = time.monotonic()
         if missing_ids:
@@ -205,6 +206,31 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
+    def _drop_nack(self, sid: int) -> None:
+        self._nack_set.discard(sid)
+        self._nack_pending.pop(sid, None)
+
+    def _prune_nack_q(self) -> None:
+        """Remove NACK ids we can no longer repair (not in window / already ACKed)."""
+        if not self._nack_q:
+            return
+        base = self._cumulative_ack
+        kept: deque[int] = deque()
+        self._nack_set.clear()
+        for sid in self._nack_q:
+            if sid < base or sid not in self._window:
+                self._nack_pending.pop(sid, None)
+                self._rexmit_at.pop(sid, None)
+                continue
+            if sid not in self._nack_set:
+                self._nack_set.add(sid)
+                kept.append(sid)
+        self._nack_q = kept
+        # Pending for gone symbols
+        for sid in list(self._nack_pending):
+            if sid < base or sid not in self._window:
+                self._nack_pending.pop(sid, None)
+
     def nack_ready_count(
         self,
         min_age: float = 0.0,
@@ -218,6 +244,8 @@ class TetrysEncoder:
         far = min_age if far_age is None else far_age
         n = 0
         for sid in self._nack_q:
+            if sid < base or sid not in self._window:
+                continue
             dist = max(0, sid - base)
             if frontier is not None and dist >= frontier:
                 continue
@@ -226,7 +254,7 @@ class TetrysEncoder:
                 continue
             n += 1
         for sid, t0 in self._nack_pending.items():
-            if sid not in self._window:
+            if sid not in self._window or sid < base:
                 continue
             dist = max(0, sid - base)
             if frontier is not None and dist >= frontier:
@@ -261,7 +289,7 @@ class TetrysEncoder:
 
         ready: list[int] = []
         for sid, t0 in list(self._nack_pending.items()):
-            if sid not in self._window:
+            if sid < base or sid not in self._window:
                 self._nack_pending.pop(sid, None)
                 continue
             dist = max(0, sid - base)
@@ -285,6 +313,9 @@ class TetrysEncoder:
         self._nack_set.clear()
         leftover: list[int] = []
         for sid in queued:
+            if sid < base or sid not in self._window:
+                self._rexmit_at.pop(sid, None)
+                continue
             if len(out) >= limit:
                 leftover.append(sid)
                 continue
@@ -297,10 +328,9 @@ class TetrysEncoder:
                 out.append(wire)
                 self._rexmit_at[sid] = now
                 self._total_rexmit += 1
-            else:
-                leftover.append(sid)
+            # else: symbol gone — drop, do not re-queue
         for sid in leftover:
-            if sid not in self._nack_set:
+            if sid not in self._nack_set and sid in self._window and sid >= base:
                 self._nack_set.add(sid)
                 self._nack_q.append(sid)
         return out
