@@ -53,6 +53,7 @@ def run_server(
     wan: bool = False,
     rate_mbit: float = 0.0,
     ramp_s: float = 3.0,
+    reorder_hold_s: float = 0.60,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
@@ -306,41 +307,66 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL / aged NACK → repair. Young gaps wait reorder hold (~RTT).
+                    # Tip: repair ~RTT (true HOL loss). Far: wait reorder hold
+                    # (iperf ~30% OOO / ~0.5% loss). Cap repair + cooldown.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
-                    reorder_s = max(0.1, rtt_s * 1.25) if wan else 0.0
-                    plr = int(ack_progress["plr"])
+                    tip_age = max(0.08, rtt_s * 1.0) if wan else 0.0
+                    far_age = (
+                        max(tip_age, float(reorder_hold_s)) if wan else 0.0
+                    )
+                    cooldown = (rtt_s * 1.5) if wan else 0.0
                     with enc_lock:
                         win = enc.window_size
-                        nack_ready = enc.nack_ready_count(min_age=reorder_s)
+                        tip_ready = enc.nack_ready_count(
+                            min_age=tip_age,
+                            far_age=far_age,
+                            frontier=512,
+                            cooldown=cooldown,
+                        )
                         stalled = (
                             wan
                             and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s * 1.5)
                         )
-                        # Do not treat fresh reorder gaps (high raw missing) as holey
-                        holey = wan and (stalled or nack_ready > 0 or plr >= 32)
-                        if holey:
-                            repair_n = 512 if stalled else 256
+                        # Ignore SACK-PLR (inflated by OOO). Repair tip / stall only.
+                        if stalled:
+                            repair_n = 128
+                        elif tip_ready > 0:
+                            repair_n = 32
                         else:
-                            repair_n = 64 if wan else 4
-                        repairs = enc.pop_nack_retransmit(
-                            limit=repair_n, min_age=reorder_s
-                        )
-                        if stalled or win >= enc.cfg.max_window:
+                            repair_n = 8 if wan else 4
+                        repairs: list[bytearray] = []
+                        if stalled:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(64, repair_n - len(repairs))
+                                    limit=repair_n, cooldown=cooldown
                                 )
                             )
+                            repairs.extend(
+                                enc.pop_nack_retransmit(
+                                    limit=max(16, repair_n // 2),
+                                    min_age=tip_age,
+                                    far_age=far_age,
+                                    cooldown=cooldown,
+                                )
+                            )
+                        else:
+                            repairs = enc.pop_nack_retransmit(
+                                limit=repair_n,
+                                min_age=tip_age,
+                                far_age=far_age,
+                                cooldown=cooldown,
+                            )
+                        # Hard cap: repair ≤ ~10% of batch (≈ loss budget, not OOO)
+                        if not stalled and repairs:
+                            repairs = repairs[: max(8, batch // 10)]
                         room = enc.cfg.max_window - enc.window_size
 
                     flight_cap = max(int(ack_progress["flight"]), win)
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # While repairing true holes, throttle new admits slightly
-                    if holey and repairs:
+                    if stalled and repairs:
                         n_take = min(n_take, max(256, batch // 4))
 
                     chunks: list[bytes] = []
@@ -368,8 +394,8 @@ def run_server(
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
-                    # Repair first whenever holes exist (unblocks cumack / window).
-                    if holey:
+                    # Repair-first only when cumack is stuck
+                    if stalled:
                         send_batch(repairs)
                         send_batch(wires)
                     else:
@@ -392,10 +418,15 @@ def run_server(
                             send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                tail = enc.retransmit_oldest(limit=256)
+                                tail = enc.retransmit_oldest(
+                                    limit=128, cooldown=cooldown
+                                )
                                 tail.extend(
                                     enc.pop_nack_retransmit(
-                                        limit=128, min_age=reorder_s
+                                        limit=64,
+                                        min_age=tip_age,
+                                        far_age=far_age,
+                                        cooldown=cooldown,
                                     )
                                 )
                             send_batch(tail)
@@ -403,10 +434,17 @@ def run_server(
                     elif sent == 0:
                         with enc_lock:
                             tail = enc.pop_nack_retransmit(
-                                limit=128, min_age=reorder_s
+                                limit=32,
+                                min_age=tip_age,
+                                far_age=far_age,
+                                cooldown=cooldown,
                             )
                             if stalled or not tail:
-                                tail.extend(enc.retransmit_oldest(limit=128))
+                                tail.extend(
+                                    enc.retransmit_oldest(
+                                        limit=32, cooldown=cooldown
+                                    )
+                                )
                         send_batch(tail)
 
                     now = time.monotonic()
@@ -440,7 +478,9 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
-                            f"nack={st['nack_q']} rtx={st['rexmit']} plr={st['plr_byte']} "
+                            f"nack={tip_ready}/{st['nack_q']} rtx={st['rexmit']} "
+                            f"tip={tip_age * 1000:.0f}ms far={far_age * 1000:.0f}ms "
+                            f"plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
                             f"app={rate:.1f} MiB/s"
@@ -506,6 +546,12 @@ def main(argv: list[str] | None = None) -> int:
         default=3.0,
         help="seconds to ease-in pace from 0 to --rate (slow→fast; 0=immediate blast)",
     )
+    p.add_argument(
+        "--reorder-hold-s",
+        type=float,
+        default=0.60,
+        help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.60)",
+    )
     args = p.parse_args(argv)
     return run_server(
         args.host,
@@ -520,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         wan=args.wan,
         rate_mbit=args.rate_mbit,
         ramp_s=args.ramp_s,
+        reorder_hold_s=args.reorder_hold_s,
     )
 
 

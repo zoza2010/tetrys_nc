@@ -39,10 +39,10 @@ def run_client(
         # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
         if max_window < 65536:
             max_window = 65536
-        # Reorder-heavy path (iperf ~16% OOO): slower SACK than lossy LAN.
+        # iperf ~30% OOO / ~0.5% loss: wait for reorder before PLR/NACK pressure.
         if feedback_every > 64:
-            feedback_every = 32
-        reorder_hold_s = 0.12  # ~1.5×80ms RTT — wait before treating gap as loss
+            feedback_every = 64
+        reorder_hold_s = 0.60
     else:
         reorder_hold_s = 0.0
 
@@ -61,7 +61,10 @@ def run_client(
         )
     )
 
-    print(f"connecting to udp://{host}:{port}")
+    print(
+        f"connecting to udp://{host}:{port}"
+        f" (hold={reorder_hold_s:.2f}s fb_every={feedback_every})"
+    )
     ready = ReadyPacket(max_window).pack()
     for _ in range(5):
         sock.sendto(ready, server)
@@ -232,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: large window, reorder-tolerant SACK (hold ~120ms before NACK)",
+        help="WAN: large window, reorder hold 0.6s, feedback every 64",
     )
     args = p.parse_args(argv)
     return run_client(

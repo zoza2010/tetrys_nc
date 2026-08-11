@@ -43,6 +43,8 @@ class TetrysEncoder:
         self._nack_pending: dict[int, float] = {}
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
+        # sid -> last SOURCE retransmit time (cooldown against spam)
+        self._rexmit_at: dict[int, float] = {}
         self._total_rexmit = 0
         self.last_plr_byte = 0
         self._send_ts_us = 0
@@ -163,6 +165,7 @@ class TetrysEncoder:
             sid, _ = self._window.popitem(last=False)
             self._nack_set.discard(sid)
             self._nack_pending.pop(sid, None)
+            self._rexmit_at.pop(sid, None)
             removed += 1
 
         # With FEC off: free SACKed symbols immediately so HOL holes don't pin
@@ -172,6 +175,7 @@ class TetrysEncoder:
                 if self._window.pop(sid, None) is not None:
                     self._nack_set.discard(sid)
                     self._nack_pending.pop(sid, None)
+                    self._rexmit_at.pop(sid, None)
                     removed += 1
 
         now = time.monotonic()
@@ -201,55 +205,127 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
-    def nack_ready_count(self, min_age: float = 0.0) -> int:
-        """How many pending NACKs are older than min_age (plus queued)."""
+    def nack_ready_count(
+        self,
+        min_age: float = 0.0,
+        far_age: float | None = None,
+        frontier: int | None = None,
+        cooldown: float = 0.0,
+    ) -> int:
+        """Count NACKs old enough to repair (respects tip/far age + cooldown)."""
         now = time.monotonic()
-        n = len(self._nack_q)
+        base = self._cumulative_ack
+        far = min_age if far_age is None else far_age
+        n = 0
+        for sid in self._nack_q:
+            dist = max(0, sid - base)
+            if frontier is not None and dist >= frontier:
+                continue
+            last = self._rexmit_at.get(sid, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                continue
+            n += 1
         for sid, t0 in self._nack_pending.items():
-            if sid in self._window and (now - t0) >= min_age:
-                n += 1
+            if sid not in self._window:
+                continue
+            dist = max(0, sid - base)
+            if frontier is not None and dist >= frontier:
+                continue
+            need = min_age if dist < 512 else far
+            if (now - t0) < need:
+                continue
+            last = self._rexmit_at.get(sid, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                continue
+            n += 1
         return n
 
     def pop_nack_retransmit(
-        self, limit: int = 8, min_age: float = 0.0
+        self,
+        limit: int = 8,
+        min_age: float = 0.0,
+        far_age: float | None = None,
+        frontier: int = 512,
+        cooldown: float = 0.0,
     ) -> list[bytearray]:
-        """Pack SOURCE retransmits for NACKs that survived reorder hold."""
+        """Pack SOURCE retransmits; tip ages with min_age, far with far_age.
+
+        Prefer oldest first. Skip ids still in retransmit cooldown.
+        """
         out: list[bytearray] = []
+        if limit <= 0:
+            return out
         now = time.monotonic()
-        # Promote aged pending → queue
+        base = self._cumulative_ack
+        far = min_age if far_age is None else far_age
+
+        ready: list[int] = []
         for sid, t0 in list(self._nack_pending.items()):
             if sid not in self._window:
                 self._nack_pending.pop(sid, None)
                 continue
-            if (now - t0) < min_age:
+            dist = max(0, sid - base)
+            need = min_age if dist < frontier else far
+            if (now - t0) < need:
                 continue
+            last = self._rexmit_at.get(sid, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                continue
+            ready.append(sid)
+        ready.sort()
+
+        for sid in ready[: max(limit * 2, limit)]:
             self._nack_pending.pop(sid, None)
             if sid not in self._nack_set:
                 self._nack_set.add(sid)
                 self._nack_q.append(sid)
 
-        while self._nack_q and len(out) < limit:
-            sid = self._nack_q.popleft()
-            self._nack_set.discard(sid)
+        queued = sorted(self._nack_q)
+        self._nack_q.clear()
+        self._nack_set.clear()
+        leftover: list[int] = []
+        for sid in queued:
+            if len(out) >= limit:
+                leftover.append(sid)
+                continue
+            last = self._rexmit_at.get(sid, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                leftover.append(sid)
+                continue
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                self._rexmit_at[sid] = now
                 self._total_rexmit += 1
+            else:
+                leftover.append(sid)
+        for sid in leftover:
+            if sid not in self._nack_set:
+                self._nack_set.add(sid)
+                self._nack_q.append(sid)
         return out
 
-    def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
+    def retransmit_oldest(
+        self, limit: int = 64, cooldown: float = 0.0
+    ) -> list[bytearray]:
         """
         Retransmit the oldest unacked SOURCE symbols (HOL frontier).
-        This is what unblocks the receiver when the window is full of
-        future data waiting on early holes — better than coded spam.
+        Skips ids still in retransmit cooldown.
         """
         out: list[bytearray] = []
         if limit <= 0 or not self._window:
             return out
-        for sid in list(self._window.keys())[:limit]:
+        now = time.monotonic()
+        for sid in list(self._window.keys()):
+            if len(out) >= limit:
+                break
+            last = self._rexmit_at.get(sid, 0.0)
+            if cooldown > 0 and (now - last) < cooldown:
+                continue
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                self._rexmit_at[sid] = now
                 self._total_rexmit += 1
         return out
 

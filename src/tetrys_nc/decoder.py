@@ -243,7 +243,13 @@ class TetrysDecoder:
             else:
                 missing += 1
                 t0 = self._gap_open_at.setdefault(sid, now)
-                if hold <= 0 or (now - t0) >= hold:
+                # Tip ages faster (~150ms @ hold=0.6) so true HOL loss shows in PLR;
+                # far gaps keep full hold (OOO-heavy path).
+                if hold > 0 and i < 256:
+                    hold_eff = min(hold, max(0.15, hold * 0.25))
+                else:
+                    hold_eff = hold
+                if hold <= 0 or (now - t0) >= hold_eff:
                     aged_missing += 1
                 # bit stays 0 — SACK accurate; sender ages NACK before repair
 
