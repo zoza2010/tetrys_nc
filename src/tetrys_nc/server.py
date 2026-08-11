@@ -119,14 +119,14 @@ def run_server(
     enc_lock = threading.Lock()
     fin_from_client = threading.Event()
     stop_feedback = threading.Event()
-    # Large initial flight — fill the pipe before first ACKs arrive.
+    # Modest initial flight; DelayRateController grows with pace (esp. during ramp).
     ack_progress = {
         "ack": 0,
         "plr": 0,
         "t": time.monotonic(),
         "rtt_us": 0.0,
         "echo": 0,
-        "flight": max_window if wan else min(8192, max_window),
+        "flight": min(8192, max_window) if wan else min(8192, max_window),
         "nack": 0,
     }
 
@@ -227,10 +227,10 @@ def run_server(
                             if rtt is not None:
                                 ack_progress["rtt_us"] = rtt
                         ack_progress["echo"] = pkt.echo_ts_us
-                        # Never shrink cwnd below current flight (avoids admit deadlock)
+                        # Track flight from cwnd; do not ratchet forever on a full holey window
                         cwnd = delay_cc.target_cwnd_packets()
                         ack_progress["flight"] = min(
-                            enc.cfg.max_window, max(cwnd, win_now, ack_progress["flight"])
+                            enc.cfg.max_window, max(cwnd, min(win_now, cwnd * 2))
                         )
                     elif delta > 0:
                         ack_progress["flight"] = min(
@@ -314,60 +314,69 @@ def run_server(
                     far_age = (
                         max(tip_age, float(reorder_hold_s)) if wan else 0.0
                     )
-                    cooldown = (rtt_s * 1.5) if wan else 0.0
+                    win_full = False
                     with enc_lock:
                         win = enc.window_size
-                        tip_ready = enc.nack_ready_count(
-                            min_age=tip_age,
-                            far_age=far_age,
-                            frontier=512,
-                            cooldown=cooldown,
-                        )
+                        win_full = wan and win >= int(enc.cfg.max_window * 0.90)
                         stalled = (
                             wan
                             and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s * 1.5)
                         )
-                        # Ignore SACK-PLR (inflated by OOO). Repair tip / stall only.
-                        if stalled:
-                            repair_n = 128
+                        # Tip needs faster retries when cumack/window stuck;
+                        # far gaps keep long cooldown (OOO).
+                        tip_cd = (rtt_s * 0.5) if (stalled or win_full) else (rtt_s * 1.0)
+                        tip_ready = enc.nack_ready_count(
+                            min_age=tip_age,
+                            far_age=far_age,
+                            frontier=512,
+                            cooldown=tip_cd,
+                        )
+                        if stalled or win_full:
+                            repair_n = 256
                         elif tip_ready > 0:
-                            repair_n = 32
+                            repair_n = 64
                         else:
                             repair_n = 8 if wan else 4
                         repairs: list[bytearray] = []
-                        if stalled:
+                        if stalled or win_full:
+                            # Unblock cumack first — don't starve tip under full window
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=repair_n, cooldown=cooldown
+                                    limit=repair_n, cooldown=tip_cd
                                 )
                             )
                             repairs.extend(
                                 enc.pop_nack_retransmit(
-                                    limit=max(16, repair_n // 2),
+                                    limit=repair_n,
                                     min_age=tip_age,
                                     far_age=far_age,
-                                    cooldown=cooldown,
+                                    frontier=512,
+                                    cooldown=tip_cd,
                                 )
                             )
                         else:
+                            # tip_cd for tip; far_age gates distant gaps (OOO hold)
                             repairs = enc.pop_nack_retransmit(
                                 limit=repair_n,
                                 min_age=tip_age,
                                 far_age=far_age,
-                                cooldown=cooldown,
+                                frontier=512,
+                                cooldown=tip_cd,
                             )
-                        # Hard cap: repair ≤ ~10% of batch (≈ loss budget, not OOO)
-                        if not stalled and repairs:
-                            repairs = repairs[: max(8, batch // 10)]
+                            # Cap far repair share; keep tip (first ~frontier) intact
+                            if repairs and tip_ready == 0:
+                                repairs = repairs[: max(8, batch // 10)]
                         room = enc.cfg.max_window - enc.window_size
 
-                    flight_cap = max(int(ack_progress["flight"]), win)
-                    ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
+                    # Flight from cwnd only — do not expand to holey win size
+                    flight_cap = min(enc.cfg.max_window, max(int(ack_progress["flight"]), 1024))
+                    ack_progress["flight"] = flight_cap
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    if stalled and repairs:
-                        n_take = min(n_take, max(256, batch // 4))
+                    # When window full / HOL: prefer clearing tip over new data
+                    if (stalled or win_full) and repairs:
+                        n_take = min(n_take, max(128, batch // 8))
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -394,8 +403,8 @@ def run_server(
                             for cw in enc.maybe_coded():
                                 wires.append(cw)
 
-                    # Repair-first only when cumack is stuck
-                    if stalled:
+                    # Repair-first when cumack stuck or window pinned
+                    if stalled or win_full:
                         send_batch(repairs)
                         send_batch(wires)
                     else:
@@ -419,14 +428,14 @@ def run_server(
                         else:
                             with enc_lock:
                                 tail = enc.retransmit_oldest(
-                                    limit=128, cooldown=cooldown
+                                    limit=128, cooldown=tip_cd
                                 )
                                 tail.extend(
                                     enc.pop_nack_retransmit(
                                         limit=64,
                                         min_age=tip_age,
                                         far_age=far_age,
-                                        cooldown=cooldown,
+                                        cooldown=tip_cd,
                                     )
                                 )
                             send_batch(tail)
@@ -437,12 +446,12 @@ def run_server(
                                 limit=32,
                                 min_age=tip_age,
                                 far_age=far_age,
-                                cooldown=cooldown,
+                                cooldown=tip_cd,
                             )
-                            if stalled or not tail:
+                            if stalled or win_full or not tail:
                                 tail.extend(
                                     enc.retransmit_oldest(
-                                        limit=32, cooldown=cooldown
+                                        limit=64, cooldown=tip_cd
                                     )
                                 )
                         send_batch(tail)
@@ -471,7 +480,7 @@ def run_server(
                             cwnd = delay_cc.target_cwnd_packets()
                             ack_progress["flight"] = min(
                                 enc.cfg.max_window,
-                                max(cwnd, st["window"], ack_progress["flight"]),
+                                max(cwnd, min(st["window"], cwnd * 2)),
                             )
                         flight = int(ack_progress["flight"])
                         print(
@@ -484,7 +493,7 @@ def run_server(
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
                             f"app={rate:.1f} MiB/s"
-                            f"{' HOL' if stalled else ''}"
+                            f"{' HOL' if stalled or win_full else ''}"
                         )
 
                     if fin_sent and time.monotonic() - t0 > 3600:

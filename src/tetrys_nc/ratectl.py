@@ -178,12 +178,19 @@ class DelayRateController:
         return float(rtt)
 
     def target_cwnd_packets(self) -> int:
-        """Oversized flight so sender never waits on ACK while pipe has room."""
-        min_rtt = self.base_rtt_us or self.srtt_us or 40_000.0
-        bw = max(self.limiter.max_rate, self.limiter.rate, self.btlbw, self.peak_bw)
+        """Flight sized for current pace; smaller during ease-in ramp."""
+        min_rtt = self.base_rtt_us or self.srtt_us or 80_000.0
+        # During ramp use current rate (not max) so we don't open 65k flight at once.
+        if not self._ramp_done and self.ramp_s > 0:
+            bw = max(self.limiter.rate, self.btlbw * 0.5, 1_000_000.0)
+            gain = 2.0
+            floor = 1024
+        else:
+            bw = max(self.limiter.max_rate, self.limiter.rate, self.btlbw, self.peak_bw)
+            gain = 6.0
+            floor = 16384
         bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
-        # High gain: keep multiple BDPs in flight (FASP-like aggressiveness).
-        return max(16384, int(bdp * 6.0))
+        return max(floor, int(bdp * gain))
 
     def _offer_bw(self, now: float, sample_bps: float) -> None:
         if sample_bps <= 0:
