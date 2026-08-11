@@ -266,6 +266,7 @@ def run_server(
     file_offset = 0
     last_ack_seen = 0
     last_ack_advance_t = t0
+    last_oldest_rtx_t = 0.0
 
     def _stamp(buf: bytearray, ts: int) -> None:
         if len(buf) < 4:
@@ -339,7 +340,7 @@ def run_server(
                             and win > 64
                             and (now_loop - last_ack_advance_t > rtt_s * 2.5)
                         )
-                        # After a rtx, wait ~1 RTT+ for the repair to land (cut duplicates).
+                        # After a rtx, wait for repair to land (cut duplicate storms).
                         tip_cd = max(rtt_s * 1.5, tip_age * 0.5) if wan else 0.0
                         tip_ready = enc.nack_ready_count(
                             min_age=tip_age,
@@ -348,27 +349,32 @@ def run_server(
                             cooldown=tip_cd,
                         )
                         if stalled:
-                            repair_n = 64
+                            repair_n = 16
                         elif tip_ready > 0 or win_fat:
                             repair_n = 32
                         else:
                             repair_n = 4 if wan else 4
                         repairs: list[bytearray] = []
                         if stalled:
-                            repairs.extend(
-                                enc.retransmit_oldest(
-                                    limit=repair_n,
-                                    cooldown=tip_cd,
-                                    min_age=tip_age,
+                            # Only tip, and at most once per cooldown — never sweep whole window.
+                            stall_cd = max(tip_cd, rtt_s * 2.0, 0.25)
+                            if now_loop - last_oldest_rtx_t >= stall_cd:
+                                repairs.extend(
+                                    enc.retransmit_oldest(
+                                        limit=repair_n,
+                                        cooldown=stall_cd,
+                                        min_age=tip_age,
+                                        frontier=128,
+                                    )
                                 )
-                            )
+                                last_oldest_rtx_t = now_loop
                             repairs.extend(
                                 enc.pop_nack_retransmit(
                                     limit=repair_n,
                                     min_age=tip_age,
                                     far_age=far_age,
                                     frontier=512,
-                                    cooldown=tip_cd,
+                                    cooldown=stall_cd,
                                 )
                             )
                         else:

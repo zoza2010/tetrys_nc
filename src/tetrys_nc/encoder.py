@@ -344,8 +344,8 @@ class TetrysEncoder:
             need = min_age if dist < tip_frontier else far
             if self._sent_age(sid, now) < need:
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if last and cooldown > 0 and (now - last) < cooldown:
+            last = self._rexmit_at.get(sid)
+            if last is not None and cooldown > 0 and (now - last) < cooldown:
                 continue
             seen.add(sid)
             n += 1
@@ -358,8 +358,8 @@ class TetrysEncoder:
             need = min_age if dist < tip_frontier else far
             if self._sent_age(sid, now) < need:
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if last and cooldown > 0 and (now - last) < cooldown:
+            last = self._rexmit_at.get(sid)
+            if last is not None and cooldown > 0 and (now - last) < cooldown:
                 continue
             n += 1
         return n
@@ -389,8 +389,8 @@ class TetrysEncoder:
             need = min_age if dist < frontier else far
             if self._sent_age(sid, now) < need:
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if last and cooldown > 0 and (now - last) < cooldown:
+            last = self._rexmit_at.get(sid)
+            if last is not None and cooldown > 0 and (now - last) < cooldown:
                 continue
             ready.append(sid)
         ready.sort()
@@ -417,8 +417,8 @@ class TetrysEncoder:
             if len(out) >= limit:
                 leftover.append(sid)
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if last and cooldown > 0 and (now - last) < cooldown:
+            last = self._rexmit_at.get(sid)
+            if last is not None and cooldown > 0 and (now - last) < cooldown:
                 leftover.append(sid)
                 continue
             wire = self.pack_source_id(sid)
@@ -436,19 +436,22 @@ class TetrysEncoder:
         limit: int = 64,
         cooldown: float = 0.0,
         min_age: float = 0.0,
+        frontier: int = 256,
     ) -> list[bytearray]:
-        """Retransmit oldest unacked SOURCE; requires min_age since first send."""
+        """Retransmit only the HOL tip (oldest `frontier` ids), not the whole window."""
         out: list[bytearray] = []
         if limit <= 0 or not self._window:
             return out
         now = time.monotonic()
-        for sid in list(self._window.keys()):
+        for i, sid in enumerate(self._window.keys()):
+            if i >= frontier:
+                break
             if len(out) >= limit:
                 break
             if min_age > 0 and self._sent_age(sid, now) < min_age:
                 continue
-            last = self._rexmit_at.get(sid, 0.0)
-            if last and cooldown > 0 and (now - last) < cooldown:
+            last = self._rexmit_at.get(sid)
+            if last is not None and cooldown > 0 and (now - last) < cooldown:
                 continue
             wire = self.pack_source_id(sid)
             if wire is not None:
