@@ -129,6 +129,30 @@ class TetrysEncoder:
             out.append(pkt.pack())
         return out
 
+    def emit_repair_coded(self, limit: int = 8, cooldown: float = 0.0) -> list[bytes]:
+        """
+        On-demand Tetrys repair: coded packets over the HOL frontier instead of
+        SOURCE retransmits. Marks tip symbols as recently repaired (cooldown).
+        """
+        if limit <= 0 or not self._window:
+            return []
+        now = time.monotonic()
+        # Avoid flooding the same tip every loop iteration.
+        oldest = next(iter(self._window))
+        last = self._rexmit_at.get(oldest, 0.0)
+        if last and cooldown > 0 and (now - last) < cooldown:
+            return []
+        out = self.emit_coded(limit)
+        if out:
+            # Cooldown tip symbols covered by the coded mix.
+            for i, sid in enumerate(self._window.keys()):
+                if i >= self.cfg.code_degree:
+                    break
+                self._rexmit_at[sid] = now
+                self._nack_pending.pop(sid, None)
+                self._drop_nack(sid)
+        return out
+
     def make_coded(self, prefer_oldest: bool = True) -> CodedPacket | None:
         """
         Build coded packet over the elastic window.
