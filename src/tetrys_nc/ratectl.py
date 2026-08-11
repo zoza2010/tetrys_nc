@@ -50,15 +50,15 @@ class DelayRateController:
     """
     FASP-style controller:
 
-    - Target = --rate (hard ceiling via RateLimiter.max_rate)
-    - Start at / stay near target (blast)
-    - Standing queue → tiny soft bias only (floor ≈ 90% of target)
+    - Optional ease-in ramp ~0 → --rate over --ramp-s (slow start, then fast)
+    - Then blast at target; standing queue → tiny soft bias (floor ≈ 90%)
     - Loss ignored for pacing (repair handles reliability)
     - Large cwnd so elastic window / flight never starve the pipe
     """
 
     MODE_BLAST = "Blast"
     MODE_SOFT = "Soft"
+    MODE_RAMP = "Ramp"
     # Aliases kept for older log/tests
     MODE_STARTUP = MODE_BLAST
     MODE_DRAIN = MODE_SOFT
@@ -76,12 +76,16 @@ class DelayRateController:
         "btlbw",
         "peak_bw",
         "payload_size",
+        "ramp_s",
         "_delivered",
         "_sample_t",
         "_sample_delivered",
         "_bw_filter",
         "_rtt_warmup",
         "_min_rtt_stamp",
+        "_t0",
+        "_ramp_done",
+        "_saved_min",
     )
 
     def __init__(
@@ -89,6 +93,7 @@ class DelayRateController:
         limiter: RateLimiter,
         alpha: float = 0.125,
         payload_size: int = 1350,
+        ramp_s: float = 0.0,
     ) -> None:
         self.limiter = limiter
         self.payload_size = max(1, payload_size)
@@ -101,14 +106,28 @@ class DelayRateController:
         self.mode = self.MODE_BLAST
         self.btlbw = 0.0
         self.peak_bw = 0.0
+        self.ramp_s = max(0.0, float(ramp_s))
         self._delivered = 0.0
         self._sample_t = time.monotonic()
         self._sample_delivered = 0.0
         self._bw_filter: deque[tuple[float, float]] = deque()
         self._rtt_warmup = 0
         self._min_rtt_stamp = time.monotonic()
-        # Immediate blast at cap
-        self.limiter.set_rate(self.limiter.max_rate)
+        self._t0 = time.monotonic()
+        self._saved_min = self.limiter.min_rate
+        self._ramp_done = self.ramp_s <= 0.0
+        if self._ramp_done:
+            self.limiter.set_rate(self.limiter.max_rate)
+        else:
+            # Allow near-zero during ramp (below FASP floor)
+            self.limiter.min_rate = 1.0
+            self.limiter.set_rate(1.0)
+            self.mode = self.MODE_RAMP
+            self.slow_start = True
+
+    def tick(self) -> None:
+        """Advance ramp / pacing from the send loop (not only on ACK)."""
+        self._update_pacing(time.monotonic())
 
     def on_loss(self, plr_byte: int) -> None:
         return
@@ -183,11 +202,27 @@ class DelayRateController:
             return 0.0
         return max(0.0, self.srtt_us - self.base_rtt_us)
 
+    def _ramp_frac(self, now: float) -> float:
+        if self._ramp_done or self.ramp_s <= 0.0:
+            return 1.0
+        elapsed = now - self._t0
+        if elapsed >= self.ramp_s:
+            self._ramp_done = True
+            self.slow_start = False
+            self.limiter.min_rate = self._saved_min
+            return 1.0
+        # Ease-in cubic: slow at start, accelerates toward the end.
+        t = max(0.0, min(1.0, elapsed / self.ramp_s))
+        return t * t * t
+
     def _update_pacing(self, now: float) -> None:
         q_us = self._queue_us()
-        cap = self.limiter.max_rate
+        frac = self._ramp_frac(now)
+        # Ceiling climbs 0 → max during ramp; Soft bias applies on top.
+        cap = self.limiter.max_rate * frac
+        if frac < 1.0 and cap < 1.0:
+            cap = 1.0
 
-        # Extreme standing queue only: soft bias, never a real drain.
         if q_us > 120_000:
             self.mode = self.MODE_SOFT
             self.limiter.set_rate(cap * 0.92)
@@ -197,8 +232,12 @@ class DelayRateController:
             self.limiter.set_rate(cap * 0.97)
             return
 
-        # Clear / mild queue — blast at target rate.
-        self.mode = self.MODE_BLAST
+        if frac < 1.0:
+            self.mode = self.MODE_RAMP
+            self.slow_start = True
+        else:
+            self.mode = self.MODE_BLAST
+            self.slow_start = False
         self.limiter.set_rate(cap)
 
     def stats(self) -> dict:
@@ -215,6 +254,7 @@ class DelayRateController:
             "cwnd": self.target_cwnd_packets(),
             "rate": self.limiter.rate,
             "max_rate": self.limiter.max_rate,
+            "ramp_s": self.ramp_s,
         }
 
 

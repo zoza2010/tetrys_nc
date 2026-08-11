@@ -52,6 +52,7 @@ def run_server(
     skip_hash: bool = False,
     wan: bool = False,
     rate_mbit: float = 0.0,
+    ramp_s: float = 3.0,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
@@ -128,18 +129,27 @@ def run_server(
         "nack": 0,
     }
 
-    # FASP-style: blast at --rate; soft delay bias only; loss → NACK repair.
+    # FASP-style: blast at --rate; optional linear ramp from ~0.
     limiter: RateLimiter | None = None
     delay_cc: DelayRateController | None = None
     if rate_mbit > 0 or wan:
         max_bps = (rate_mbit if rate_mbit > 0 else 1000.0) * 1_000_000 / 8
         limiter = RateLimiter(max_bps, start_bps=max_bps)
-        delay_cc = DelayRateController(limiter, payload_size=payload_size)
-        print(
-            f"pace BLAST start {max_bps / (1024 * 1024):.1f} "
-            f"cap {max_bps / (1024 * 1024):.1f} MiB/s "
-            f"(FASP-style; loss→NACK only)"
+        delay_cc = DelayRateController(
+            limiter, payload_size=payload_size, ramp_s=ramp_s
         )
+        if ramp_s > 0:
+            print(
+                f"pace ramp {ramp_s:.1f}s "
+                f"0→{max_bps / (1024 * 1024):.1f} MiB/s "
+                f"(ease-in; loss→NACK only)"
+            )
+        else:
+            print(
+                f"pace BLAST start {max_bps / (1024 * 1024):.1f} "
+                f"cap {max_bps / (1024 * 1024):.1f} MiB/s "
+                f"(FASP-style; loss→NACK only)"
+            )
 
     deadline = time.monotonic() + 600
     while client_addr is None:
@@ -161,6 +171,15 @@ def run_server(
             print(f"client ready from {addr}, window={enc.cfg.max_window}")
 
     assert client_addr is not None
+
+    # Start ramp when transfer begins (not while waiting for READY).
+    if delay_cc is not None and delay_cc.ramp_s > 0:
+        delay_cc._t0 = time.monotonic()
+        delay_cc._ramp_done = False
+        delay_cc.limiter.min_rate = 1.0
+        delay_cc.limiter.set_rate(1.0)
+        delay_cc.mode = DelayRateController.MODE_RAMP
+        delay_cc.slow_start = True
 
     meta = MetaPacket(file_size, file_path.name, payload_size, digest).pack()
     for _ in range(3):
@@ -255,6 +274,8 @@ def run_server(
             else:
                 bufs.append(bytearray(w))
         total = sum(len(b) for b in bufs)
+        if delay_cc is not None:
+            delay_cc.tick()
         if limiter is not None:
             limiter.consume(total)
         ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
@@ -419,7 +440,7 @@ def run_server(
                             f"progress {done}/{total_symbols} ({pct:.1f}%) "
                             f"win={st['window']}/{flight} ack={st['cumulative_ack']} "
                             f"coded={st['sent_coded']} burst={st['coded_burst']} "
-                            f"nack={st['nack_q']} plr={st['plr_byte']} "
+                            f"nack={st['nack_q']} rtx={st['rexmit']} plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
                             f"app={rate:.1f} MiB/s"
@@ -441,7 +462,7 @@ def _print_summary(enc: TetrysEncoder, file_size: int, elapsed: float) -> None:
     goodput = file_size / max(elapsed, 1e-6) / (1024 * 1024)
     print(
         f"done in {elapsed:.2f}s — goodput {goodput:.2f} MiB/s — "
-        f"source={st['sent_source']} coded={st['sent_coded']}"
+        f"source={st['sent_source']} coded={st['sent_coded']} rtx={st['rexmit']}"
     )
 
 
@@ -479,6 +500,12 @@ def main(argv: list[str] | None = None) -> int:
         dest="rate_mbit",
         help="target UDP send rate in Mbit/s (alias: --rate). WAN default 1000",
     )
+    p.add_argument(
+        "--ramp-s",
+        type=float,
+        default=3.0,
+        help="seconds to ease-in pace from 0 to --rate (slow→fast; 0=immediate blast)",
+    )
     args = p.parse_args(argv)
     return run_server(
         args.host,
@@ -492,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_hash=args.skip_hash,
         wan=args.wan,
         rate_mbit=args.rate_mbit,
+        ramp_s=args.ramp_s,
     )
 
 

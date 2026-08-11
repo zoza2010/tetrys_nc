@@ -222,7 +222,7 @@ def test_blast_starts_at_cap():
 
 def test_loss_does_not_collapse_rate():
     lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
-    cc = DelayRateController(lim, payload_size=1350)
+    cc = DelayRateController(lim, payload_size=1350, ramp_s=0.0)
     before = lim.rate
     cc.on_loss(120)
     assert lim.rate == before
@@ -232,7 +232,7 @@ def test_loss_does_not_collapse_rate():
 
 def test_soft_bias_keeps_near_cap():
     lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
-    cc = DelayRateController(lim, payload_size=1000)
+    cc = DelayRateController(lim, payload_size=1000, ramp_s=0.0)
     import time
 
     for _ in range(4):
@@ -246,3 +246,16 @@ def test_soft_bias_keeps_near_cap():
     # Soft bias only — still ≥90% of target (FASP floor)
     assert lim.rate >= 50_000_000.0 * 0.90
     assert lim.rate <= 50_000_000.0
+
+
+def test_ramp_starts_near_zero():
+    import time
+
+    lim = RateLimiter(50_000_000.0, start_bps=50_000_000.0)
+    cc = DelayRateController(lim, payload_size=1350, ramp_s=3.0)
+    assert cc.mode == DelayRateController.MODE_RAMP
+    assert lim.rate <= 1_000_000.0
+    cc._t0 = time.monotonic() - 3.0
+    cc.tick()
+    assert lim.rate >= 50_000_000.0 * 0.90
+    assert cc.mode == DelayRateController.MODE_BLAST

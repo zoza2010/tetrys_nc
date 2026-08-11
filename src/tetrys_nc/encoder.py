@@ -43,6 +43,7 @@ class TetrysEncoder:
         self._nack_pending: dict[int, float] = {}
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
+        self._total_rexmit = 0
         self.last_plr_byte = 0
         self._send_ts_us = 0
 
@@ -233,6 +234,7 @@ class TetrysEncoder:
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                self._total_rexmit += 1
         return out
 
     def retransmit_oldest(self, limit: int = 64) -> list[bytearray]:
@@ -248,6 +250,7 @@ class TetrysEncoder:
             wire = self.pack_source_id(sid)
             if wire is not None:
                 out.append(wire)
+                self._total_rexmit += 1
         return out
 
     def get_source(self, symbol_id: int) -> bytes | None:
@@ -272,5 +275,6 @@ class TetrysEncoder:
             "coded_burst": self._coded_burst,
             "cumulative_ack": self._cumulative_ack,
             "nack_q": len(self._nack_q),
+            "rexmit": self._total_rexmit,
             "plr_byte": self.last_plr_byte,
         }
