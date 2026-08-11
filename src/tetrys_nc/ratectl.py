@@ -186,10 +186,10 @@ class DelayRateController:
             floor = 1024
             ceil = 12288
         else:
-            # Headroom for 600–800M paths; occupancy stays lower via admit pacing.
-            gain = 3.0
+            # Good ~35MiB/s run lived with small *occupancy* but large flight headroom.
+            gain = 2.5
             floor = 4096
-            ceil = 32768
+            ceil = 24576
         bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
         return max(floor, min(ceil, int(bdp * gain)))
 
