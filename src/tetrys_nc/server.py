@@ -341,27 +341,8 @@ def run_server(
                             repair_n = 32
                         else:
                             repair_n = 4 if wan else 4
-                        repairs: list[bytearray | bytes] = []
-                        # WAN + coding: prefer Tetrys coded repair over SOURCE rtx.
-                        use_coded_repair = wan and enc.cfg.redundancy_every > 0
-                        if use_coded_repair and (stalled or tip_ready > 0 or win_fat):
-                            n_coded = repair_n if stalled else min(repair_n, 16)
-                            repairs.extend(
-                                enc.emit_repair_coded(
-                                    limit=max(1, n_coded // 4),
-                                    cooldown=tip_cd,
-                                )
-                            )
-                            # If still stalled after coded, one SOURCE tip poke.
-                            if stalled and not repairs:
-                                repairs.extend(
-                                    enc.retransmit_oldest(
-                                        limit=8,
-                                        cooldown=tip_cd,
-                                        min_age=tip_age,
-                                    )
-                                )
-                        elif stalled:
+                        repairs: list[bytearray] = []
+                        if stalled:
                             repairs.extend(
                                 enc.retransmit_oldest(
                                     limit=repair_n,
@@ -454,27 +435,12 @@ def run_server(
                             send_datagram(FinPacket(True, total_symbols).pack())
                         else:
                             with enc_lock:
-                                if wan and enc.cfg.redundancy_every > 0:
-                                    tail = list(
-                                        enc.emit_repair_coded(
-                                            limit=16, cooldown=tip_cd
-                                        )
-                                    )
-                                    if not tail:
-                                        tail = enc.retransmit_oldest(
-                                            limit=32,
-                                            cooldown=tip_cd,
-                                            min_age=tip_age,
-                                        )
-                                else:
-                                    tail = enc.retransmit_oldest(
-                                        limit=64,
-                                        cooldown=tip_cd,
-                                        min_age=tip_age,
-                                    )
+                                tail = enc.retransmit_oldest(
+                                    limit=64, cooldown=tip_cd, min_age=tip_age
+                                )
                                 tail.extend(
                                     enc.pop_nack_retransmit(
-                                        limit=32,
+                                        limit=64,
                                         min_age=tip_age,
                                         far_age=far_age,
                                         cooldown=tip_cd,
