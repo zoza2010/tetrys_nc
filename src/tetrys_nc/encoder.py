@@ -38,7 +38,9 @@ class TetrysEncoder:
         self._redundancy_every = self.cfg.redundancy_every
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._cumulative_ack = 0
-        # NACK queue from receiver SACK holes
+        # NACK queue: age missing ids before repair (reorder hold on sender).
+        # sid -> first time reported missing
+        self._nack_pending: dict[int, float] = {}
         self._nack_q: deque[int] = deque()
         self._nack_set: set[int] = set()
         self.last_plr_byte = 0
@@ -159,6 +161,7 @@ class TetrysEncoder:
         while self._window and next(iter(self._window)) < self._cumulative_ack:
             sid, _ = self._window.popitem(last=False)
             self._nack_set.discard(sid)
+            self._nack_pending.pop(sid, None)
             removed += 1
 
         # With FEC off: free SACKed symbols immediately so HOL holes don't pin
@@ -167,13 +170,15 @@ class TetrysEncoder:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
                     self._nack_set.discard(sid)
+                    self._nack_pending.pop(sid, None)
                     removed += 1
 
+        now = time.monotonic()
         if missing_ids:
             for sid in missing_ids:
-                if sid in self._window and sid not in self._nack_set:
-                    self._nack_set.add(sid)
-                    self._nack_q.append(sid)
+                if sid in self._window:
+                    # First sighting starts reorder timer; do not NACK yet
+                    self._nack_pending.setdefault(sid, now)
 
         # Adaptive FEC around configured base. Loss → slightly denser coded over
         # the HOL frontier — NOT a SOURCE-retransmit flood, and never disables FEC.
@@ -195,9 +200,33 @@ class TetrysEncoder:
             self._coded_burst = self.cfg.coded_burst
         return removed
 
-    def pop_nack_retransmit(self, limit: int = 8) -> list[bytearray]:
-        """Pack SOURCE packets for NACKed ids still in the window."""
+    def nack_ready_count(self, min_age: float = 0.0) -> int:
+        """How many pending NACKs are older than min_age (plus queued)."""
+        now = time.monotonic()
+        n = len(self._nack_q)
+        for sid, t0 in self._nack_pending.items():
+            if sid in self._window and (now - t0) >= min_age:
+                n += 1
+        return n
+
+    def pop_nack_retransmit(
+        self, limit: int = 8, min_age: float = 0.0
+    ) -> list[bytearray]:
+        """Pack SOURCE retransmits for NACKs that survived reorder hold."""
         out: list[bytearray] = []
+        now = time.monotonic()
+        # Promote aged pending → queue
+        for sid, t0 in list(self._nack_pending.items()):
+            if sid not in self._window:
+                self._nack_pending.pop(sid, None)
+                continue
+            if (now - t0) < min_age:
+                continue
+            self._nack_pending.pop(sid, None)
+            if sid not in self._nack_set:
+                self._nack_set.add(sid)
+                self._nack_q.append(sid)
+
         while self._nack_q and len(out) < limit:
             sid = self._nack_q.popleft()
             self._nack_set.discard(sid)

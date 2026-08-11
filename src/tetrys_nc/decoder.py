@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -14,6 +15,8 @@ class DecoderConfig:
     max_decode_window: int = 4096
     feedback_every_packets: int = 256
     delivered_cache: int = 4096
+    # Don't treat gaps as loss until this old (reorder hold). 0 = immediate.
+    reorder_hold_s: float = 0.0
 
 
 @dataclass
@@ -33,6 +36,8 @@ class TetrysDecoder:
     highest_seen: int = -1
     total_symbols: int | None = None
     payload_size: int = 32768
+    # sid -> monotonic time when gap was first observed (reorder vs loss)
+    _gap_open_at: dict[int, float] = field(default_factory=dict)
 
     def _known(self, sid: int) -> bytes | None:
         got = self._symbols.get(sid)
@@ -41,14 +46,30 @@ class TetrysDecoder:
         return self._delivered.get(sid)
 
     def _note_seen(self, sid: int) -> None:
+        now = time.monotonic()
         if sid > self.highest_seen:
+            # Ids between old high-water and new sid may be reorder gaps.
+            start = max(self.next_deliver, self.highest_seen + 1)
+            for g in range(start, sid):
+                if g not in self._symbols:
+                    self._gap_open_at.setdefault(g, now)
             self.highest_seen = sid
+
+    def _mark_gap_range(self) -> None:
+        """Ensure open HOL gaps have timestamps (for PLR / NACK aging)."""
+        if self.highest_seen < self.next_deliver:
+            return
+        now = time.monotonic()
+        for g in range(self.next_deliver, self.highest_seen + 1):
+            if g not in self._symbols:
+                self._gap_open_at.setdefault(g, now)
 
     def on_source_raw(self, sid: int, payload: bytes | memoryview | bytearray) -> list[tuple[int, bytes]]:
         """Hot path entry without allocating SourcePacket."""
         self._packets_since_feedback += 1
         self._total_source_rx += 1
         self._note_seen(sid)
+        self._gap_open_at.pop(sid, None)
         if sid < self.next_deliver or sid in self._symbols:
             return []
 
@@ -126,6 +147,7 @@ class TetrysDecoder:
                         self._symbols[sid] = bytes(
                             gf256.scale_bytes(gf256.inv(coef), payload)
                         )
+                        self._gap_open_at.pop(sid, None)
                         self._total_recovered += 1
                         progress = True
                     continue
@@ -168,6 +190,7 @@ class TetrysDecoder:
         out: list[tuple[int, bytes]] = []
         while self.next_deliver in self._symbols:
             data = self._symbols.pop(self.next_deliver)
+            self._gap_open_at.pop(self.next_deliver, None)
             # Cache only when coding/recovery is active
             if self._equations or self._total_recovered:
                 self._cache_delivered(self.next_deliver, data)
@@ -180,23 +203,30 @@ class TetrysDecoder:
         return bool(self._symbols) or bool(self._equations)
 
     def need_feedback(self) -> bool:
-        # Feedback ASAP when HOL-blocked — critical on lossy WAN
-        if self.has_holes() and self._packets_since_feedback >= 8:
-            return True
+        hold = self.cfg.reorder_hold_s
+        if self.has_holes():
+            # With reorder hold: don't scream every 8 packets — let gaps age
+            thresh = 64 if hold > 0 else 8
+            if self._packets_since_feedback >= thresh:
+                return True
         return self._packets_since_feedback >= self.cfg.feedback_every_packets
 
     def build_feedback(self, sack_bits: int = 256) -> WindowUpdatePacket:
         """
         SACK/PLR only cover symbols we have *evidence* were sent
-        (up to highest_seen). Counting not-yet-sent ids as losses
-        falsely reports ~100% PLR and collapses sender pacing.
+        (up to highest_seen).
+
+        With reorder_hold_s > 0: young gaps are reported as held so the sender
+        does not NACK yet (iperf shows ~16% OOO on this path). After the hold,
+        the bit stays clear → NACK/repair. True losses still repair after hold.
         """
         self._packets_since_feedback = 0
+        self._mark_gap_range()
+        now = time.monotonic()
+        hold = self.cfg.reorder_hold_s
         base = self.next_deliver
-        # End of observed range (inclusive). If nothing seen ahead, no holes.
         observed_end = max(self.highest_seen, base - 1)
         span = max(0, observed_end - base + 1)
-        # Extended SACK: up to 65535 bits (~8KiB) — covers a full WAN window.
         sack_bits = min(max(sack_bits, 0), 65535)
         span = min(span, sack_bits)
         if self.total_symbols is not None:
@@ -205,20 +235,26 @@ class TetrysDecoder:
         n_bytes = (span + 7) // 8 if span > 0 else 0
         sack = bytearray(n_bytes)
         missing = 0
+        aged_missing = 0
         for i in range(span):
             sid = base + i
             if sid in self._symbols:
                 sack[i // 8] |= 1 << (i % 8)
             else:
                 missing += 1
-        # Leave unused high bits in the last byte as 0; sack_span gates them.
+                t0 = self._gap_open_at.setdefault(sid, now)
+                if hold <= 0 or (now - t0) >= hold:
+                    aged_missing += 1
+                # bit stays 0 — SACK accurate; sender ages NACK before repair
 
+        # PLR from aged holes only (reorder looks like ~0% until hold expires)
+        nack_count = aged_missing if hold > 0 else missing
         denom = max(span, 1)
-        plr_pct = min(100.0, 100.0 * missing / denom) if span > 0 else 0.0
+        plr_pct = min(100.0, 100.0 * nack_count / denom) if span > 0 else 0.0
         plr_byte = int(plr_pct * 256 / 100)
         return WindowUpdatePacket(
             cumulative_ack=self.next_deliver,
-            nb_missing_src=missing,
+            nb_missing_src=nack_count,
             nb_not_used_coded=len(self._equations),
             plr_byte=plr_byte,
             sack=bytes(sack),
@@ -239,4 +275,5 @@ class TetrysDecoder:
             "source_rx": self._total_source_rx,
             "coded_rx": self._total_coded_rx,
             "recovered": self._total_recovered,
+            "gaps": len(self._gap_open_at),
         }

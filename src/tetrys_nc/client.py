@@ -39,8 +39,12 @@ def run_client(
         # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
         if max_window < 65536:
             max_window = 65536
-        if feedback_every > 16:
-            feedback_every = 4
+        # Reorder-heavy path (iperf ~16% OOO): slower SACK than lossy LAN.
+        if feedback_every > 64:
+            feedback_every = 32
+        reorder_hold_s = 0.12  # ~1.5×80ms RTT — wait before treating gap as loss
+    else:
+        reorder_hold_s = 0.0
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
@@ -53,6 +57,7 @@ def run_client(
             max_decode_window=max_window * 2,
             feedback_every_packets=feedback_every,
             delivered_cache=max_window * 2,
+            reorder_hold_s=reorder_hold_s,
         )
     )
 
@@ -115,7 +120,7 @@ def run_client(
 
     with out_path.open("wb", buffering=8 * 1024 * 1024) as out:
         while True:
-            timeout = 0.02 if (wan or dec.has_holes()) else 0.1
+            timeout = 0.1 if wan else (0.02 if dec.has_holes() else 0.1)
             r, _, _ = select.select([sock], [], [], timeout)
             now = time.monotonic()
             if not r:
@@ -172,10 +177,10 @@ def run_client(
 
                 processed += 1
 
+            fb_period = 0.1 if wan else 0.02
             if processed and (
                 dec.need_feedback()
-                or (wan and now - last_fb > 0.02)
-                or (dec.has_holes() and now - last_fb > 0.02)
+                or (now - last_fb > fb_period)
             ):
                 send_feedback()
 
@@ -227,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="lossy/long-RTT profile: large window, fast SACK/NACK feedback",
+        help="WAN: large window, reorder-tolerant SACK (hold ~120ms before NACK)",
     )
     args = p.parse_args(argv)
     return run_client(

@@ -285,27 +285,31 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # HOL holes → repair gets the pipe; new data only if room remains.
+                    # HOL / aged NACK → repair. Young gaps wait reorder hold (~RTT).
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
+                    reorder_s = max(0.1, rtt_s * 1.25) if wan else 0.0
                     plr = int(ack_progress["plr"])
                     with enc_lock:
                         win = enc.window_size
-                        nack_pending = len(enc._nack_q)
+                        nack_ready = enc.nack_ready_count(min_age=reorder_s)
                         stalled = (
                             wan
                             and win > 64
-                            and (now_loop - last_ack_advance_t > rtt_s)
+                            and (now_loop - last_ack_advance_t > rtt_s * 1.5)
                         )
-                        holey = wan and (stalled or nack_pending > 0 or plr >= 16)
+                        # Do not treat fresh reorder gaps (high raw missing) as holey
+                        holey = wan and (stalled or nack_ready > 0 or plr >= 32)
                         if holey:
-                            repair_n = 2048 if stalled else 1024
+                            repair_n = 512 if stalled else 256
                         else:
-                            repair_n = 128 if wan else 4
-                        repairs = enc.pop_nack_retransmit(limit=repair_n)
-                        if holey or win >= enc.cfg.max_window:
+                            repair_n = 64 if wan else 4
+                        repairs = enc.pop_nack_retransmit(
+                            limit=repair_n, min_age=reorder_s
+                        )
+                        if stalled or win >= enc.cfg.max_window:
                             repairs.extend(
                                 enc.retransmit_oldest(
-                                    limit=max(128, repair_n - len(repairs))
+                                    limit=max(64, repair_n - len(repairs))
                                 )
                             )
                         room = enc.cfg.max_window - enc.window_size
@@ -314,9 +318,9 @@ def run_server(
                     ack_progress["flight"] = min(enc.cfg.max_window, flight_cap)
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # While repairing holes, throttle new admits — keep pipe on frontier.
+                    # While repairing true holes, throttle new admits slightly
                     if holey and repairs:
-                        n_take = min(n_take, max(64, batch // 8))
+                        n_take = min(n_take, max(256, batch // 4))
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -368,13 +372,20 @@ def run_server(
                         else:
                             with enc_lock:
                                 tail = enc.retransmit_oldest(limit=256)
-                                tail.extend(enc.pop_nack_retransmit(limit=128))
+                                tail.extend(
+                                    enc.pop_nack_retransmit(
+                                        limit=128, min_age=reorder_s
+                                    )
+                                )
                             send_batch(tail)
                             time.sleep(0.00005)
                     elif sent == 0:
                         with enc_lock:
-                            tail = enc.retransmit_oldest(limit=256)
-                            tail.extend(enc.pop_nack_retransmit(limit=128))
+                            tail = enc.pop_nack_retransmit(
+                                limit=128, min_age=reorder_s
+                            )
+                            if stalled or not tail:
+                                tail.extend(enc.retransmit_oldest(limit=128))
                         send_batch(tail)
 
                     now = time.monotonic()

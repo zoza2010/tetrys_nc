@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from tetrys_nc import gf256
-from tetrys_nc.decoder import TetrysDecoder
+from tetrys_nc.decoder import DecoderConfig, TetrysDecoder
 from tetrys_nc.encoder import EncoderConfig, TetrysEncoder
 from tetrys_nc.packets import SOURCE_HDR_SIZE, CodedPacket, WindowUpdatePacket, parse_packet
 from tetrys_nc.ratectl import DelayRateController, RateLimiter
@@ -184,8 +184,34 @@ def test_sack_release_unpins_window():
     enc.apply_feedback(5, plr_byte=40, missing_ids=missing, held_ids=held)
     assert enc.window_size == 20 - 5 - 5  # freed cumack 0..4 and held 6..10
     assert 5 in enc._window
-    assert 5 in enc._nack_set
+    assert 5 in enc._nack_pending  # reorder hold — not repaired yet
+    assert 5 not in enc._nack_set
+    # After hold expires, NACK is ready
+    wires = enc.pop_nack_retransmit(limit=8, min_age=0.0)
+    assert len(wires) == 1
     assert 11 in enc._window
+
+
+def test_reorder_hold_delays_plr_and_nack():
+    """Young gaps must not inflate PLR; aged gaps become NACK-eligible."""
+    import time
+
+    dec = TetrysDecoder(
+        DecoderConfig(reorder_hold_s=0.2, feedback_every_packets=256)
+    )
+    dec.payload_size = 8
+    # Receive 0, then 2 (gap at 1) — classic reorder
+    for s, d in dec.on_source_raw(0, b"\x00" * 8):
+        pass
+    for s, d in dec.on_source_raw(2, b"\x02" * 8):
+        pass
+    fb = dec.build_feedback(sack_bits=64)
+    assert fb.plr_byte == 0  # gap too young
+    assert 1 in fb.missing_ids()  # still reported missing in SACK
+    time.sleep(0.22)
+    fb2 = dec.build_feedback(sack_bits=64)
+    assert fb2.plr_byte > 0  # aged → counts as loss
+    assert 1 in fb2.missing_ids()
 
 
 def test_blast_starts_at_cap():
