@@ -307,13 +307,15 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # Tip: repair ~RTT (true HOL loss). Far: wait reorder hold
-                    # (iperf ~30% OOO / ~0.5% loss). Cap repair + cooldown.
+                    # Tip: ~2.5×RTT (OOO often >1 RTT). Far: full reorder hold.
+                    # iperf ~30% OOO / ~0.3% loss — tip_age=1×RTT was false-NACK heavy.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
-                    tip_age = max(0.08, rtt_s * 1.0) if wan else 0.0
-                    far_age = (
-                        max(tip_age, float(reorder_hold_s)) if wan else 0.0
-                    )
+                    if wan:
+                        tip_age = max(0.20, min(float(reorder_hold_s) * 0.5, rtt_s * 2.5))
+                        far_age = max(tip_age, float(reorder_hold_s))
+                    else:
+                        tip_age = 0.0
+                        far_age = 0.0
                     win_full = False
                     with enc_lock:
                         win = enc.window_size
@@ -321,11 +323,9 @@ def run_server(
                         stalled = (
                             wan
                             and win > 64
-                            and (now_loop - last_ack_advance_t > rtt_s * 1.5)
+                            and (now_loop - last_ack_advance_t > rtt_s * 2.0)
                         )
-                        # Tip needs faster retries when cumack/window stuck;
-                        # far gaps keep long cooldown (OOO).
-                        tip_cd = (rtt_s * 0.5) if (stalled or win_full) else (rtt_s * 1.0)
+                        tip_cd = (rtt_s * 0.75) if (stalled or win_full) else (rtt_s * 1.25)
                         tip_ready = enc.nack_ready_count(
                             min_age=tip_age,
                             far_age=far_age,
@@ -333,9 +333,9 @@ def run_server(
                             cooldown=tip_cd,
                         )
                         if stalled or win_full:
-                            repair_n = 256
+                            repair_n = 384
                         elif tip_ready > 0:
-                            repair_n = 64
+                            repair_n = 96
                         else:
                             repair_n = 8 if wan else 4
                         repairs: list[bytearray] = []
@@ -374,9 +374,11 @@ def run_server(
                     ack_progress["flight"] = flight_cap
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # When window full / HOL: prefer clearing tip over new data
-                    if (stalled or win_full) and repairs:
-                        n_take = min(n_take, max(128, batch // 8))
+                    # HOL / tip backlog: stop admitting — repair must drain first
+                    if stalled or win_full or tip_ready > 128:
+                        n_take = 0
+                    elif tip_ready > 32:
+                        n_take = min(n_take, 64)
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
