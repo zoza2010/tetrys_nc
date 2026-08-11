@@ -178,19 +178,20 @@ class DelayRateController:
         return float(rtt)
 
     def target_cwnd_packets(self) -> int:
-        """Flight sized for current pace; smaller during ease-in ramp."""
+        """Flight ≈ 2×BDP of *current* pace; hard-capped so we don't pin 65k."""
         min_rtt = self.base_rtt_us or self.srtt_us or 80_000.0
-        # During ramp use current rate (not max) so we don't open 65k flight at once.
+        # Never size flight from peak_bw spikes — that re-opened 65k and killed goodput.
+        bw = max(self.limiter.rate, 1_000_000.0)
         if not self._ramp_done and self.ramp_s > 0:
-            bw = max(self.limiter.rate, self.btlbw * 0.5, 1_000_000.0)
             gain = 2.0
             floor = 1024
+            ceil = 8192
         else:
-            bw = max(self.limiter.max_rate, self.limiter.rate, self.btlbw, self.peak_bw)
-            gain = 6.0
-            floor = 16384
+            gain = 2.0
+            floor = 2048
+            ceil = 12288
         bdp = bw * (min_rtt / 1_000_000.0) / self.payload_size
-        return max(floor, int(bdp * gain))
+        return max(floor, min(ceil, int(bdp * gain)))
 
     def _offer_bw(self, now: float, sample_bps: float) -> None:
         if sample_bps <= 0:
