@@ -27,7 +27,7 @@ class EncoderConfig:
     # When True, redundancy_every is the starting point; density follows PLR.
     adaptive_fec: bool = False
     adaptive_red_min: int = 8   # densest ≈12% coded
-    adaptive_red_max: int = 50  # sparsest ≈2% coded
+    adaptive_red_max: int = 32  # sparsest ≈3% — never starve FEC (1/50 caused rtx storms)
 
 
 class TetrysEncoder:
@@ -45,6 +45,7 @@ class TetrysEncoder:
         self._redundancy_every = start_red
         self._coded_burst = max(1, self.cfg.coded_burst)
         self._plr_ewma = 0.0
+        self._fec_samples = 0
         self._cumulative_ack = 0
         # NACK queue: age missing ids before repair (reorder hold on sender).
         # sid -> first time reported missing
@@ -227,23 +228,41 @@ class TetrysEncoder:
     def _update_fec(self, plr_byte: int, nack_hint: int = 0) -> None:
         """Adjust periodic coding density from loss / NACK pressure."""
         plr = plr_byte * 100.0 / 256.0 if plr_byte > 0 else 0.0
-        self._plr_ewma = (0.85 * self._plr_ewma) + (0.15 * plr)
+        # Rise fast on loss, fall slowly — avoid flapping to 1/50 then rtx-storm.
+        if plr >= self._plr_ewma:
+            self._plr_ewma = (0.70 * self._plr_ewma) + (0.30 * plr)
+        else:
+            self._plr_ewma = (0.95 * self._plr_ewma) + (0.05 * plr)
+        self._fec_samples += 1
 
         if self.cfg.adaptive_fec:
-            # Target coded fraction ≈ 2% + 2×PLR, clamped to ~2–12%.
-            # Matches the good --redundancy 30 (~3%) on a ~0.5% loss path.
-            target_frac = min(0.12, max(0.02, 0.02 + 2.0 * (self._plr_ewma / 100.0)))
+            pending = len(self._nack_pending) + len(self._nack_q)
+            # First feedbacks: ramp PLR is mostly OOO noise — don't go to 1/8.
+            eff_plr = self._plr_ewma
+            if self._fec_samples < 25:
+                eff_plr = min(eff_plr, 1.5)
+
+            # Floor ~3% (every 32); densify with PLR. Proven sweet spot was ~1/30.
+            target_frac = min(0.12, max(0.03, 0.03 + 2.5 * (eff_plr / 100.0)))
             every = int(round(1.0 / target_frac))
-            if nack_hint > 128:
-                every = max(self.cfg.adaptive_red_min, every // 2)
-            elif nack_hint > 32:
-                every = max(self.cfg.adaptive_red_min, (every * 3) // 4)
+
+            # Hole pressure matters even when PLR byte is 0 (reorder hold).
+            pressure = max(nack_hint, pending)
+            if pressure > 256:
+                every = min(every, 12)
+            elif pressure > 64:
+                every = min(every, 20)
+            elif pressure > 16:
+                every = min(every, 28)
+
             every = max(
                 self.cfg.adaptive_red_min,
                 min(self.cfg.adaptive_red_max, every),
             )
             self._redundancy_every = every
-            self._coded_burst = 2 if self._plr_ewma >= 5.0 else max(1, self.cfg.coded_burst)
+            self._coded_burst = (
+                2 if (eff_plr >= 5.0 or pressure > 128) else max(1, self.cfg.coded_burst)
+            )
             return
 
         base_red = self.cfg.redundancy_every
