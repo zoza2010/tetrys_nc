@@ -320,20 +320,12 @@ def run_server(
                         last_ack_seen = cur_ack
                         last_ack_advance_t = now_loop
 
-                    # With FEC: shorter holds — coded covers false-NACK risk from OOO.
-                    # Without FEC: keep long far hold (iperf ~30–40% OOO).
+                    # Tip/far ages gate on *first-send* time (encoder), not NACK sighting.
+                    # ~40% OOO — wait most of reorder-hold before SOURCE rtx (0.45 was too eager).
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
-                    fec_on = False
-                    with enc_lock:
-                        fec_on = enc.cfg.adaptive_fec or enc.cfg.redundancy_every > 0
                     if wan:
-                        hold = float(reorder_hold_s)
-                        if fec_on:
-                            hold = min(hold, 0.45)
-                            tip_age = max(0.18, min(hold * 0.55, rtt_s * 2.0))
-                        else:
-                            tip_age = max(0.25, min(hold * 0.75, rtt_s * 3.0))
-                        far_age = max(tip_age, hold)
+                        tip_age = max(0.25, min(float(reorder_hold_s) * 0.75, rtt_s * 3.0))
+                        far_age = max(tip_age, float(reorder_hold_s))
                     else:
                         tip_age = 0.0
                         far_age = 0.0
@@ -401,16 +393,15 @@ def run_server(
                     ack_progress["flight"] = flight_cap
                     flight_room = max(0, flight_cap - win)
                     n_take = min(batch, max(room, 0), flight_room)
-                    # WAN admit pacing: with FEC we can push harder (was ~96 → ~48MiB/s ceiling).
+                    # WAN: ~64–96/loop matched the ~48 MiB/s stable run; 160 over-burst → OOO/rtx.
                     if wan and n_take:
-                        admit_cap = 160 if fec_on else 96
-                        n_take = min(n_take, admit_cap)
+                        n_take = min(n_take, 96)
                     if win == 0:
                         pass
                     elif stalled or win_full:
                         n_take = 0
                     elif tip_ready > 64 or win_fat:
-                        n_take = min(n_take, 48 if fec_on else 32)
+                        n_take = min(n_take, 32)
 
                     chunks: list[bytes] = []
                     for _ in range(n_take):
@@ -599,8 +590,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--reorder-hold-s",
         type=float,
-        default=0.45,
-        help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.45)",
+        default=0.60,
+        help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.60)",
     )
     args = p.parse_args(argv)
     return run_server(
