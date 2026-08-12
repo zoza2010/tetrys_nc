@@ -124,15 +124,27 @@ class TetrysEncoder:
         if self._sources_since_coded < self._redundancy_every:
             return []
         self._sources_since_coded = 0
-        return self.emit_coded(self._coded_burst)
+        # Proactive FEC must cover the block just put on the wire: the oldest
+        # window entries sit below cumack (already delivered, ack lag ~RTT+hold),
+        # so mixing them yields empty equations and repairs nothing.
+        return self.emit_coded(
+            self._coded_burst,
+            prefer_oldest=False,
+            degree=self._redundancy_every,
+        )
 
-    def emit_coded(self, n: int = 1) -> list[bytes]:
-        """Force N coded packets over the oldest window (HOL repair)."""
+    def emit_coded(
+        self,
+        n: int = 1,
+        prefer_oldest: bool = True,
+        degree: int | None = None,
+    ) -> list[bytes]:
+        """Force N coded packets over the window (oldest = HOL repair)."""
         out: list[bytes] = []
         if n <= 0 or not self._window:
             return out
         for _ in range(n):
-            pkt = self.make_coded(prefer_oldest=True)
+            pkt = self.make_coded(prefer_oldest=prefer_oldest, degree=degree)
             if pkt is None:
                 break
             out.append(pkt.pack())
@@ -162,16 +174,19 @@ class TetrysEncoder:
                 self._drop_nack(sid)
         return out
 
-    def make_coded(self, prefer_oldest: bool = True) -> CodedPacket | None:
+    def make_coded(
+        self, prefer_oldest: bool = True, degree: int | None = None
+    ) -> CodedPacket | None:
         """
         Build coded packet over the elastic window.
-        For WAN/HOL recovery we MUST mix the oldest unacked symbols
-        (near the delivery frontier), not the newest ones.
+        HOL repair mixes the oldest unacked symbols (delivery frontier);
+        proactive FEC mixes the newest ones (still in flight, can be lost).
         """
         if not self._window:
             return None
         items = list(self._window.items())
-        degree = min(self.cfg.code_degree, len(items))
+        want = self.cfg.code_degree if degree is None else degree
+        degree = min(max(1, want), len(items))
         if prefer_oldest:
             chosen = items[:degree]
         else:
