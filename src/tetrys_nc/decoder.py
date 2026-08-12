@@ -38,6 +38,9 @@ class TetrysDecoder:
     payload_size: int = 32768
     # sid -> monotonic time when gap was first observed (reorder vs loss)
     _gap_open_at: dict[int, float] = field(default_factory=dict)
+    # GF decode cost for progress lines (reset by take_decode_stats).
+    _dec_ns: int = 0
+    _dec_n: int = 0
 
     def _known(self, sid: int) -> bytes | None:
         got = self._symbols.get(sid)
@@ -83,8 +86,11 @@ class TetrysDecoder:
 
         self._symbols[sid] = payload_b
         if self._equations:
+            t0 = time.perf_counter_ns()
             self._reduce_equations_with(sid, payload_b)
             self._solve()
+            self._dec_ns += time.perf_counter_ns() - t0
+            self._dec_n += 1
         return self.pop_deliverable()
 
     def on_coded(self, pkt: CodedPacket) -> list[tuple[int, bytes]]:
@@ -92,6 +98,7 @@ class TetrysDecoder:
         self._total_coded_rx += 1
         self._note_seen(pkt.last_source_id)
 
+        t0 = time.perf_counter_ns()
         coefs: dict[int, int] = {}
         payload = bytearray(pkt.payload)
         for sid in range(pkt.first_source_id, pkt.last_source_id + 1):
@@ -103,18 +110,33 @@ class TetrysDecoder:
                 gf256.mul_bytes(coef, known, payload)
             elif sid < self.next_deliver:
                 # Need delivered cache for late coded packets
+                self._dec_ns += time.perf_counter_ns() - t0
+                self._dec_n += 1
                 return []
             else:
                 coefs[sid] = coef
 
         if not coefs:
+            self._dec_ns += time.perf_counter_ns() - t0
+            self._dec_n += 1
             return []
 
         self._equations.append((coefs, payload))
         if len(self._equations) > self.cfg.max_decode_window:
             self._equations = self._equations[-self.cfg.max_decode_window :]
         self._solve()
+        self._dec_ns += time.perf_counter_ns() - t0
+        self._dec_n += 1
         return self.pop_deliverable()
+
+    def take_decode_stats(self) -> tuple[float, int, float]:
+        """Decode CPU since last call: (ms total, op count, µs/op)."""
+        ns, n = self._dec_ns, self._dec_n
+        self._dec_ns = 0
+        self._dec_n = 0
+        ms = ns / 1e6
+        us = (ns / n / 1e3) if n else 0.0
+        return ms, n, us
 
     def _cache_delivered(self, sid: int, data: bytes) -> None:
         self._delivered[sid] = data

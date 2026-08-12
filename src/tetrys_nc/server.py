@@ -493,6 +493,7 @@ def run_server(
                         with enc_lock:
                             st = enc.stats()
                             done = enc.next_source_id
+                            enc_ms, enc_n, enc_us = enc.take_code_stats()
                         pct = 100.0 * done / total_symbols if total_symbols else 0
                         rate = file_offset / max(now - t0, 1e-6) / (1024 * 1024)
                         pace = (limiter.rate / (1024 * 1024)) if limiter else 0
@@ -526,7 +527,8 @@ def run_server(
                             f"plr={st['plr_byte']} "
                             f"rtt={rtt_ms:.1f}ms q={q_ms:.1f}ms echo={int(ack_progress['echo'])} "
                             f"pace={pace:.1f}/{cap:.1f}MiB/s bw={bw_m:.1f}/{peak_m:.1f}{mode} "
-                            f"app={rate:.1f} MiB/s"
+                            f"app={rate:.1f} MiB/s "
+                            f"enc={enc_ms:.1f}ms/{enc_n} {enc_us:.1f}us"
                             f"{' HOL' if stalled or win_full or win_fat else ''}"
                         )
 

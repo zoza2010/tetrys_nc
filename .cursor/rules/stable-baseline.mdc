@@ -1,0 +1,12 @@
+---
+description: Known-good WAN baseline commit for tetrys_nc
+alwaysApply: true
+---
+
+# Stable baseline
+
+- **Commit**: `ae7b8cc2ad9ea03cbb48933a6d98aa7005ac3dd0` (`speed up encoding math`)
+- User marked this as the most stable WAN baseline (Russia↔Spain, tintrack-cloud:7494).
+- Prefer incremental changes **on top of this commit**. If a change regresses below ~45–50 MiB/s goodput or causes freezes, revert toward this SHA before stacking more experiments.
+- Typical good run on this baseline: ~47–57 MiB/s app goodput, `hold=0.80s`, `fb_every=64`, adaptive FEC; speed still floats run-to-run with path conditions.
+- Do not treat later “speed fix” commits after this SHA as safer by default without a fresh matched client+server run.

@@ -60,6 +60,9 @@ class TetrysEncoder:
         self._unique_rexmit = 0
         self.last_plr_byte = 0
         self._send_ts_us = 0
+        # GF encode cost for progress lines (reset by take_code_stats).
+        self._code_ns = 0
+        self._code_n = 0
 
     def stamp(self) -> int:
         """Refresh send timestamp (monotonic µs, uint32)."""
@@ -216,10 +219,22 @@ class TetrysEncoder:
         terms = [
             (gf256.vandermonde_coef(sid + 1, cid), data) for sid, data in chosen
         ]
+        t0 = time.perf_counter_ns()
         payload = gf256.linear_combine(terms, self.cfg.payload_size)
+        self._code_ns += time.perf_counter_ns() - t0
+        self._code_n += 1
 
         self._total_sent_coded += 1
         return CodedPacket(cid, first, last, payload, send_ts_us=self.stamp())
+
+    def take_code_stats(self) -> tuple[float, int, float]:
+        """Encode CPU since last call: (ms total, packet count, µs/pkt)."""
+        ns, n = self._code_ns, self._code_n
+        self._code_ns = 0
+        self._code_n = 0
+        ms = ns / 1e6
+        us = (ns / n / 1e3) if n else 0.0
+        return ms, n, us
 
     def apply_feedback(
         self,

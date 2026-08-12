@@ -190,13 +190,16 @@ def run_client(
             if now - last_progress >= 1.0:
                 last_progress = now
                 st = dec.stats()
+                dec_ms, dec_n, dec_us = dec.take_decode_stats()
                 pct = 100.0 * bytes_written / meta.file_size if meta.file_size else 0
                 rate = bytes_written / max(now - t0, 1e-6) / (1024 * 1024)
                 print(
                     f"progress {bytes_written}/{meta.file_size} ({pct:.1f}%) "
                     f"deliver={st['next_deliver']}/{total_symbols} "
                     f"buf={st['buffered']} eq={st['equations']} "
-                    f"recovered={st['recovered']} {rate:.1f} MiB/s"
+                    f"recovered={st['recovered']} "
+                    f"dec={dec_ms:.1f}ms/{dec_n} {dec_us:.1f}us "
+                    f"{rate:.1f} MiB/s"
                 )
 
             if dec.is_complete() and bytes_written >= meta.file_size:
