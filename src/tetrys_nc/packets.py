@@ -5,6 +5,12 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
+
+try:
+    import numpy as _np
+except ImportError:  # pragma: no cover - numpy is the normal path
+    _np: Any = None  # type: ignore[no-redef]
 
 MAGIC = 0x54  # 'T'
 VERSION = 1
@@ -192,8 +198,18 @@ class WindowUpdatePacket:
 
     def missing_ids(self, limit: int = 64) -> list[int]:
         """Symbol IDs in SACK range that receiver does NOT have."""
-        out: list[int] = []
         span = self._span()
+        # Runs in the sender's feedback thread and holds the GIL: a bit loop
+        # over a 17k-bit span costs ~1.7ms and starves the send loop.
+        if _np is not None and span > 512:
+            bits = _np.unpackbits(
+                _np.frombuffer(self.sack, dtype=_np.uint8),
+                count=span,
+                bitorder="little",
+            )
+            gaps = _np.flatnonzero(bits == 0)[:limit]
+            return (gaps + self.cumulative_ack).tolist()
+        out: list[int] = []
         for i, byte in enumerate(self.sack):
             for b in range(8):
                 bit = i * 8 + b

@@ -216,10 +216,13 @@ def run_server(
                     continue
                 if isinstance(pkt, WindowUpdatePacket):
                     missing = pkt.missing_ids(limit=8192)
-                    held = pkt.held_ids(limit=200_000) if wan else []
                     with enc_lock:
                         enc.apply_feedback(
-                            pkt.cumulative_ack, pkt.plr_byte, missing, held
+                            pkt.cumulative_ack,
+                            pkt.plr_byte,
+                            missing,
+                            sack=pkt.sack if wan else None,
+                            sack_span=pkt.sack_span if wan else 0,
                         )
                         win_now = enc.window_size
                     prev_ack = ack_progress["ack"]

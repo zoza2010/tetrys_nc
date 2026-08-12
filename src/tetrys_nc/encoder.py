@@ -227,6 +227,8 @@ class TetrysEncoder:
         plr_byte: int = 0,
         missing_ids: list[int] | None = None,
         held_ids: list[int] | None = None,
+        sack: bytes | None = None,
+        sack_span: int = 0,
     ) -> int:
         if cumulative_ack > self._cumulative_ack:
             self._cumulative_ack = cumulative_ack
@@ -240,7 +242,27 @@ class TetrysEncoder:
         # window to the receiver's reorder hold (~0.55s), so throughput caps at
         # cwnd/(rtt+hold) instead of cwnd/rtt. Proactive FEC mixes the newest
         # symbols now, so delivered ones are dead weight.
-        if held_ids:
+        #
+        # Walk our own window rather than the bitmap: every feedback re-reports
+        # the whole span, but only the ids we still hold are news. That makes
+        # the cost per feedback O(newly acked) instead of O(span).
+        if sack is not None and sack_span > 0:
+            end = cumulative_ack + sack_span
+            n_bytes = len(sack)
+            doomed: list[int] = []
+            for sid in self._window:
+                if sid >= end:
+                    break
+                i = sid - cumulative_ack
+                if i < 0:
+                    continue
+                if (i >> 3) < n_bytes and (sack[i >> 3] >> (i & 7)) & 1:
+                    doomed.append(sid)
+            for sid in doomed:
+                del self._window[sid]
+                self._forget_sid(sid)
+                removed += 1
+        elif held_ids:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
                     self._forget_sid(sid)

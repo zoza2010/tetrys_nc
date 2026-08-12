@@ -62,7 +62,8 @@ def main() -> int:
                 fb.cumulative_ack,
                 fb.plr_byte,
                 fb.missing_ids(limit=8192),
-                fb.held_ids(limit=200_000),
+                sack=fb.sack,
+                sack_span=fb.sack_span,
             )
             # Holey window: coded repair over the oldest run must stay decodable.
             for pkt_bytes in enc.emit_repair_coded(limit=2):
