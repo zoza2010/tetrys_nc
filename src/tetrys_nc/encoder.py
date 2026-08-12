@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 import time
 from collections import OrderedDict, deque
+from itertools import islice
 from dataclasses import dataclass
 
 from . import gf256
@@ -184,13 +185,22 @@ class TetrysEncoder:
         """
         if not self._window:
             return None
-        items = list(self._window.items())
         want = self.cfg.code_degree if degree is None else degree
-        degree = min(max(1, want), len(items))
+        degree = min(max(1, want), len(self._window))
         if prefer_oldest:
-            chosen = items[:degree]
+            chosen = list(islice(self._window.items(), degree))
         else:
-            chosen = items[-degree:]
+            # Newest contiguous run. The decoder rebuilds coefficients over
+            # [first..last], so the mix must have no holes.
+            chosen = []
+            for sid in range(self._next_source_id - degree, self._next_source_id):
+                data = self._window.get(sid)
+                if data is None:
+                    chosen.clear()
+                    continue
+                chosen.append((sid, data))
+            if not chosen:
+                return None
         first, last = chosen[0][0], chosen[-1][0]
         cid = self._next_coded_id
         self._next_coded_id += 1
