@@ -39,10 +39,10 @@ def run_client(
         # Match server blast window: enough BDP for ~100ms×1Gbit with margin.
         if max_window < 65536:
             max_window = 65536
-        # iperf ~30% OOO / ~0.5% loss: wait for reorder before PLR/NACK pressure.
+        # ~35% OOO: hold long enough that gaps are real loss (0.80 matched ~53 MiB/s).
         if feedback_every > 64:
             feedback_every = 64
-        reorder_hold_s = 0.60
+        reorder_hold_s = 0.80
     else:
         reorder_hold_s = 0.0
 
@@ -235,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: large window, reorder hold 0.6s, feedback every 64",
+        help="WAN: large window, reorder hold 0.8s, feedback every 64",
     )
     args = p.parse_args(argv)
     return run_client(

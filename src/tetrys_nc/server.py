@@ -53,7 +53,7 @@ def run_server(
     wan: bool = False,
     rate_mbit: float = 0.0,
     ramp_s: float = 3.0,
-    reorder_hold_s: float = 0.60,
+    reorder_hold_s: float = 0.80,
 ) -> int:
     file_path = file_path.resolve()
     if not file_path.is_file():
@@ -591,8 +591,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--reorder-hold-s",
         type=float,
-        default=0.60,
-        help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.60)",
+        default=0.80,
+        help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.80)",
     )
     args = p.parse_args(argv)
     return run_server(
