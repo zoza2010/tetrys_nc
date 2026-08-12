@@ -321,11 +321,13 @@ def run_server(
                         last_ack_advance_t = now_loop
 
                     # Tip/far ages gate on *first-send* time (encoder), not NACK sighting.
-                    # iperf ~40% OOO — wait most of reorder-hold before SOURCE rtx.
+                    # iperf ~40-50% OOO: rtt*3 pinned tip at the 250ms floor even when
+                    # hold grew, so tip rtx fired on reorder. Scale tip with hold too.
                     rtt_s = max(0.05, float(ack_progress["rtt_us"]) / 1_000_000.0)
                     if wan:
-                        tip_age = max(0.25, min(float(reorder_hold_s) * 0.75, rtt_s * 3.0))
-                        far_age = max(tip_age, float(reorder_hold_s))
+                        hold_s = float(reorder_hold_s)
+                        tip_age = max(0.30, min(hold_s * 0.6, rtt_s * 5.0))
+                        far_age = max(tip_age, hold_s)
                     else:
                         tip_age = 0.0
                         far_age = 0.0
