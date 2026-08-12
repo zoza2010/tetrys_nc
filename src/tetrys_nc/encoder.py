@@ -5,7 +5,6 @@ from __future__ import annotations
 import struct
 import time
 from collections import OrderedDict, deque
-from itertools import islice
 from dataclasses import dataclass
 
 from . import gf256
@@ -188,7 +187,16 @@ class TetrysEncoder:
         want = self.cfg.code_degree if degree is None else degree
         degree = min(max(1, want), len(self._window))
         if prefer_oldest:
-            chosen = list(islice(self._window.items(), degree))
+            # SACKed ids are freed mid-window, so the oldest entries are no
+            # longer contiguous; the decoder rebuilds coefficients over
+            # [first..last], so the mix must be a hole-free run.
+            chosen = []
+            for sid, data in self._window.items():
+                if chosen and sid != chosen[-1][0] + 1:
+                    break
+                chosen.append((sid, data))
+                if len(chosen) >= degree:
+                    break
         else:
             # Newest contiguous run. The decoder rebuilds coefficients over
             # [first..last], so the mix must have no holes.
@@ -228,8 +236,11 @@ class TetrysEncoder:
             self._forget_sid(sid)
             removed += 1
 
-        # Keep symbols for coding while FEC is active (adaptive or fixed).
-        if held_ids and self._redundancy_every <= 0:
+        # Free SACKed symbols even with FEC on. Waiting for cumack ties the
+        # window to the receiver's reorder hold (~0.55s), so throughput caps at
+        # cwnd/(rtt+hold) instead of cwnd/rtt. Proactive FEC mixes the newest
+        # symbols now, so delivered ones are dead weight.
+        if held_ids:
             for sid in held_ids:
                 if self._window.pop(sid, None) is not None:
                     self._forget_sid(sid)
