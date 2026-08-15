@@ -8,6 +8,9 @@ dependencies = [
     "numpy>=1.26",
 ]
 
+[project.optional-dependencies]
+gen = ["raptorq>=2"]
+
 [project.scripts]
 tetrys-server = "tetrys_nc.server:main"
 tetrys-client = "tetrys_nc.client:main"

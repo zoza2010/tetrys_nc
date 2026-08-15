@@ -601,7 +601,38 @@ def main(argv: list[str] | None = None) -> int:
         default=0.80,
         help="far-gap NACK min-age before repair (tip uses ~RTT; default 0.80)",
     )
+    p.add_argument(
+        "--xfer",
+        choices=("tetrys", "gen"),
+        default="tetrys",
+        help="transfer mode: classic tetrys (default) or generation RaptorQ",
+    )
+    p.add_argument("--gen-k", type=int, default=48, help="symbols per generation (~K)")
+    p.add_argument(
+        "--gen-overhead",
+        type=int,
+        default=8,
+        help="RaptorQ repair overhead percent (default 8)",
+    )
     args = p.parse_args(argv)
+    if args.xfer == "gen":
+        from .gen_xfer import run_gen_server
+
+        symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
+        rate = args.rate_mbit
+        if args.wan and rate <= 0:
+            rate = 1500.0
+        return run_gen_server(
+            args.host,
+            args.port,
+            args.file,
+            symbol_size=symbol,
+            gen_k=args.gen_k,
+            overhead_pct=args.gen_overhead,
+            rate_mbit=rate if rate > 0 else 1500.0,
+            ramp_s=args.ramp_s,
+            skip_hash=args.skip_hash,
+        )
     return run_server(
         args.host,
         args.port,

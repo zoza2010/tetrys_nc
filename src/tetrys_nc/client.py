@@ -20,6 +20,7 @@ from .packets import (
     PKT_META,
     PKT_SOURCE,
     SOURCE_HDR_SIZE,
+    XFER_GEN,
     CodedPacket,
     FinPacket,
     MetaPacket,
@@ -88,12 +89,19 @@ def run_client(
             continue
         if isinstance(pkt, MetaPacket):
             meta = pkt
+            xfer = f" xfer=gen K={meta.gen_k}" if meta.xfer else ""
             print(
                 f"META: name={meta.file_name} size={meta.file_size} "
                 f"payload={meta.payload_size} sha256={meta.sha256_hex[:16] or 'n/a'}..."
+                f"{xfer}"
             )
 
     assert meta is not None
+    if meta.xfer == XFER_GEN:
+        from .gen_xfer import run_gen_client
+
+        return run_gen_client(host, port, output, meta, sock, server)
+
     dec.payload_size = meta.payload_size
     total_symbols = (meta.file_size + meta.payload_size - 1) // meta.payload_size
     dec.total_symbols = total_symbols
