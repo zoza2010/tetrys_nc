@@ -1,15 +1,12 @@
 [project]
 name = "tetrys-nc"
 version = "0.1.0"
-description = "Tetrys on-the-fly network coding transport over UDP (RFC 9407)"
+description = "Generation RaptorQ UDP file transfer"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "numpy>=1.26",
+    "raptorq>=2",
 ]
-
-[project.optional-dependencies]
-gen = ["raptorq>=2"]
 
 [project.scripts]
 tetrys-server = "tetrys_nc.server:main"

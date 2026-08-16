@@ -1,4 +1,4 @@
-"""RaptorQ helpers for generation-based transfer (optional `raptorq` package)."""
+"""RaptorQ helpers for generation-based transfer."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def require_raptorq():
         from raptorq import Decoder, Encoder  # type: ignore
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "raptorq is required for --xfer gen (pip/uv install 'raptorq>=2')"
+            "raptorq is required (pip/uv install 'raptorq>=2')"
         ) from e
     return Encoder, Decoder
 

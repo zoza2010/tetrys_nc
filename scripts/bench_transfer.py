@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Tetrys UDP transfer on localhost."""
+"""Benchmark gen RaptorQ UDP transfer on localhost."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--size", default="64M")
     p.add_argument("--port", type=int, default=9100)
-    p.add_argument("--payload-size", type=int, default=32768)
-    p.add_argument("--window", type=int, default=8192)
-    p.add_argument("--redundancy", type=int, default=0)
+    p.add_argument("--gen-k", type=int, default=48)
+    p.add_argument("--gen-overhead", type=int, default=8)
+    p.add_argument("--rate", type=float, default=2000.0)
     args = p.parse_args()
 
     testdata = ROOT / "testdata"
@@ -41,72 +41,56 @@ def main() -> int:
         cwd=ROOT,
     )
 
-    server = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tetrys_nc",
-            "server",
-            "--file",
-            str(src),
-            "--port",
-            str(args.port),
-            "--payload-size",
-            str(args.payload_size),
-            "--window",
-            str(args.window),
-            "--redundancy",
-            str(args.redundancy),
-            "--skip-hash",
-        ],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    server_cmd = [
+        sys.executable,
+        "-m",
+        "tetrys_nc",
+        "server",
+        "--file",
+        str(src),
+        "--port",
+        str(args.port),
+        "--skip-hash",
+        "--gen-k",
+        str(args.gen_k),
+        "--gen-overhead",
+        str(args.gen_overhead),
+        "--rate",
+        str(args.rate),
+        "--ramp-s",
+        "0",
+        "--payload-size",
+        "1350",
+    ]
+    client_cmd = [
+        sys.executable,
+        "-m",
+        "tetrys_nc",
+        "client",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--output",
+        str(dst),
+    ]
+
+    print(f"=== transfer {src.name} ===")
+    t0 = time.monotonic()
+    srv = subprocess.Popen(server_cmd, cwd=ROOT)
     try:
         time.sleep(0.5)
-        print(f"=== client transfer payload={args.payload_size} window={args.window} ===")
-        t0 = time.monotonic()
-        client = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tetrys_nc",
-                "client",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(args.port),
-                "--output",
-                str(dst),
-                "--window",
-                str(args.window),
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        elapsed = time.monotonic() - t0
-        print(client.stdout)
-        if client.stderr:
-            print(client.stderr, file=sys.stderr)
-        print(f"wall_time={elapsed:.2f}s exit={client.returncode}")
-
-        # Wait for server to finish
-        try:
-            out, _ = server.communicate(timeout=10)
-            print(out)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            out, _ = server.communicate()
-            print(out)
-
-        return client.returncode
+        subprocess.check_call(client_cmd, cwd=ROOT)
     finally:
-        if server.poll() is None:
-            server.kill()
+        srv.terminate()
+        try:
+            srv.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            srv.kill()
+    elapsed = time.monotonic() - t0
+    size = src.stat().st_size
+    print(f"OK in {elapsed:.2f}s ({size / elapsed / (1024 * 1024):.1f} MiB/s)")
+    return 0
 
 
 if __name__ == "__main__":

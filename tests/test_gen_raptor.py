@@ -93,5 +93,7 @@ def test_meta_gen_roundtrip():
     got = MetaPacket.unpack(m.pack())
     assert got.xfer == XFER_GEN
     assert got.gen_k == 48 and got.gen_symbol_size == 1350
+    # META always packs gen trailer
     plain = MetaPacket(100, "x", 64, "")
-    assert MetaPacket.unpack(plain.pack()).xfer == 0
+    got2 = MetaPacket.unpack(plain.pack())
+    assert got2.xfer == XFER_GEN

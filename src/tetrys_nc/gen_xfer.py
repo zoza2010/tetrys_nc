@@ -1,4 +1,4 @@
-"""Generation + RaptorQ random-access file transfer (opt-in --xfer gen)."""
+"""Generation + RaptorQ random-access file transfer."""
 
 from __future__ import annotations
 

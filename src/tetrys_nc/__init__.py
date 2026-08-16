@@ -1,3 +1,3 @@
-"""Tetrys NC — on-the-fly network coding transport over UDP (RFC 9407)."""
+"""tetrys_nc — generation RaptorQ file transfer over UDP."""
 
 __version__ = "0.1.0"
