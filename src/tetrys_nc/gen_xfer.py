@@ -37,8 +37,10 @@ _ENCODER_KEEP = 512
 _REPAIR_COOLDOWN_S = 0.05
 # Start frontier repair when client lags this many gens behind send cursor.
 _REPAIR_LAG = 32
-# When lag is huge, spend extra thin-repair rounds before each new gen.
-_HEAVY_REPAIR_LAG = 256
+# Pause opening new gens until frontier catches up (stops lag death-spiral).
+_INFLIGHT_MAX = 512
+# If next_needed unchanged this long, full-reblast that gen (thin repair failed).
+_STUCK_S = 0.15
 
 
 def _file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
@@ -219,14 +221,14 @@ def run_gen_server(
             return 0
         base_r = max(1, repair_count(gen_k, overhead_pct))
         rounds = repair_extra.get(nid, 0)
-        if full_once and rounds == 0:
+        if full_once:
             ts = int(now * 1_000_000) & 0xFFFFFFFF
             wires = [
                 GenPacket(nid, i, blob, ts).pack()
                 for i, blob in enumerate(enc.packets())
             ]
             send_batch(wires)
-            repair_extra[nid] = 1
+            repair_extra[nid] = max(rounds, 1) + 1
             last_repair_ts[nid] = now
             return len(wires)
         rounds = min(rounds + 1, 32)
@@ -247,6 +249,8 @@ def run_gen_server(
     gens_sent = 0
     repair_sent = 0
     last_progress = t0
+    stuck_nn = -1
+    stuck_nn_since = t0
 
     try:
         with file_path.open("rb") as f:
@@ -259,30 +263,62 @@ def run_gen_server(
                             break
                         nacks = list(fb_state["nacks"])
                         next_needed = int(fb_state["next_needed"])
+                        completed = int(fb_state["completed"])
 
                     now = time.monotonic()
+                    if next_needed != stuck_nn:
+                        stuck_nn = next_needed
+                        stuck_nn_since = now
+                    stuck = (now - stuck_nn_since) >= _STUCK_S
                     lag = gen_id - next_needed
 
-                    # Frontier repair: thin repair only mid-blast (no full gen
-                    # reblast — that inflated repair_pkts ~80k with little gain).
-                    # Full reblast remains allowed in drain for never-seen gens.
-                    if lag >= _REPAIR_LAG or (nacks and lag >= 8):
+                    # Clear the oldest hole first. When next_needed is stuck,
+                    # full-reblast it; otherwise thin repair. Do NOT spray repair
+                    # across a huge lag window — that caused the 48 MiB/s spiral.
+                    if lag >= _REPAIR_LAG or stuck or (nacks and lag >= 8):
                         targets: list[int] = []
                         if 0 <= next_needed < gen_id:
                             targets.append(next_needed)
                         for nid in nacks:
                             if nid < gen_id and nid not in targets:
                                 targets.append(nid)
-                            if len(targets) >= (8 if lag >= _HEAVY_REPAIR_LAG else 3):
+                            if len(targets) >= 3:
                                 break
-                        for nid in targets:
-                            repair_sent += repair_one(mm, nid, now=now, full_once=False)
-                        if lag >= _HEAVY_REPAIR_LAG:
-                            now = time.monotonic()
-                            for nid in targets[:3]:
+                        for i, nid in enumerate(targets):
+                            use_full = stuck and nid == next_needed
+                            # Bypass cooldown for a stuck frontier full reblast.
+                            if use_full:
+                                last_repair_ts.pop(nid, None)
+                            repair_sent += repair_one(
+                                mm, nid, now=now, full_once=use_full
+                            )
+                            if i == 0 and stuck:
+                                # Extra thin slices right after full blast.
+                                now = time.monotonic()
                                 repair_sent += repair_one(
                                     mm, nid, now=now, full_once=False
                                 )
+
+                    # Backpressure: stop opening gens while the frontier is far
+                    # behind (typical when --rate exceeds path ~950 Mbit).
+                    if lag >= _INFLIGHT_MAX:
+                        if now - last_progress >= 1.0:
+                            last_progress = now
+                            rate = (
+                                bytes_sent_payload
+                                / max(now - t0, 1e-6)
+                                / (1024 * 1024)
+                            )
+                            print(
+                                f"progress {gen_id}/{total_gens} "
+                                f"client_done={completed} "
+                                f"lag={lag} "
+                                f"repair_extra={repair_sent} "
+                                f"HOLD "
+                                f"app={rate:.1f} MiB/s"
+                            )
+                        time.sleep(0.002)
+                        continue
 
                     off = gen_id * block_bytes
                     end = min(off + block_bytes, file_size)
@@ -292,11 +328,13 @@ def run_gen_server(
 
                     enc = GenEncoder(raw, symbol_size, overhead_pct)
                     encoders[gen_id] = enc
-                    keep_from = max(0, max(next_needed - 8, gen_id - _ENCODER_KEEP))
-                    for old in [g for g in encoders if g < keep_from]:
+                    protected = {next_needed, *nacks[:16]}
+                    keep_from = max(0, gen_id - _ENCODER_KEEP)
+                    for old in [g for g in encoders if g < keep_from and g not in protected]:
                         encoders.pop(old, None)
-                        repair_extra.pop(old, None)
-                        last_repair_ts.pop(old, None)
+                        if old not in protected:
+                            repair_extra.pop(old, None)
+                            last_repair_ts.pop(old, None)
 
                     ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
                     wires = [
