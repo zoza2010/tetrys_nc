@@ -36,8 +36,8 @@ _ENCODER_KEEP = 512
 # Do not re-repair the same gen on every send-loop iteration.
 _REPAIR_COOLDOWN_S = 0.05
 # Start frontier repair when client lags this many gens behind send cursor.
-_REPAIR_LAG = 24
-# When lag is huge, spend extra repair rounds before each new gen (no hard stop).
+_REPAIR_LAG = 32
+# When lag is huge, spend extra thin-repair rounds before each new gen.
 _HEAVY_REPAIR_LAG = 256
 
 
@@ -263,9 +263,9 @@ def run_gen_server(
                     now = time.monotonic()
                     lag = gen_id - next_needed
 
-                    # Frontier repair so next_needed keeps moving. Independent gens
-                    # do not need a hard send-stop; starving the frontier looks like
-                    # a client hang (your 11205 stall with overhead=2%).
+                    # Frontier repair: thin repair only mid-blast (no full gen
+                    # reblast — that inflated repair_pkts ~80k with little gain).
+                    # Full reblast remains allowed in drain for never-seen gens.
                     if lag >= _REPAIR_LAG or (nacks and lag >= 8):
                         targets: list[int] = []
                         if 0 <= next_needed < gen_id:
@@ -273,19 +273,16 @@ def run_gen_server(
                         for nid in nacks:
                             if nid < gen_id and nid not in targets:
                                 targets.append(nid)
-                            if len(targets) >= (12 if lag >= _HEAVY_REPAIR_LAG else 4):
+                            if len(targets) >= (8 if lag >= _HEAVY_REPAIR_LAG else 3):
                                 break
                         for nid in targets:
-                            # Prefer a full reblast once for the frontier gen.
-                            force_full = nid == next_needed and repair_extra.get(nid, 0) == 0
-                            repair_sent += repair_one(
-                                mm, nid, now=now, full_once=force_full
-                            )
+                            repair_sent += repair_one(mm, nid, now=now, full_once=False)
                         if lag >= _HEAVY_REPAIR_LAG:
-                            # Second pass of repair slices before opening more gens.
                             now = time.monotonic()
-                            for nid in targets[:4]:
-                                repair_sent += repair_one(mm, nid, now=now)
+                            for nid in targets[:3]:
+                                repair_sent += repair_one(
+                                    mm, nid, now=now, full_once=False
+                                )
 
                     off = gen_id * block_bytes
                     end = min(off + block_bytes, file_size)
