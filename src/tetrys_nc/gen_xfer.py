@@ -34,13 +34,16 @@ from .ratectl import RateLimiter
 # Keep recent encoders for fast drain/NACK (avoid re-encode from mmap).
 _ENCODER_KEEP = 512
 # Do not re-repair the same gen on every send-loop iteration.
-_REPAIR_COOLDOWN_S = 0.05
+_REPAIR_COOLDOWN_S = 0.10
 # Start frontier repair when client lags this many gens behind send cursor.
-_REPAIR_LAG = 32
-# Pause opening new gens until frontier catches up (stops lag death-spiral).
-_INFLIGHT_MAX = 512
+_REPAIR_LAG = 48
+# Soft cap on how far blast may run ahead of next_needed.
+# 512 was too tight on a ~900 Mbit path and parked transfers in HOLD.
+_INFLIGHT_MAX = 2048
 # If next_needed unchanged this long, full-reblast that gen (thin repair failed).
-_STUCK_S = 0.15
+_STUCK_S = 0.40
+# Min gap between full reblasts of the same gen.
+_FULL_REBLAST_COOLDOWN_S = 0.25
 
 
 def _file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
@@ -136,6 +139,7 @@ def run_gen_server(
     encoders: dict[int, GenEncoder] = {}
     repair_extra: dict[int, int] = {}
     last_repair_ts: dict[int, float] = {}
+    last_full_ts: dict[int, float] = {}
     stop_fb = threading.Event()
     fb_lock = threading.Lock()
     fb_state = {
@@ -272,36 +276,23 @@ def run_gen_server(
                     stuck = (now - stuck_nn_since) >= _STUCK_S
                     lag = gen_id - next_needed
 
-                    # Clear the oldest hole first. When next_needed is stuck,
-                    # full-reblast it; otherwise thin repair. Do NOT spray repair
-                    # across a huge lag window — that caused the 48 MiB/s spiral.
-                    if lag >= _REPAIR_LAG or stuck or (nacks and lag >= 8):
-                        targets: list[int] = []
-                        if 0 <= next_needed < gen_id:
-                            targets.append(next_needed)
-                        for nid in nacks:
-                            if nid < gen_id and nid not in targets:
-                                targets.append(nid)
-                            if len(targets) >= 3:
-                                break
-                        for i, nid in enumerate(targets):
-                            use_full = stuck and nid == next_needed
-                            # Bypass cooldown for a stuck frontier full reblast.
-                            if use_full:
-                                last_repair_ts.pop(nid, None)
-                            repair_sent += repair_one(
-                                mm, nid, now=now, full_once=use_full
-                            )
-                            if i == 0 and stuck:
-                                # Extra thin slices right after full blast.
-                                now = time.monotonic()
-                                repair_sent += repair_one(
-                                    mm, nid, now=now, full_once=False
-                                )
+                    # Only intervene mid-blast when the frontier is stuck.
+                    # Continuous lag-based thin repair re-created the death spiral
+                    # under loss; proactive FEC + drain covers the rest.
+                    if (
+                        stuck
+                        and 0 <= next_needed < gen_id
+                        and (now - last_full_ts.get(next_needed, 0.0))
+                        >= _FULL_REBLAST_COOLDOWN_S
+                    ):
+                        last_repair_ts.pop(next_needed, None)
+                        n = repair_one(mm, next_needed, now=now, full_once=True)
+                        if n:
+                            repair_sent += n
+                            last_full_ts[next_needed] = now
 
-                    # Backpressure: stop opening gens while the frontier is far
-                    # behind (typical when --rate exceeds path ~950 Mbit).
-                    if lag >= _INFLIGHT_MAX:
+                    # Soft backpressure only when far ahead of a stuck hole.
+                    if lag >= _INFLIGHT_MAX and stuck:
                         if now - last_progress >= 1.0:
                             last_progress = now
                             rate = (
