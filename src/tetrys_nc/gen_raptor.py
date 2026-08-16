@@ -50,12 +50,17 @@ class GenEncoder:
     def packets(self) -> list[bytes]:
         return self._packets
 
+    @property
+    def repair_budget(self) -> int:
+        return self._repair_budget
+
     def ensure_repair(self, min_total_repair: int) -> list[bytes]:
         """Grow repair budget; return only newly added serialized packets."""
         if min_total_repair <= self._repair_budget:
             return []
         prev = len(self._packets)
         self._repair_budget = min_total_repair
+        # Prefix of get_encoded_packets(n) is stable as n grows.
         self._packets = list(self._encoder.get_encoded_packets(self._repair_budget))
         return self._packets[prev:]
 

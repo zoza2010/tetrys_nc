@@ -31,6 +31,15 @@ from .packets import (
 )
 from .ratectl import RateLimiter
 
+# Keep recent encoders for fast drain/NACK (avoid re-encode from mmap).
+_ENCODER_KEEP = 512
+# Do not re-repair the same gen on every send-loop iteration.
+_REPAIR_COOLDOWN_S = 0.05
+# Start frontier repair when client lags this many gens behind send cursor.
+_REPAIR_LAG = 24
+# When lag is huge, spend extra repair rounds before each new gen (no hard stop).
+_HEAVY_REPAIR_LAG = 256
+
 
 def _file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
     h = hashlib.sha256()
@@ -124,6 +133,7 @@ def run_gen_server(
 
     encoders: dict[int, GenEncoder] = {}
     repair_extra: dict[int, int] = {}
+    last_repair_ts: dict[int, float] = {}
     stop_fb = threading.Event()
     fb_lock = threading.Lock()
     fb_state = {
@@ -185,6 +195,53 @@ def run_gen_server(
         assert client_addr is not None
         send_datagrams(sock, client_addr, wires)
 
+    def get_or_make_encoder(mm: mmap.mmap, gen_id: int) -> GenEncoder | None:
+        if gen_id < 0 or gen_id >= total_gens:
+            return None
+        enc = encoders.get(gen_id)
+        if enc is not None:
+            return enc
+        off = gen_id * block_bytes
+        end = min(off + block_bytes, file_size)
+        raw = bytes(mm[off:end])
+        if len(raw) < block_bytes:
+            raw = raw + b"\x00" * (block_bytes - len(raw))
+        enc = GenEncoder(raw, symbol_size, overhead_pct)
+        encoders[gen_id] = enc
+        return enc
+
+    def repair_one(mm: mmap.mmap, nid: int, *, now: float, full_once: bool = False) -> int:
+        """Send a cooldown-gated repair (or one full reblast) for incomplete gen."""
+        if (now - last_repair_ts.get(nid, 0.0)) < _REPAIR_COOLDOWN_S:
+            return 0
+        enc = get_or_make_encoder(mm, nid)
+        if enc is None:
+            return 0
+        base_r = max(1, repair_count(gen_k, overhead_pct))
+        rounds = repair_extra.get(nid, 0)
+        if full_once and rounds == 0:
+            ts = int(now * 1_000_000) & 0xFFFFFFFF
+            wires = [
+                GenPacket(nid, i, blob, ts).pack()
+                for i, blob in enumerate(enc.packets())
+            ]
+            send_batch(wires)
+            repair_extra[nid] = 1
+            last_repair_ts[nid] = now
+            return len(wires)
+        rounds = min(rounds + 1, 32)
+        repair_extra[nid] = rounds
+        new_pkts = enc.ensure_repair(enc.repair_budget + base_r)
+        if not new_pkts:
+            new_pkts = enc.packets()[-base_r:]
+        else:
+            new_pkts = new_pkts[:base_r]
+        ts = int(now * 1_000_000) & 0xFFFFFFFF
+        wires = [GenPacket(nid, 0, blob, ts).pack() for blob in new_pkts]
+        send_batch(wires)
+        last_repair_ts[nid] = now
+        return len(wires)
+
     t0 = time.monotonic()
     bytes_sent_payload = 0
     gens_sent = 0
@@ -195,32 +252,40 @@ def run_gen_server(
         with file_path.open("rb") as f:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                for gen_id in range(total_gens):
+                gen_id = 0
+                while gen_id < total_gens:
                     with fb_lock:
                         if fb_state["done"]:
                             break
                         nacks = list(fb_state["nacks"])
+                        next_needed = int(fb_state["next_needed"])
 
-                    # Service NACKs for earlier gens before blasting ahead too far.
-                    for nid in nacks[:16]:
-                        if nid >= gen_id:
-                            continue
-                        enc = encoders.get(nid)
-                        if enc is None:
-                            continue
-                        extra_rounds = repair_extra.get(nid, 0) + 1
-                        repair_extra[nid] = extra_rounds
-                        base_r = repair_count(gen_k, overhead_pct)
-                        new_pkts = enc.ensure_repair(base_r + extra_rounds * base_r)
-                        if not new_pkts:
-                            continue
-                        ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                        wires = [
-                            GenPacket(nid, 0, blob, ts).pack()
-                            for blob in new_pkts[:base_r]
-                        ]
-                        send_batch(wires)
-                        repair_sent += len(wires)
+                    now = time.monotonic()
+                    lag = gen_id - next_needed
+
+                    # Frontier repair so next_needed keeps moving. Independent gens
+                    # do not need a hard send-stop; starving the frontier looks like
+                    # a client hang (your 11205 stall with overhead=2%).
+                    if lag >= _REPAIR_LAG or (nacks and lag >= 8):
+                        targets: list[int] = []
+                        if 0 <= next_needed < gen_id:
+                            targets.append(next_needed)
+                        for nid in nacks:
+                            if nid < gen_id and nid not in targets:
+                                targets.append(nid)
+                            if len(targets) >= (12 if lag >= _HEAVY_REPAIR_LAG else 4):
+                                break
+                        for nid in targets:
+                            # Prefer a full reblast once for the frontier gen.
+                            force_full = nid == next_needed and repair_extra.get(nid, 0) == 0
+                            repair_sent += repair_one(
+                                mm, nid, now=now, full_once=force_full
+                            )
+                        if lag >= _HEAVY_REPAIR_LAG:
+                            # Second pass of repair slices before opening more gens.
+                            now = time.monotonic()
+                            for nid in targets[:4]:
+                                repair_sent += repair_one(mm, nid, now=now)
 
                     off = gen_id * block_bytes
                     end = min(off + block_bytes, file_size)
@@ -230,32 +295,34 @@ def run_gen_server(
 
                     enc = GenEncoder(raw, symbol_size, overhead_pct)
                     encoders[gen_id] = enc
-                    while len(encoders) > 64:
-                        oldest = min(encoders.keys())
-                        if oldest >= gen_id - 32:
-                            break
-                        encoders.pop(oldest, None)
+                    keep_from = max(0, max(next_needed - 8, gen_id - _ENCODER_KEEP))
+                    for old in [g for g in encoders if g < keep_from]:
+                        encoders.pop(old, None)
+                        repair_extra.pop(old, None)
+                        last_repair_ts.pop(old, None)
 
                     ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
                     wires = [
                         GenPacket(gen_id, i, blob, ts).pack()
                         for i, blob in enumerate(enc.packets())
                     ]
-                    chunk = 64
-                    for i in range(0, len(wires), chunk):
-                        send_batch(wires[i : i + chunk])
+                    for i in range(0, len(wires), 64):
+                        send_batch(wires[i : i + 64])
                     gens_sent += 1
                     bytes_sent_payload += end - off
+                    gen_id += 1
 
                     now = time.monotonic()
                     if now - last_progress >= 1.0:
                         last_progress = now
                         with fb_lock:
                             done_g = fb_state["completed"]
+                            nn = int(fb_state["next_needed"])
                         rate = bytes_sent_payload / max(now - t0, 1e-6) / (1024 * 1024)
                         print(
-                            f"progress {gen_id + 1}/{total_gens} "
+                            f"progress {gen_id}/{total_gens} "
                             f"client_done={done_g} "
+                            f"lag={gen_id - nn} "
                             f"repair_extra={repair_sent} "
                             f"app={rate:.1f} MiB/s"
                         )
@@ -270,56 +337,26 @@ def run_gen_server(
                         if fb_state["done"] or fb_state["completed"] >= total_gens:
                             break
                         nacks = list(fb_state["nacks"])
+                        next_needed = int(fb_state["next_needed"])
                     if not nacks:
                         sock.sendto(fin, client_addr)
-                        time.sleep(0.05)
+                        time.sleep(0.02)
                         continue
-                    for nid in nacks[:32]:
-                        enc = encoders.get(nid)
-                        if enc is None and 0 <= nid < total_gens:
-                            off = nid * block_bytes
-                            end = min(off + block_bytes, file_size)
-                            raw = bytes(mm[off:end])
-                            if len(raw) < block_bytes:
-                                raw = raw + b"\x00" * (block_bytes - len(raw))
-                            enc = GenEncoder(raw, symbol_size, overhead_pct)
-                            encoders[nid] = enc
-                        if enc is None:
-                            continue
-                        extra_rounds = repair_extra.get(nid, 0) + 1
-                        repair_extra[nid] = extra_rounds
-                        base_r = repair_count(gen_k, overhead_pct)
-                        if extra_rounds == 1 and enc.packet_count > 0:
-                            ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                            wires = [
-                                GenPacket(nid, i, blob, ts).pack()
-                                for i, blob in enumerate(enc.packets())
-                            ]
-                            send_batch(wires)
-                            repair_sent += len(wires)
-                            continue
-                        if extra_rounds > 12:
-                            continue
-                        new_pkts = enc.ensure_repair(base_r * (1 + extra_rounds))
-                        if not new_pkts:
-                            ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                            allp = enc.packets()
-                            wires = [
-                                GenPacket(nid, 0, blob, ts).pack()
-                                for blob in allp[-base_r:]
-                            ]
-                            send_batch(wires)
-                            repair_sent += len(wires)
-                            continue
-                        ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                        wires = [
-                            GenPacket(nid, 0, blob, ts).pack()
-                            for blob in new_pkts[:base_r]
-                        ]
-                        send_batch(wires)
-                        repair_sent += len(wires)
+                    now = time.monotonic()
+                    ordered = sorted(
+                        nacks[:24],
+                        key=lambda g: (0 if g == next_needed else 1, abs(g - next_needed)),
+                    )
+                    for nid in ordered:
+                        # First contact: full packet set once; then repair forever.
+                        repair_sent += repair_one(
+                            mm,
+                            nid,
+                            now=now,
+                            full_once=repair_extra.get(nid, 0) == 0,
+                        )
                     sock.sendto(fin, client_addr)
-                    time.sleep(0.01)
+                    time.sleep(0.005)
 
             finally:
                 mm.close()
@@ -410,12 +447,13 @@ def run_gen_client(
         nonlocal last_fb
         next_needed = total_gens
         nacks: list[int] = []
+        horizon = 256 if fin_seen else 64
         for i in range(total_gens):
             if bit_get(i):
                 continue
             if next_needed == total_gens:
                 next_needed = i
-            if i <= next_needed + 64 or i in decoders:
+            if i <= next_needed + horizon or i in decoders:
                 nacks.append(i)
             if len(nacks) >= 64:
                 break
@@ -425,9 +463,10 @@ def run_gen_client(
 
     try:
         while True:
-            timeout = 0.05
+            timeout = 0.02 if fin_seen else 0.05
             r, _, _ = select.select([sock], [], [], timeout)
             now = time.monotonic()
+            fb_every = 0.05 if fin_seen else 0.1
             if not r:
                 send_fb()
                 if fin_seen and completed >= total_gens:
@@ -481,7 +520,7 @@ def run_gen_client(
             if write_queue:
                 flush_writes()
 
-            if now - last_fb > 0.1:
+            if now - last_fb > fb_every:
                 send_fb()
 
             if now - last_progress >= 1.0:
