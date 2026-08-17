@@ -24,6 +24,19 @@ def repair_count(k: int, overhead_pct: int) -> int:
     return max(1, r)
 
 
+# When overhead_pct=0, still ship a small bootstrap in the initial blast so
+# one RTT of loss does not stall the whole inflight window on WAN paths.
+_MIN_BLAST_OVERHEAD_PCT = 4
+
+
+def blast_repair_budget(k: int, overhead_pct: int) -> int:
+    if k <= 0:
+        return 0
+    if overhead_pct <= 0:
+        return repair_count(k, _MIN_BLAST_OVERHEAD_PCT)
+    return repair_count(k, overhead_pct)
+
+
 @dataclass
 class GenEncoder:
     """Encode one file generation; can emit more repair on demand."""
@@ -40,7 +53,7 @@ class GenEncoder:
         self._encoder = Encoder.with_defaults(self.data, self.symbol_size)
         # Initial systematic + repair. Packet count ≈ K + R.
         k_est = max(1, (len(self.data) + self.symbol_size - 1) // self.symbol_size)
-        self._repair_budget = repair_count(k_est, self.overhead_pct)
+        self._repair_budget = blast_repair_budget(k_est, self.overhead_pct)
         self._packets = list(self._encoder.get_encoded_packets(self._repair_budget))
 
     @property

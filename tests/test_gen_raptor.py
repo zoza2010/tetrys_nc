@@ -8,7 +8,7 @@ import pytest
 
 raptorq = pytest.importorskip("raptorq")
 
-from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, repair_count
+from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, blast_repair_budget, repair_count
 from tetrys_nc.gen_xfer import fountain_targets
 from tetrys_nc.packets import (
     XFER_GEN,
@@ -45,6 +45,21 @@ def test_repair_count():
     assert repair_count(48, 8) == 4
     assert repair_count(10, 8) >= 1
     assert repair_count(48, 0) == 0
+    assert blast_repair_budget(48, 0) == repair_count(48, 4)
+    assert blast_repair_budget(48, 8) == repair_count(48, 8)
+
+
+def test_fountain_targets_frontier_only():
+    got = fountain_targets(
+        10,
+        300,
+        nacks=[],
+        nack_rx={},
+        gen_k=192,
+        limit=8,
+        frontier_only=True,
+    )
+    assert got == [10]
 
 
 def test_gen_roundtrip():
