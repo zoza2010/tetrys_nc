@@ -79,6 +79,8 @@ _REPAIR_AT_CAP = 4
 _REPAIR_ROUND_MAX = 32
 # While blast is blocked on inflight cap, spray new ESI into the frontier
 # (send loop only). Rate is limited by the token bucket, not a hard pkts/s cap.
+# Pipelined blast: send K systematic symbols, advance, fountain the tail.
+_PIPELINE_SYSTEMATIC = True
 _FOUNTAIN_CAP_GENS = 3
 _FOUNTAIN_CAP_COOLDOWN_S = 0.008
 _FOUNTAIN_CAP_PER_GEN = 16
@@ -198,7 +200,7 @@ def _encode_gen_worker(
     raw = bytes(_worker_mm[off:end])
     if len(raw) < block_bytes:
         raw = raw + b"\x00" * (block_bytes - len(raw))
-    enc = GenEncoder(raw, symbol_size, overhead_pct)
+    enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=True)
     ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
     wires = [
         GenPacket(gid, i, blob, ts).pack()
@@ -231,12 +233,9 @@ def _repair_gen_worker(
     raw = bytes(_worker_mm[off:end])
     if len(raw) < block_bytes:
         raw = raw + b"\x00" * (block_bytes - len(raw))
-    enc = GenEncoder(raw, symbol_size, overhead_pct)
-    initial_budget = blast_repair_budget(
-        max(1, (len(raw) + symbol_size - 1) // symbol_size), overhead_pct
-    )
+    enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=True)
     want = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
-    target_budget = initial_budget + prior_extra + want
+    target_budget = prior_extra + want
     new_pkts = enc.ensure_repair(target_budget)
     if not new_pkts:
         return time.monotonic() - t_enc, 0, []
@@ -302,7 +301,8 @@ def run_gen_server(
         f"block={block_bytes} overhead={overhead_pct}% "
         f"{'(4% blast bootstrap) ' if overhead_pct <= 0 else ''}"
         f"cc={'delay' if delay_cc else 'off'} "
-        f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit}"
+        f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
+        f"{'pipeline=K+fountain ' if _PIPELINE_SYSTEMATIC else ''}"
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
     print("waiting for client READY...")
@@ -444,7 +444,7 @@ def run_gen_server(
         raw = bytes(mm[off:end])
         if len(raw) < block_bytes:
             raw = raw + b"\x00" * (block_bytes - len(raw))
-        enc = GenEncoder(raw, symbol_size, overhead_pct)
+        enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=_PIPELINE_SYSTEMATIC)
         with enc_lock:
             existing = encoders.get(gen_id)
             if existing is not None:
@@ -525,8 +525,10 @@ def run_gen_server(
         if enc is None:
             return []
         t_enc = time.monotonic()
-        initial_budget = blast_repair_budget(gen_k, overhead_pct)
-        target_budget = initial_budget + prior_extra + send_n
+        if _PIPELINE_SYSTEMATIC:
+            target_budget = prior_extra + send_n
+        else:
+            target_budget = blast_repair_budget(gen_k, overhead_pct) + prior_extra + send_n
         new_pkts = enc.ensure_repair(target_budget)
         if not new_pkts:
             return []
@@ -591,6 +593,66 @@ def run_gen_server(
             repair_q: queue.Queue[list[bytes]] = queue.Queue(maxsize=64)
             stop_repair = threading.Event()
             cursor = {"gen_id": 0}
+            fountain_gens: set[int] = set()
+            fountain_lock = threading.Lock()
+
+            def prune_fountain(
+                next_needed: int,
+                nack_rx: dict[int, int],
+                nacks: list[int],
+            ) -> None:
+                enough = gen_k + _DECODE_MARGIN
+                with fountain_lock:
+                    for gid in list(fountain_gens):
+                        if gid < next_needed:
+                            fountain_gens.discard(gid)
+                            continue
+                        rx = nack_rx.get(gid)
+                        if rx is not None and rx >= enough and gid not in nacks:
+                            fountain_gens.discard(gid)
+
+            def fountain_send_tick(
+                mm: mmap.mmap,
+                *,
+                now: float,
+                next_needed: int,
+                nacks: list[int],
+                nack_rx: dict[int, int],
+                sent_before: int,
+            ) -> list[bytes]:
+                if sent_before <= 0:
+                    return []
+                prune_fountain(next_needed, nack_rx, nacks)
+                with fountain_lock:
+                    if not fountain_gens:
+                        return []
+                targets = fountain_targets(
+                    next_needed,
+                    sent_before,
+                    nacks,
+                    nack_rx,
+                    gen_k=gen_k,
+                    limit=_FOUNTAIN_CAP_GENS,
+                    frontier_only=True,
+                )
+                wires: list[bytes] = []
+                for i, nid in enumerate(targets):
+                    send_n = (
+                        _REPAIR_ROUND_MAX if i == 0 else _FOUNTAIN_CAP_PER_GEN
+                    )
+                    wires.extend(
+                        repair_one(
+                            mm,
+                            nid,
+                            now=now,
+                            symbols_rx=nack_rx.get(nid),
+                            cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
+                            send_n=send_n,
+                        )
+                    )
+                if targets:
+                    prune_encoders(set(targets))
+                return wires
 
             def fill_encode_queue(start: int) -> None:
                 stop = min(total_gens, start + _ENCODE_PREFETCH)
@@ -702,42 +764,22 @@ def run_gen_server(
                     elif incomplete <= inflight_gen_limit // 2:
                         limiter.set_burst_s(0.016)
                     repair_sent += drain_repairs()
+                    with fb_lock:
+                        nacks = list(fb_state["nacks"])
+                        nack_rx = dict(fb_state["nack_rx"])
+                    extra = fountain_send_tick(
+                        mm,
+                        now=now,
+                        next_needed=next_needed,
+                        nacks=nacks,
+                        nack_rx=nack_rx,
+                        sent_before=gen_id,
+                    )
+                    if extra:
+                        send_batch(extra, repair=True)
+                        repair_sent += len(extra)
                     if incomplete >= inflight_gen_limit:
-                        # Blast is blocked; spray new ESI into the oldest
-                        # incomplete gens on this thread so unused rate is
-                        # not slept away waiting on the repair queue.
-                        with fb_lock:
-                            nacks = list(fb_state["nacks"])
-                            nack_rx = dict(fb_state["nack_rx"])
-                        extra: list[bytes] = []
-                        targets = fountain_targets(
-                            next_needed,
-                            gen_id,
-                            nacks,
-                            nack_rx,
-                            gen_k=gen_k,
-                            limit=_FOUNTAIN_CAP_GENS,
-                            frontier_only=True,
-                        )
-                        for i, nid in enumerate(targets):
-                            send_n = (
-                                _REPAIR_ROUND_MAX
-                                if i == 0
-                                else _FOUNTAIN_CAP_PER_GEN
-                            )
-                            batch = repair_one(
-                                mm,
-                                nid,
-                                now=now,
-                                symbols_rx=nack_rx.get(nid),
-                                cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
-                                send_n=send_n,
-                            )
-                            extra.extend(batch)
-                        if extra:
-                            send_batch(extra, repair=True)
-                            repair_sent += len(extra)
-                        elif repair_q.empty():
+                        if not extra and repair_q.empty():
                             time.sleep(0.001)
                             cap_s += 0.001
                         continue
@@ -759,6 +801,8 @@ def run_gen_server(
                     prune_encoders({next_needed})
 
                     send_batch(wires)
+                    with fountain_lock:
+                        fountain_gens.add(gen_id)
                     gens_sent += 1
                     bytes_sent_payload += source_bytes
                     gen_id += 1
@@ -793,6 +837,7 @@ def run_gen_server(
                             f"lag={gen_id - nn} "
                             f"incomplete={max(0, gen_id - int(done_g))}/"
                             f"{inflight_gen_limit} "
+                            f"fountain={len(fountain_gens)} "
                             f"repair_extra={repair_sent} "
                             f"rate={cc_mbit:.0f}/{cap_mbit:.0f}Mbit "
                             f"cc={cc.mode} "

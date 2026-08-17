@@ -44,6 +44,7 @@ class GenEncoder:
     data: bytes
     symbol_size: int
     overhead_pct: int
+    systematic_only: bool = False
     _encoder: object = field(init=False, repr=False)
     _packets: list[bytes] = field(default_factory=list, repr=False)
     _repair_budget: int = 0
@@ -51,9 +52,11 @@ class GenEncoder:
     def __post_init__(self) -> None:
         Encoder, _ = require_raptorq()
         self._encoder = Encoder.with_defaults(self.data, self.symbol_size)
-        # Initial systematic + repair. Packet count ≈ K + R.
         k_est = max(1, (len(self.data) + self.symbol_size - 1) // self.symbol_size)
-        self._repair_budget = blast_repair_budget(k_est, self.overhead_pct)
+        if self.systematic_only:
+            self._repair_budget = 0
+        else:
+            self._repair_budget = blast_repair_budget(k_est, self.overhead_pct)
         self._packets = list(self._encoder.get_encoded_packets(self._repair_budget))
 
     @property

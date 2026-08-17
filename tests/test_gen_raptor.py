@@ -62,6 +62,16 @@ def test_fountain_targets_frontier_only():
     assert got == [10]
 
 
+def test_systematic_only_smaller_than_full_blast():
+    T = 1350
+    K = 48
+    data = bytes([(i * 3) & 0xFF for i in range(K * T)])
+    full = GenEncoder(data, T, overhead_pct=8, systematic_only=False)
+    sys_only = GenEncoder(data, T, overhead_pct=8, systematic_only=True)
+    assert len(sys_only.packets()) >= K
+    assert len(sys_only.packets()) < len(full.packets())
+
+
 def test_gen_roundtrip():
     T = 1350
     K = 48
