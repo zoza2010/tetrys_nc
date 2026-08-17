@@ -20,14 +20,16 @@ class RateLimiter:
         if start_bps is None:
             start_bps = self.max_rate
         self.rate = min(self.max_rate, max(start_bps, self.min_rate))
-        # Large burst so we can fill shallow buffers / absorb ACK jitter.
-        self.burst = burst if burst is not None else max(self.rate * 0.25, 2_000_000.0)
+        # A few milliseconds, not 250ms: large token bursts were harmless when
+        # Python sendto was the bottleneck, but UDP GSO can dump them instantly
+        # and overflow the path/receiver queues.
+        self.burst = burst if burst is not None else max(self.rate * 0.002, 64_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.25, 2_000_000.0)
+        self.burst = max(self.rate * 0.002, 64_000.0)
 
     def consume(self, nbytes: int) -> None:
         now = time.monotonic()

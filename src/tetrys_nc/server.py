@@ -39,7 +39,12 @@ def main(argv: list[str] | None = None) -> int:
         default=2.0,
         help="seconds to ease-in pace from 0 to --rate (0=immediate blast)",
     )
-    p.add_argument("--gen-k", type=int, default=48, help="symbols per generation (~K)")
+    p.add_argument(
+        "--gen-k",
+        type=int,
+        default=192,
+        help="symbols per generation (~K; default 192)",
+    )
     p.add_argument(
         "--gen-overhead",
         type=int,

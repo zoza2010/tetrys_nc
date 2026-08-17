@@ -18,6 +18,7 @@ PKT_GEN_FB = 0x21  # generation feedback / NACK
 # GEN: hdr4 + gen_id4 + esi4 + send_ts4 = 16
 GEN_HDR_SIZE = 16
 FLAG_META_XFER = 0x08  # META always carries gen params trailer
+FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
 XFER_GEN = 1
 
 _HDR = struct.Struct("!BBBB")
@@ -68,19 +69,28 @@ class GenFeedbackPacket:
     nack_gens: list[int]
     echo_ts_us: int = 0
     completed_gens: int = 0
+    # Aligned with nack_gens. 0 means no symbols received / no decoder yet.
+    nack_rx_counts: list[int] | None = None
 
     def pack(self) -> bytes:
         nacks = self.nack_gens[:64]
+        counts = (self.nack_rx_counts or [])[: len(nacks)]
+        with_counts = len(counts) == len(nacks)
         body = struct.pack(
             "!IIH",
             self.next_needed_gen & 0xFFFFFFFF,
             self.completed_gens & 0xFFFFFFFF,
             len(nacks),
         )
-        for g in nacks:
-            body += struct.pack("!I", g & 0xFFFFFFFF)
+        if with_counts:
+            for g, rx in zip(nacks, counts):
+                body += struct.pack("!IH", g & 0xFFFFFFFF, min(0xFFFF, max(0, rx)))
+        else:
+            for g in nacks:
+                body += struct.pack("!I", g & 0xFFFFFFFF)
         body += struct.pack("!I", self.echo_ts_us & 0xFFFFFFFF)
-        return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, 0) + body
+        flags = FLAG_FB_RX_COUNTS if with_counts else 0
+        return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, flags) + body
 
     @classmethod
     def unpack(cls, data: bytes) -> GenFeedbackPacket:
@@ -89,11 +99,21 @@ class GenFeedbackPacket:
         next_needed, completed, n = struct.unpack_from("!IIH", data, 4)
         off = 4 + 10
         nacks: list[int] = []
+        counts: list[int] = []
+        with_counts = bool(data[3] & FLAG_FB_RX_COUNTS)
+        item_size = 6 if with_counts else 4
+        if len(data) < off + n * item_size:
+            raise ValueError("gen feedback NACK list truncated")
         for _ in range(n):
-            nacks.append(struct.unpack_from("!I", data, off)[0])
-            off += 4
+            if with_counts:
+                gen_id, rx = struct.unpack_from("!IH", data, off)
+                nacks.append(gen_id)
+                counts.append(rx)
+            else:
+                nacks.append(struct.unpack_from("!I", data, off)[0])
+            off += item_size
         echo = struct.unpack_from("!I", data, off)[0] if len(data) >= off + 4 else 0
-        return cls(next_needed, nacks, echo, completed)
+        return cls(next_needed, nacks, echo, completed, counts if with_counts else None)
 
 
 @dataclass(slots=True)

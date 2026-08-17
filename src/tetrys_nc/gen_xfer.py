@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import mmap
 import os
 import select
@@ -10,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from .gen_raptor import GenDecoder, GenEncoder, repair_count, require_raptorq
@@ -31,19 +33,33 @@ from .packets import (
 )
 from .ratectl import RateLimiter
 
-# Keep recent encoders for fast drain/NACK (avoid re-encode from mmap).
-_ENCODER_KEEP = 512
+# Raptor encoders are heavy (hundreds of KiB to MiB each). Keep a bounded
+# working set; old generations can be reconstructed from mmap for repair.
+_ENCODER_KEEP = 128
 # Do not re-repair the same gen on every send-loop iteration.
 _REPAIR_COOLDOWN_S = 0.10
 # Start frontier repair when client lags this many gens behind send cursor.
 _REPAIR_LAG = 48
-# Soft cap on how far blast may run ahead of next_needed.
-# 512 was too tight on a ~900 Mbit path and parked transfers in HOLD.
-_INFLIGHT_MAX = 2048
-# If next_needed unchanged this long, full-reblast that gen (thin repair failed).
+# If next_needed is unchanged this long, send deficit-sized fountain repair.
 _STUCK_S = 0.40
-# Min gap between full reblasts of the same gen.
-_FULL_REBLAST_COOLDOWN_S = 0.25
+# Min gap between deficit repair rounds of the same generation.
+_STUCK_REPAIR_COOLDOWN_S = 0.25
+# RaptorQ normally decodes near K; add a small rank margin and enough surplus
+# for loss of the repair packets themselves.
+_DECODE_MARGIN = 2
+_REPAIR_SURPLUS = 0.25
+# Bound incomplete source data rather than generation count so larger K does
+# not recreate an unbounded repair tail. This is well above the path BDP.
+_MAX_INFLIGHT_BYTES = 64 * 1024 * 1024
+_MIN_INFLIGHT_GENS = 64
+# Overlap Raptor encode with UDP send. Safe now that inflight is bounded.
+_ENCODE_WORKERS = 2
+_ENCODE_PREFETCH = 8
+# How many incomplete gens to fountain-repair per send-loop turn.
+_REPAIR_PER_TURN = 2
+_REPAIR_AT_CAP = 16
+# One feedback round must stay a thin fountain top-up, never a full reblast.
+_REPAIR_ROUND_MAX = 32
 
 
 def _file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
@@ -63,7 +79,7 @@ def run_gen_server(
     file_path: Path,
     *,
     symbol_size: int = 1350,
-    gen_k: int = 48,
+    gen_k: int = 192,
     overhead_pct: int = 8,
     rate_mbit: float = 1500.0,
     ramp_s: float = 4.0,
@@ -77,6 +93,10 @@ def run_gen_server(
     file_size = file_path.stat().st_size
     block_bytes = max(1, gen_k) * max(64, symbol_size)
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0
+    inflight_gen_limit = max(
+        _MIN_INFLIGHT_GENS,
+        _MAX_INFLIGHT_BYTES // block_bytes,
+    )
     digest = "" if skip_hash else _file_sha256(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -92,7 +112,7 @@ def run_gen_server(
     print(
         f"xfer=gen gens={total_gens} T={symbol_size} K~={gen_k} "
         f"block={block_bytes} overhead={overhead_pct}% "
-        f"rate_mbit={rate_mbit}"
+        f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit}"
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
     print("waiting for client READY...")
@@ -146,6 +166,7 @@ def run_gen_server(
         "next_needed": 0,
         "completed": 0,
         "nacks": [],
+        "nack_rx": {},
         "echo": 0,
         "done": False,
     }
@@ -171,6 +192,8 @@ def run_gen_server(
                         fb_state["next_needed"] = pkt.next_needed_gen
                         fb_state["completed"] = pkt.completed_gens
                         fb_state["nacks"] = list(pkt.nack_gens)
+                        counts = pkt.nack_rx_counts or []
+                        fb_state["nack_rx"] = dict(zip(pkt.nack_gens, counts))
                         fb_state["echo"] = pkt.echo_ts_us
                         if pkt.completed_gens >= total_gens and total_gens > 0:
                             fb_state["done"] = True
@@ -216,37 +239,91 @@ def run_gen_server(
         encoders[gen_id] = enc
         return enc
 
-    def repair_one(mm: mmap.mmap, nid: int, *, now: float, full_once: bool = False) -> int:
-        """Send a cooldown-gated repair (or one full reblast) for incomplete gen."""
+    def encode_generation(mm: mmap.mmap, gid: int) -> tuple[GenEncoder, int]:
+        off = gid * block_bytes
+        end = min(off + block_bytes, file_size)
+        raw = bytes(mm[off:end])
+        if len(raw) < block_bytes:
+            raw = raw + b"\x00" * (block_bytes - len(raw))
+        return GenEncoder(raw, symbol_size, overhead_pct), end - off
+
+    def prune_encoders(protected: set[int]) -> None:
+        """Bound native Raptor encoder memory while retaining active repairs."""
+        target = _ENCODER_KEEP + len(protected)
+        if len(encoders) <= target:
+            return
+        for old in list(encoders):
+            if len(encoders) <= target:
+                break
+            if old in protected:
+                continue
+            encoders.pop(old, None)
+
+    def repair_one(
+        mm: mmap.mmap,
+        nid: int,
+        *,
+        now: float,
+        symbols_rx: int | None = None,
+    ) -> int:
+        """Send new fountain symbols sized to the client's decode deficit."""
         if (now - last_repair_ts.get(nid, 0.0)) < _REPAIR_COOLDOWN_S:
             return 0
         enc = get_or_make_encoder(mm, nid)
         if enc is None:
             return 0
         base_r = max(1, repair_count(gen_k, overhead_pct))
-        rounds = repair_extra.get(nid, 0)
-        if full_once:
-            ts = int(now * 1_000_000) & 0xFFFFFFFF
-            wires = [
-                GenPacket(nid, i, blob, ts).pack()
-                for i, blob in enumerate(enc.packets())
-            ]
-            send_batch(wires)
-            repair_extra[nid] = max(rounds, 1) + 1
-            last_repair_ts[nid] = now
-            return len(wires)
-        rounds = min(rounds + 1, 32)
-        repair_extra[nid] = rounds
-        new_pkts = enc.ensure_repair(enc.repair_budget + base_r)
-        if not new_pkts:
-            new_pkts = enc.packets()[-base_r:]
+        # Number of extra fountain symbols already generated for this gen.
+        # This survives encoder eviction, preventing duplicate ESI prefixes
+        # when the native encoder is reconstructed from mmap.
+        prior_extra = repair_extra.get(nid, 0)
+
+        if symbols_rx is None or symbols_rx <= 0:
+            send_n = base_r
         else:
-            new_pkts = new_pkts[:base_r]
+            deficit = max(1, gen_k + _DECODE_MARGIN - symbols_rx)
+            send_n = math.ceil(deficit * (1.0 + _REPAIR_SURPLUS))
+        send_n = max(1, min(send_n, _REPAIR_ROUND_MAX))
+
+        initial_budget = repair_count(gen_k, overhead_pct)
+        target_budget = initial_budget + prior_extra + send_n
+        new_pkts = enc.ensure_repair(target_budget)
+        if not new_pkts:
+            return 0
+        # Reconstructed encoders return the entire missing prefix including
+        # previously sent extras; take only the newest tail.
+        new_pkts = new_pkts[-send_n:]
+        repair_extra[nid] = prior_extra + len(new_pkts)
+        first_esi = enc.packet_count - len(new_pkts)
         ts = int(now * 1_000_000) & 0xFFFFFFFF
-        wires = [GenPacket(nid, 0, blob, ts).pack() for blob in new_pkts]
+        wires = [
+            GenPacket(nid, first_esi + i, blob, ts).pack()
+            for i, blob in enumerate(new_pkts)
+        ]
         send_batch(wires)
         last_repair_ts[nid] = now
         return len(wires)
+
+    def repair_nacks(
+        mm: mmap.mmap,
+        nacks: list[int],
+        nack_rx: dict[int, int],
+        next_needed: int,
+        *,
+        now: float,
+        limit: int,
+        sent_before: int,
+    ) -> int:
+        ordered = sorted(
+            (g for g in nacks if 0 <= g < sent_before),
+            key=lambda g: (0 if g == next_needed else 1, abs(g - next_needed)),
+        )[:limit]
+        n = 0
+        for nid in ordered:
+            n += repair_one(mm, nid, now=now, symbols_rx=nack_rx.get(nid))
+        if ordered:
+            prune_encoders(set(ordered))
+        return n
 
     t0 = time.monotonic()
     bytes_sent_payload = 0
@@ -259,13 +336,30 @@ def run_gen_server(
     try:
         with file_path.open("rb") as f:
             mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            encode_pool = ThreadPoolExecutor(
+                max_workers=_ENCODE_WORKERS,
+                thread_name_prefix="gen-encode",
+            )
+            encode_futures: dict[int, Future[tuple[GenEncoder, int]]] = {}
+
+            def fill_encode_queue(start: int) -> None:
+                stop = min(total_gens, start + _ENCODE_PREFETCH)
+                for gid in range(start, stop):
+                    if gid in encode_futures or gid in encoders:
+                        continue
+                    encode_futures[gid] = encode_pool.submit(
+                        encode_generation, mm, gid
+                    )
+
             try:
                 gen_id = 0
+                fill_encode_queue(0)
                 while gen_id < total_gens:
                     with fb_lock:
                         if fb_state["done"]:
                             break
                         nacks = list(fb_state["nacks"])
+                        nack_rx = dict(fb_state["nack_rx"])
                         next_needed = int(fb_state["next_needed"])
                         completed = int(fb_state["completed"])
 
@@ -275,57 +369,51 @@ def run_gen_server(
                         stuck_nn_since = now
                     stuck = (now - stuck_nn_since) >= _STUCK_S
                     lag = gen_id - next_needed
+                    incomplete = max(0, gen_id - completed)
 
-                    # Only intervene mid-blast when the frontier is stuck.
-                    # Continuous lag-based thin repair re-created the death spiral
-                    # under loss; proactive FEC + drain covers the rest.
+                    # Stuck frontier: extra fountain round even if cooldown
+                    # still covers the regular sprinkle below.
                     if (
                         stuck
+                        and lag >= _REPAIR_LAG
                         and 0 <= next_needed < gen_id
                         and (now - last_full_ts.get(next_needed, 0.0))
-                        >= _FULL_REBLAST_COOLDOWN_S
+                        >= _STUCK_REPAIR_COOLDOWN_S
                     ):
                         last_repair_ts.pop(next_needed, None)
-                        n = repair_one(mm, next_needed, now=now, full_once=True)
+                        n = repair_one(
+                            mm,
+                            next_needed,
+                            now=now,
+                            symbols_rx=nack_rx.get(next_needed),
+                        )
                         if n:
                             repair_sent += n
                             last_full_ts[next_needed] = now
 
-                    # Soft backpressure only when far ahead of a stuck hole.
-                    if lag >= _INFLIGHT_MAX and stuck:
-                        if now - last_progress >= 1.0:
-                            last_progress = now
-                            rate = (
-                                bytes_sent_payload
-                                / max(now - t0, 1e-6)
-                                / (1024 * 1024)
-                            )
-                            print(
-                                f"progress {gen_id}/{total_gens} "
-                                f"client_done={completed} "
-                                f"lag={lag} "
-                                f"repair_extra={repair_sent} "
-                                f"HOLD "
-                                f"app={rate:.1f} MiB/s"
-                            )
-                        time.sleep(0.002)
+                    at_cap = incomplete >= inflight_gen_limit
+                    repair_sent += repair_nacks(
+                        mm,
+                        nacks,
+                        nack_rx,
+                        next_needed,
+                        now=now,
+                        limit=_REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN,
+                        sent_before=gen_id,
+                    )
+                    if at_cap:
+                        time.sleep(0.001)
                         continue
 
-                    off = gen_id * block_bytes
-                    end = min(off + block_bytes, file_size)
-                    raw = bytes(mm[off:end])
-                    if len(raw) < block_bytes:
-                        raw = raw + b"\x00" * (block_bytes - len(raw))
-
-                    enc = GenEncoder(raw, symbol_size, overhead_pct)
+                    fut = encode_futures.pop(gen_id, None)
+                    if fut is not None:
+                        enc, source_bytes = fut.result()
+                    else:
+                        enc, source_bytes = encode_generation(mm, gen_id)
                     encoders[gen_id] = enc
+                    fill_encode_queue(gen_id + 1)
                     protected = {next_needed, *nacks[:16]}
-                    keep_from = max(0, gen_id - _ENCODER_KEEP)
-                    for old in [g for g in encoders if g < keep_from and g not in protected]:
-                        encoders.pop(old, None)
-                        if old not in protected:
-                            repair_extra.pop(old, None)
-                            last_repair_ts.pop(old, None)
+                    prune_encoders(protected)
 
                     ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
                     wires = [
@@ -335,7 +423,7 @@ def run_gen_server(
                     for i in range(0, len(wires), 64):
                         send_batch(wires[i : i + 64])
                     gens_sent += 1
-                    bytes_sent_payload += end - off
+                    bytes_sent_payload += source_bytes
                     gen_id += 1
 
                     now = time.monotonic()
@@ -349,6 +437,8 @@ def run_gen_server(
                             f"progress {gen_id}/{total_gens} "
                             f"client_done={done_g} "
                             f"lag={gen_id - nn} "
+                            f"incomplete={max(0, gen_id - int(done_g))}/"
+                            f"{inflight_gen_limit} "
                             f"repair_extra={repair_sent} "
                             f"app={rate:.1f} MiB/s"
                         )
@@ -363,28 +453,27 @@ def run_gen_server(
                         if fb_state["done"] or fb_state["completed"] >= total_gens:
                             break
                         nacks = list(fb_state["nacks"])
+                        nack_rx = dict(fb_state["nack_rx"])
                         next_needed = int(fb_state["next_needed"])
                     if not nacks:
                         sock.sendto(fin, client_addr)
                         time.sleep(0.02)
                         continue
                     now = time.monotonic()
-                    ordered = sorted(
-                        nacks[:24],
-                        key=lambda g: (0 if g == next_needed else 1, abs(g - next_needed)),
+                    repair_sent += repair_nacks(
+                        mm,
+                        nacks,
+                        nack_rx,
+                        next_needed,
+                        now=now,
+                        limit=24,
+                        sent_before=total_gens,
                     )
-                    for nid in ordered:
-                        # First contact: full packet set once; then repair forever.
-                        repair_sent += repair_one(
-                            mm,
-                            nid,
-                            now=now,
-                            full_once=repair_extra.get(nid, 0) == 0,
-                        )
                     sock.sendto(fin, client_addr)
                     time.sleep(0.005)
 
             finally:
+                encode_pool.shutdown(wait=False, cancel_futures=True)
                 mm.close()
     finally:
         stop_fb.set()
@@ -473,7 +562,10 @@ def run_gen_client(
         nonlocal last_fb
         next_needed = total_gens
         nacks: list[int] = []
-        horizon = 256 if fin_seen else 64
+        nack_rx: list[int] = []
+        # Cover the server inflight window so repairs are not limited to the
+        # first 64 holes after next_needed.
+        horizon = 256
         for i in range(total_gens):
             if bit_get(i):
                 continue
@@ -481,9 +573,17 @@ def run_gen_client(
                 next_needed = i
             if i <= next_needed + horizon or i in decoders:
                 nacks.append(i)
+                dec = decoders.get(i)
+                nack_rx.append(dec.symbols_rx if dec is not None else 0)
             if len(nacks) >= 64:
                 break
-        pkt = GenFeedbackPacket(next_needed, nacks, last_echo, completed)
+        pkt = GenFeedbackPacket(
+            next_needed,
+            nacks,
+            last_echo,
+            completed,
+            nack_rx,
+        )
         sock.sendto(pkt.pack(), server)
         last_fb = time.monotonic()
 
@@ -528,7 +628,7 @@ def run_gen_client(
                     if dec is None:
                         dec = GenDecoder(block_bytes, symbol_size)
                         decoders[gid] = dec
-                    out = dec.add_packet(gp.payload)
+                    out = dec.add_packet(gp.payload, gp.esi)
                     if out is not None:
                         if dec.symbols_rx > gen_k + 1:
                             gens_recovered += 1

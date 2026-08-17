@@ -74,14 +74,19 @@ class GenDecoder:
     _decoder: object = field(init=False, repr=False)
     done: bytes | None = None
     symbols_rx: int = 0
+    _seen_esi: set[int] = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
         _, Decoder = require_raptorq()
         self._decoder = Decoder.with_defaults(self.transfer_length, self.symbol_size)
 
-    def add_packet(self, rq_blob: bytes) -> bytes | None:
+    def add_packet(self, rq_blob: bytes, esi: int | None = None) -> bytes | None:
         if self.done is not None:
             return self.done
+        if esi is not None:
+            if esi in self._seen_esi:
+                return None
+            self._seen_esi.add(esi)
         self.symbols_rx += 1
         out = self._decoder.decode(rq_blob)
         if out is not None:

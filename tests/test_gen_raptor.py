@@ -72,11 +72,37 @@ def test_gen_packet_wire():
 
 
 def test_gen_feedback_wire():
-    fb = GenFeedbackPacket(2, [2, 5, 9], echo_ts_us=1, completed_gens=2)
+    fb = GenFeedbackPacket(
+        2,
+        [2, 5, 9],
+        echo_ts_us=1,
+        completed_gens=2,
+        nack_rx_counts=[45, 12, 0],
+    )
     got = GenFeedbackPacket.unpack(fb.pack())
     assert got.next_needed_gen == 2
     assert got.nack_gens == [2, 5, 9]
     assert got.completed_gens == 2
+    assert got.nack_rx_counts == [45, 12, 0]
+
+
+def test_gen_feedback_legacy_without_counts():
+    fb = GenFeedbackPacket(2, [2, 5], echo_ts_us=1, completed_gens=1)
+    got = GenFeedbackPacket.unpack(fb.pack())
+    assert got.nack_gens == [2, 5]
+    assert got.nack_rx_counts is None
+
+
+def test_decoder_deduplicates_outer_esi():
+    T = 64
+    K = 8
+    data = bytes(range(T)) * K
+    enc = GenEncoder(data, T, overhead_pct=2)
+    pkt = enc.packets()[0]
+    dec = GenDecoder(len(data), T)
+    assert dec.add_packet(pkt, esi=0) is None
+    assert dec.add_packet(pkt, esi=0) is None
+    assert dec.symbols_rx == 1
 
 
 def test_meta_gen_roundtrip():
