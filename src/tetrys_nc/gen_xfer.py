@@ -71,6 +71,51 @@ _REPAIR_PER_TURN = 2
 _REPAIR_AT_CAP = 16
 # One feedback round must stay a thin fountain top-up, never a full reblast.
 _REPAIR_ROUND_MAX = 32
+# While blast is blocked on inflight cap, keep spraying new ESI into the
+# oldest incomplete gens instead of idling the socket. Cheap: those symbols
+# would otherwise be unused rate; skip gens the client already has enough of.
+_FOUNTAIN_CAP_GENS = 16
+_FOUNTAIN_CAP_COOLDOWN_S = 0.008
+_FOUNTAIN_CAP_PER_GEN = 32
+
+
+def fountain_targets(
+    next_needed: int,
+    sent_before: int,
+    nacks: list[int],
+    nack_rx: dict[int, int],
+    *,
+    gen_k: int,
+    limit: int,
+    decode_margin: int = _DECODE_MARGIN,
+) -> list[int]:
+    """Oldest likely-incomplete gens to fountain while blast is at cap."""
+    if sent_before <= 0 or limit <= 0:
+        return []
+    enough = gen_k + decode_margin
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def add(gid: int) -> bool:
+        if gid < 0 or gid >= sent_before or gid in seen:
+            return len(out) >= limit
+        rx = nack_rx.get(gid)
+        if rx is not None and rx >= enough:
+            return len(out) >= limit
+        seen.add(gid)
+        out.append(gid)
+        return len(out) >= limit
+
+    if add(next_needed):
+        return out
+    for gid in sorted(g for g in nacks if g != next_needed):
+        if add(gid):
+            return out
+    start = max(0, next_needed)
+    for gid in range(start, sent_before):
+        if add(gid):
+            return out
+    return out
 
 
 class _Win:
@@ -375,9 +420,17 @@ def run_gen_server(
         *,
         now: float,
         symbols_rx: int | None = None,
+        cooldown_s: float = _REPAIR_COOLDOWN_S,
+        send_n: int | None = None,
     ) -> list[bytes]:
         """Build new fountain symbols; caller sends them."""
-        if (now - last_repair_ts.get(nid, 0.0)) < _REPAIR_COOLDOWN_S:
+        if (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
+            return []
+        if (
+            symbols_rx is not None
+            and symbols_rx >= gen_k + _DECODE_MARGIN
+            and send_n is None
+        ):
             return []
         enc = get_or_make_encoder(mm, nid)
         if enc is None:
@@ -389,12 +442,13 @@ def run_gen_server(
         # when the native encoder is reconstructed from mmap.
         prior_extra = repair_extra.get(nid, 0)
 
-        if symbols_rx is None or symbols_rx <= 0:
-            send_n = base_r
-        else:
-            deficit = max(1, gen_k + _DECODE_MARGIN - symbols_rx)
-            send_n = math.ceil(deficit * (1.0 + _REPAIR_SURPLUS))
-        send_n = max(1, min(send_n, _REPAIR_ROUND_MAX))
+        if send_n is None:
+            if symbols_rx is None or symbols_rx <= 0:
+                send_n = base_r
+            else:
+                deficit = max(1, gen_k + _DECODE_MARGIN - symbols_rx)
+                send_n = math.ceil(deficit * (1.0 + _REPAIR_SURPLUS))
+        send_n = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
 
         initial_budget = repair_count(gen_k, overhead_pct)
         target_budget = initial_budget + prior_extra + send_n
@@ -528,6 +582,28 @@ def run_gen_server(
                             sent_before=gid,
                         )
                     )
+                    if at_cap:
+                        targets = fountain_targets(
+                            next_needed,
+                            gid,
+                            nacks,
+                            nack_rx,
+                            gen_k=gen_k,
+                            limit=_FOUNTAIN_CAP_GENS,
+                        )
+                        for nid in targets:
+                            extra = repair_one(
+                                mm,
+                                nid,
+                                now=now,
+                                symbols_rx=nack_rx.get(nid),
+                                cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
+                                send_n=_FOUNTAIN_CAP_PER_GEN,
+                            )
+                            if extra:
+                                wires.extend(extra)
+                        if targets:
+                            prune_encoders(set(targets))
                     if wires:
                         try:
                             repair_q.put(wires, timeout=0.05)
@@ -578,8 +654,37 @@ def run_gen_server(
                         limiter.set_burst_s(0.016)
                     repair_sent += drain_repairs()
                     if incomplete >= inflight_gen_limit:
-                        time.sleep(0.001)
-                        cap_s += 0.001
+                        # Blast is blocked; spray new ESI into the oldest
+                        # incomplete gens on this thread so unused rate is
+                        # not slept away waiting on the repair queue.
+                        with fb_lock:
+                            nacks = list(fb_state["nacks"])
+                            nack_rx = dict(fb_state["nack_rx"])
+                        extra: list[bytes] = []
+                        for nid in fountain_targets(
+                            next_needed,
+                            gen_id,
+                            nacks,
+                            nack_rx,
+                            gen_k=gen_k,
+                            limit=_FOUNTAIN_CAP_GENS,
+                        ):
+                            extra.extend(
+                                repair_one(
+                                    mm,
+                                    nid,
+                                    now=now,
+                                    symbols_rx=nack_rx.get(nid),
+                                    cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
+                                    send_n=_FOUNTAIN_CAP_PER_GEN,
+                                )
+                            )
+                        if extra:
+                            send_batch(extra, repair=True)
+                            repair_sent += len(extra)
+                        elif repair_q.empty():
+                            time.sleep(0.001)
+                            cap_s += 0.001
                         continue
 
                     fut = encode_futures.get(gen_id)

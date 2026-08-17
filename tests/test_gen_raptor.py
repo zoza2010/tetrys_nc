@@ -9,6 +9,7 @@ import pytest
 raptorq = pytest.importorskip("raptorq")
 
 from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, repair_count
+from tetrys_nc.gen_xfer import fountain_targets
 from tetrys_nc.packets import (
     XFER_GEN,
     GenFeedbackPacket,
@@ -16,6 +17,28 @@ from tetrys_nc.packets import (
     MetaPacket,
     parse_packet,
 )
+
+
+def test_fountain_targets_prefers_frontier_and_skips_full_rank():
+    got = fountain_targets(
+        10,
+        40,
+        nacks=[12, 18, 10],
+        nack_rx={10: 80, 12: 200, 18: 20},
+        gen_k=192,
+        limit=4,
+        decode_margin=2,
+    )
+    # 12 already has K+margin symbols; 10 is the frontier even if nacked.
+    assert got[0] == 10
+    assert 12 not in got
+    assert 18 in got
+    assert len(got) <= 4
+
+
+def test_fountain_targets_walks_window_without_nacks():
+    got = fountain_targets(5, 20, nacks=[], nack_rx={}, gen_k=192, limit=3)
+    assert got == [5, 6, 7]
 
 
 def test_repair_count():
