@@ -68,15 +68,18 @@ _ENCODE_WORKERS = 3
 _ENCODE_PREFETCH = 16
 # How many incomplete gens to fountain-repair per send-loop turn.
 _REPAIR_PER_TURN = 2
-_REPAIR_AT_CAP = 16
+_REPAIR_AT_CAP = 4
 # One feedback round must stay a thin fountain top-up, never a full reblast.
 _REPAIR_ROUND_MAX = 32
-# While blast is blocked on inflight cap, keep spraying new ESI into the
-# oldest incomplete gens instead of idling the socket. Cheap: those symbols
-# would otherwise be unused rate; skip gens the client already has enough of.
-_FOUNTAIN_CAP_GENS = 16
-_FOUNTAIN_CAP_COOLDOWN_S = 0.008
-_FOUNTAIN_CAP_PER_GEN = 32
+# While blast is blocked on inflight cap, spray new ESI into oldest incomplete
+# gens (send loop only — not duplicated in the repair thread).
+_FOUNTAIN_CAP_GENS = 4
+_FOUNTAIN_CAP_COOLDOWN_S = 0.02
+_FOUNTAIN_CAP_PER_GEN = 8
+# Cap repair wire when at inflight limit so a loss burst cannot turn into a
+# self-inflicted repair flood (~4k pkts/s ≈ 5 MiB/s at 1350 B).
+_CAP_REPAIR_PKTS_S = 4000.0
+_CAP_REPAIR_BURST_PKTS = 256.0
 
 
 def fountain_targets(
@@ -197,6 +200,46 @@ def _encode_gen_worker(
         for i, blob in enumerate(enc.packets())
     ]
     return time.monotonic() - t_enc, end - off, wires
+
+
+def _repair_gen_worker(
+    path: str,
+    gid: int,
+    block_bytes: int,
+    file_size: int,
+    symbol_size: int,
+    overhead_pct: int,
+    gen_k: int,
+    prior_extra: int,
+    send_n: int,
+    ts_us: int,
+) -> tuple[float, int, list[bytes]]:
+    """Encode a fountain tail in a worker process (same GIL isolation as blast)."""
+    global _worker_mm, _worker_path
+    t_enc = time.monotonic()
+    if _worker_mm is None or _worker_path != path:
+        f = open(path, "rb")
+        _worker_mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        _worker_path = path
+    off = gid * block_bytes
+    end = min(off + block_bytes, file_size)
+    raw = bytes(_worker_mm[off:end])
+    if len(raw) < block_bytes:
+        raw = raw + b"\x00" * (block_bytes - len(raw))
+    enc = GenEncoder(raw, symbol_size, overhead_pct)
+    initial_budget = repair_count(gen_k, overhead_pct)
+    want = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
+    target_budget = initial_budget + prior_extra + want
+    new_pkts = enc.ensure_repair(target_budget)
+    if not new_pkts:
+        return time.monotonic() - t_enc, 0, []
+    new_pkts = new_pkts[-want:]
+    first_esi = enc.packet_count - len(new_pkts)
+    wires = [
+        GenPacket(gid, first_esi + i, blob, ts_us).pack()
+        for i, blob in enumerate(new_pkts)
+    ]
+    return time.monotonic() - t_enc, len(new_pkts), wires
 
 
 def _file_sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
@@ -414,6 +457,9 @@ def run_gen_server(
                     continue
                 encoders.pop(old, None)
 
+    encode_pool: ProcessPoolExecutor | None = None
+    file_path_str = str(file_path)
+
     def repair_one(
         mm: mmap.mmap,
         nid: int,
@@ -432,16 +478,10 @@ def run_gen_server(
             and send_n is None
         ):
             return []
-        enc = get_or_make_encoder(mm, nid)
-        if enc is None:
+        if nid < 0 or nid >= total_gens:
             return []
-        t_enc = time.monotonic()
-        base_r = max(1, repair_count(gen_k, overhead_pct))
-        # Number of extra fountain symbols already generated for this gen.
-        # This survives encoder eviction, preventing duplicate ESI prefixes
-        # when the native encoder is reconstructed from mmap.
         prior_extra = repair_extra.get(nid, 0)
-
+        base_r = max(1, repair_count(gen_k, overhead_pct))
         if send_n is None:
             if symbols_rx is None or symbols_rx <= 0:
                 send_n = base_r
@@ -449,20 +489,44 @@ def run_gen_server(
                 deficit = max(1, gen_k + _DECODE_MARGIN - symbols_rx)
                 send_n = math.ceil(deficit * (1.0 + _REPAIR_SURPLUS))
         send_n = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
-
+        ts_us = int(now * 1_000_000) & 0xFFFFFFFF
+        if encode_pool is not None:
+            try:
+                enc_cpu_s, sent, wires = encode_pool.submit(
+                    _repair_gen_worker,
+                    file_path_str,
+                    nid,
+                    block_bytes,
+                    file_size,
+                    symbol_size,
+                    overhead_pct,
+                    gen_k,
+                    prior_extra,
+                    send_n,
+                    ts_us,
+                ).result(timeout=30.0)
+            except Exception:
+                return []
+            if not wires:
+                return []
+            win.add_repair_enc(enc_cpu_s)
+            repair_extra[nid] = prior_extra + sent
+            last_repair_ts[nid] = now
+            return wires
+        enc = get_or_make_encoder(mm, nid)
+        if enc is None:
+            return []
+        t_enc = time.monotonic()
         initial_budget = repair_count(gen_k, overhead_pct)
         target_budget = initial_budget + prior_extra + send_n
         new_pkts = enc.ensure_repair(target_budget)
         if not new_pkts:
             return []
-        # Reconstructed encoders return the entire missing prefix including
-        # previously sent extras; take only the newest tail.
         new_pkts = new_pkts[-send_n:]
         repair_extra[nid] = prior_extra + len(new_pkts)
         first_esi = enc.packet_count - len(new_pkts)
-        ts = int(now * 1_000_000) & 0xFFFFFFFF
         wires = [
-            GenPacket(nid, first_esi + i, blob, ts).pack()
+            GenPacket(nid, first_esi + i, blob, ts_us).pack()
             for i, blob in enumerate(new_pkts)
         ]
         last_repair_ts[nid] = now
@@ -519,7 +583,22 @@ def run_gen_server(
             repair_q: queue.Queue[list[bytes]] = queue.Queue(maxsize=64)
             stop_repair = threading.Event()
             cursor = {"gen_id": 0}
-            file_path_str = str(file_path)
+            cap_repair_tokens = _CAP_REPAIR_BURST_PKTS
+            cap_repair_refill = time.monotonic()
+
+            def take_cap_repair_budget(want: int) -> int:
+                nonlocal cap_repair_tokens, cap_repair_refill
+                now = time.monotonic()
+                dt = now - cap_repair_refill
+                if dt > 0:
+                    cap_repair_tokens = min(
+                        _CAP_REPAIR_BURST_PKTS,
+                        cap_repair_tokens + dt * _CAP_REPAIR_PKTS_S,
+                    )
+                    cap_repair_refill = now
+                got = min(want, int(cap_repair_tokens))
+                cap_repair_tokens -= got
+                return got
 
             def fill_encode_queue(start: int) -> None:
                 stop = min(total_gens, start + _ENCODE_PREFETCH)
@@ -582,28 +661,6 @@ def run_gen_server(
                             sent_before=gid,
                         )
                     )
-                    if at_cap:
-                        targets = fountain_targets(
-                            next_needed,
-                            gid,
-                            nacks,
-                            nack_rx,
-                            gen_k=gen_k,
-                            limit=_FOUNTAIN_CAP_GENS,
-                        )
-                        for nid in targets:
-                            extra = repair_one(
-                                mm,
-                                nid,
-                                now=now,
-                                symbols_rx=nack_rx.get(nid),
-                                cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
-                                send_n=_FOUNTAIN_CAP_PER_GEN,
-                            )
-                            if extra:
-                                wires.extend(extra)
-                        if targets:
-                            prune_encoders(set(targets))
                     if wires:
                         try:
                             repair_q.put(wires, timeout=0.05)
@@ -661,6 +718,9 @@ def run_gen_server(
                             nacks = list(fb_state["nacks"])
                             nack_rx = dict(fb_state["nack_rx"])
                         extra: list[bytes] = []
+                        budget = take_cap_repair_budget(
+                            _FOUNTAIN_CAP_GENS * _FOUNTAIN_CAP_PER_GEN
+                        )
                         for nid in fountain_targets(
                             next_needed,
                             gen_id,
@@ -669,16 +729,18 @@ def run_gen_server(
                             gen_k=gen_k,
                             limit=_FOUNTAIN_CAP_GENS,
                         ):
-                            extra.extend(
-                                repair_one(
-                                    mm,
-                                    nid,
-                                    now=now,
-                                    symbols_rx=nack_rx.get(nid),
-                                    cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
-                                    send_n=_FOUNTAIN_CAP_PER_GEN,
-                                )
+                            if budget <= 0:
+                                break
+                            batch = repair_one(
+                                mm,
+                                nid,
+                                now=now,
+                                symbols_rx=nack_rx.get(nid),
+                                cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
+                                send_n=min(_FOUNTAIN_CAP_PER_GEN, budget),
                             )
+                            extra.extend(batch)
+                            budget -= len(batch)
                         if extra:
                             send_batch(extra, repair=True)
                             repair_sent += len(extra)
@@ -875,8 +937,12 @@ def run_gen_client(
     write_s = 0.0
     write_inline = 0
     rx_bytes = 0
-    write_q: queue.Queue[tuple[int, bytes] | None] = queue.Queue(maxsize=128)
+    # Unbounded: a 1s disk stall at 90 MiB/s is ~350 gens. A 128-deep queue
+    # overflows and used to pwrite on the recv thread, dropping the UDP
+    # socket and collapsing the rest of the transfer.
+    write_q: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
     write_lock = threading.Lock()
+    _fadv_dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
 
     def bit_get(i: int) -> bool:
         if i < 0 or i >= total_gens:
@@ -898,6 +964,11 @@ def run_gen_client(
         t_w = time.monotonic()
         os.pwrite(fd, chunk, off)
         dt = time.monotonic() - t_w
+        if _fadv_dontneed is not None:
+            try:
+                os.posix_fadvise(fd, off, len(chunk), _fadv_dontneed)
+            except OSError:
+                pass
         with write_lock:
             write_s += dt
             bytes_written += len(chunk)
@@ -910,13 +981,7 @@ def run_gen_client(
             pwrite_one(item[0], item[1])
 
     def enqueue_write(off: int, data: bytes) -> None:
-        nonlocal write_inline
-        try:
-            write_q.put_nowait((off, data))
-        except queue.Full:
-            # Never drop decoded data; one inline pwrite if the writer is behind.
-            pwrite_one(off, data)
-            write_inline += 1
+        write_q.put_nowait((off, data))
 
     write_thread = threading.Thread(target=write_loop, name="gen-write", daemon=True)
     write_thread.start()
@@ -956,7 +1021,12 @@ def run_gen_client(
             t_sel = time.monotonic()
             r, _, _ = select.select([sock], [], [], timeout)
             now = time.monotonic()
-            fb_every = 0.05 if fin_seen else 0.1
+            if fin_seen:
+                fb_every = 0.05
+            elif len(decoders) >= 16:
+                fb_every = 0.02
+            else:
+                fb_every = 0.1
             if not r:
                 wait_rx_s += now - t_sel
                 send_fb()

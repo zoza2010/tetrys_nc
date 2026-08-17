@@ -44,6 +44,7 @@ def test_fountain_targets_walks_window_without_nacks():
 def test_repair_count():
     assert repair_count(48, 8) == 4
     assert repair_count(10, 8) >= 1
+    assert repair_count(48, 0) == 0
 
 
 def test_gen_roundtrip():

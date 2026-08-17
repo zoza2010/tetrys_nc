@@ -17,10 +17,10 @@ def require_raptorq():
 
 
 def repair_count(k: int, overhead_pct: int) -> int:
-    """Number of repair packets for ~overhead_pct of K (at least 1 if K>0)."""
-    if k <= 0:
+    """Extra repair packets beyond systematic (~overhead_pct of K). 0 = none."""
+    if k <= 0 or overhead_pct <= 0:
         return 0
-    r = int(math.ceil(k * max(0, overhead_pct) / 100.0))
+    r = int(math.ceil(k * overhead_pct / 100.0))
     return max(1, r)
 
 
