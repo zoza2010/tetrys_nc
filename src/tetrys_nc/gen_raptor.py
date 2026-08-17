@@ -74,6 +74,7 @@ class GenDecoder:
     _decoder: object = field(init=False, repr=False)
     done: bytes | None = None
     symbols_rx: int = 0
+    dup_esi: int = 0
     _seen_esi: set[int] = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
@@ -85,6 +86,7 @@ class GenDecoder:
             return self.done
         if esi is not None:
             if esi in self._seen_esi:
+                self.dup_esi += 1
                 return None
             self._seen_esi.add(esi)
         self.symbols_rx += 1

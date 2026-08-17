@@ -103,6 +103,7 @@ def test_decoder_deduplicates_outer_esi():
     assert dec.add_packet(pkt, esi=0) is None
     assert dec.add_packet(pkt, esi=0) is None
     assert dec.symbols_rx == 1
+    assert dec.dup_esi == 1
 
 
 def test_meta_gen_roundtrip():

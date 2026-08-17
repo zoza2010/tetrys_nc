@@ -13,25 +13,33 @@ class RateLimiter:
         max_bps: float,
         start_bps: float | None = None,
         burst: float | None = None,
+        min_frac: float = 0.90,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # FASP-like: never collapse far below target — keep the pipe full.
-        self.min_rate = min(self.max_rate, max(self.max_rate * 0.90, 8_000_000.0))
+        # Default floor is high so a fixed --rate blast stays full. Delay CC
+        # passes a lower min_frac so it can actually back off the queue.
+        self.min_rate = min(self.max_rate, max(self.max_rate * min_frac, 8_000_000.0))
         if start_bps is None:
             start_bps = self.max_rate
         self.rate = min(self.max_rate, max(start_bps, self.min_rate))
-        # A few milliseconds, not 250ms: large token bursts were harmless when
-        # Python sendto was the bottleneck, but UDP GSO can dump them instantly
-        # and overflow the path/receiver queues.
-        self.burst = burst if burst is not None else max(self.rate * 0.002, 64_000.0)
+        # ~16ms of the target rate: enough for one K=192 generation (~290 KiB)
+        # so we do not sleep after every 64-packet GSO burst. 2ms was starving
+        # the 1000 Mbit ceiling; 250ms used to overflow shallow WAN queues.
+        self._burst_s = 0.016
+        self.burst = burst if burst is not None else max(self.rate * self._burst_s, 256_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
-        self.burst = max(self.rate * 0.002, 64_000.0)
+        self.burst = max(self.rate * self._burst_s, 256_000.0)
 
-    def consume(self, nbytes: int) -> None:
+    def set_burst_s(self, burst_s: float) -> None:
+        self._burst_s = max(0.001, min(burst_s, 0.050))
+        self.burst = max(self.rate * self._burst_s, 256_000.0)
+
+    def consume(self, nbytes: int) -> float:
+        """Spend tokens. Returns seconds slept waiting for the bucket."""
         now = time.monotonic()
         elapsed = now - self.updated
         self.updated = now
@@ -45,3 +53,5 @@ class RateLimiter:
             time.sleep(sleep_s)
             self.updated = time.monotonic()
             self.tokens = 0.0
+            return sleep_s
+        return 0.0
