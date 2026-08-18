@@ -16,7 +16,6 @@ import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
-from .delaycc import DelayCc
 from .gen_raptor import (
     GenDecoder,
     GenEncoder,
@@ -25,6 +24,7 @@ from .gen_raptor import (
     repair_count,
     require_raptorq,
 )
+from .ratectl import RateLimiter
 from .netutil import (
     recv_datagrams,
     send_datagrams,
@@ -449,7 +449,6 @@ def run_gen_server(
     rate_mbit: float = 1500.0,
     ramp_s: float = 4.0,
     skip_hash: bool = True,
-    delay_cc: bool = True,
 ) -> int:
     require_raptorq()
     if not file_path.is_file():
@@ -480,7 +479,7 @@ def run_gen_server(
         f"xfer=gen gens={total_gens} T={symbol_size} K~={gen_k} "
         f"block={block_bytes} overhead={overhead_pct}% "
         f"{'(fountain redundancy) ' if fountain_mode else ''}"
-        f"cc={'delay' if delay_cc else 'off'} "
+        f"cc=off "
         f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
@@ -524,16 +523,11 @@ def run_gen_server(
     limiter = RateLimiter(
         max_bps,
         start_bps=1.0 if ramp_s > 0 else max_bps,
-        min_frac=0.50 if delay_cc else 0.90,
+        min_frac=0.90,
     )
     t_ramp0 = time.monotonic()
     if ramp_s > 0:
         print(f"pace ramp {ramp_s:.1f}s 0→{max_bps / (1024 * 1024):.1f} MiB/s")
-    cc = DelayCc(
-        max_bps=max_bps,
-        min_bps=max(max_bps * 0.50, 8_000_000.0),
-        enabled=delay_cc,
-    )
 
     enc_lock = threading.Lock()
     encoders: dict[int, GenEncoder] = {}
@@ -593,7 +587,7 @@ def run_gen_server(
                 frac = (elapsed / ramp_s) ** 2
                 limiter.set_rate(max(1.0, max_bps * frac))
                 return
-        limiter.set_rate(cc.rate if delay_cc else max_bps)
+        limiter.set_rate(max_bps)
 
     def send_batch(wires: list[bytes], *, repair: bool = False) -> None:
         nonlocal send_s, pace_s, wire_bytes, blast_pkts, repair_pkts_w
@@ -1044,13 +1038,10 @@ def run_gen_server(
                             break
                         next_needed = int(fb_state["next_needed"])
                         completed = int(fb_state["completed"])
-                        echo = int(fb_state["echo"])
 
                     now = time.monotonic()
-                    cc.note_echo(echo, now)
-                    cc.note_delivery(now, completed, block_bytes)
                     if ramp_s <= 0 or (now - t_ramp0) >= ramp_s:
-                        cc.step(now)
+                        pace_tick()
                     if next_needed != stuck_nn:
                         stuck_nn = next_needed
                         stuck_nn_since = now
@@ -1139,11 +1130,8 @@ def run_gen_server(
                             done_g = fb_state["completed"]
                             nn = int(fb_state["next_needed"])
                         rate = bytes_sent_payload / max(now - t0, 1e-6) / (1024 * 1024)
-                        cc_mbit = limiter.rate * 8.0 / 1_000_000.0
+                        pace_mbit = limiter.rate * 8.0 / 1_000_000.0
                         cap_mbit = max_bps * 8.0 / 1_000_000.0
-                        deliv_mib = cc.bw_bps / (1024 * 1024)
-                        min_rtt_ms = (cc.min_rtt_s or 0.0) * 1000
-                        rtt_ms = cc.rtt_s * 1000
                         enc_s, renc_s, qdrop = win.take_workers()
                         sys_s, blk_s, sys_n, blk_n = take_send_stats()
                         parts = {
@@ -1173,11 +1161,7 @@ def run_gen_server(
                             f"fountain={fount_n} "
                             f"pipe={storm_flag} "
                             f"repair_extra={repair_sent} "
-                            f"rate={cc_mbit:.0f}/{cap_mbit:.0f}Mbit "
-                            f"cc={cc.mode} "
-                            f"rtt={rtt_ms:.0f}/ewma={cc.rtt_ewma_s * 1000:.0f}/min={min_rtt_ms:.0f} "
-                            f"q={cc.qdelay_s * 1000:.0f}ms "
-                            f"deliv={deliv_mib:.1f} "
+                            f"rate={pace_mbit:.0f}/{cap_mbit:.0f}Mbit "
                             f"app={rate:.1f} MiB/s"
                         )
                         print(

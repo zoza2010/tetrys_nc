@@ -51,11 +51,6 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="RaptorQ repair overhead percent in blast (0=fountain-only; default 0)",
     )
-    p.add_argument(
-        "--no-cc",
-        action="store_true",
-        help="disable delay-based CC; blast at --rate",
-    )
     args = p.parse_args(argv)
 
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
@@ -75,7 +70,6 @@ def main(argv: list[str] | None = None) -> int:
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
-        delay_cc=not args.no_cc,
     )
 
 
