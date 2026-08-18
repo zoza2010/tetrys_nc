@@ -15,7 +15,7 @@ uv run python -m tetrys_nc genfile --output testdata/blob_1g.bin --size 1G
 
 # терминал 1 — сервер (отправитель)
 uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 9000 \
-  --gen-k 48 --gen-overhead 8 --rate 1000 --ramp-s 2
+  --gen-k 48 --rate 1000 --ramp-s 2
 
 # терминал 2 — клиент (получатель)
 uv run python -m tetrys_nc client --host 127.0.0.1 --port 9000 --output testdata/received_1g.bin
@@ -45,7 +45,7 @@ server:
   --rate / --rate-mbit целевая скорость UDP (Mbit/s)
   --ramp-s S           разгон 0→rate (default 2)
   --gen-k N            символов на поколение (default 48)
-  --gen-overhead PCT   repair overhead % (default 8)
+  --gen-overhead PCT   blast repair overhead % (0=fountain default)
   --skip-hash          не считать SHA-256 на сервере
 
 client:
@@ -65,7 +65,7 @@ uv run pytest -q
 ```bash
 # сервер
 uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --skip-hash \
-  --rate 1000 --ramp-s 2 --gen-k 48 --gen-overhead 2
+  --rate 1000 --ramp-s 2 --gen-k 48
 
 # клиент
 uv run python -m tetrys_nc client --host tintrack-cloud.a-vfx.com --port 7494 --wan \

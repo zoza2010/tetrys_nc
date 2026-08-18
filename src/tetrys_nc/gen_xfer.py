@@ -76,11 +76,9 @@ _ENCODE_PREFETCH = 16
 # Hybrid pipeline: fountain only when client lags or inflight is high.
 _PIPELINE_LAG_GENS = 64
 _PIPELINE_INFLIGHT_FRAC = 3 / 4
-# When overhead_pct=0, blast is K systematic only; fountain carries redundancy.
+# Fountain mode (overhead=0): per-gen repair in encode worker; cap top-up at inflight limit.
 _FOUNTAIN_TARGET_OVERHEAD_PCT = 8
-# One async repair batch per gen (mirrors blast bootstrap, without blocking encode).
-_FOUNTAIN_BOOTSTRAP_COOLDOWN_S = 1.0
-# Fountain tick every N systematic sends when not at hard cap.
+# Fountain tick every N systematic sends when hybrid path is stressed (not at hard cap).
 _FOUNTAIN_EVERY_N = 4
 # How many incomplete gens to fountain-repair per send-loop turn.
 _REPAIR_PER_TURN = 2
@@ -106,23 +104,14 @@ _REPAIR_META_KEEP = 256
 
 
 def fountain_redundancy(overhead_pct: int) -> bool:
-    """True when blast is systematic-only and repair comes from the fountain."""
+    """True when CLI overhead is 0 (repair via fountain bootstrap + cap top-up)."""
     return overhead_pct <= 0
 
 
 def repair_round_size(gen_k: int, overhead_pct: int) -> int:
-    """Default repair symbols per fountain round."""
-    pct = (
-        overhead_pct
-        if overhead_pct > 0
-        else _FOUNTAIN_TARGET_OVERHEAD_PCT
-    )
+    """Default repair symbols per generation or fountain round."""
+    pct = overhead_pct if overhead_pct > 0 else _FOUNTAIN_TARGET_OVERHEAD_PCT
     return max(1, repair_count(gen_k, pct))
-
-
-def fountain_gen_budget(gen_k: int) -> int:
-    """Target repair symbols per generation in fountain-only mode."""
-    return fountain_blast_budget(gen_k, _FOUNTAIN_TARGET_OVERHEAD_PCT)
 
 
 def cap_fountain_send(
@@ -134,8 +123,8 @@ def cap_fountain_send(
     decode_margin: int = _DECODE_MARGIN,
     round_max: int = _REPAIR_ROUND_MAX,
 ) -> int:
-    """Cap fountain repair to ~bootstrap budget; allow deficit top-up beyond."""
-    budget = fountain_gen_budget(gen_k)
+    """Cap fountain repair to per-gen budget; allow deficit top-up beyond."""
+    budget = repair_round_size(gen_k, 0)
     if prior_extra >= budget:
         if symbols_rx is not None and symbols_rx < gen_k + decode_margin:
             deficit = max(1, gen_k + decode_margin - symbols_rx)
@@ -182,33 +171,12 @@ def should_track_fountain_gen(
     *,
     at_cap: bool,
     window: int = _FOUNTAIN_WINDOW,
-    fountain_mode: bool = False,
 ) -> bool:
-    """Track gens near the frontier for async fountain repair."""
+    """Track gens near the frontier for hybrid async fountain repair."""
     if gen_id < next_needed:
         return False
-    if fountain_mode:
-        limit = window if at_cap else min(window // 2, _FOUNTAIN_CAP_GENS + 4)
-        return gen_id < next_needed + limit
     limit = window if at_cap else min(window // 2, _FOUNTAIN_CAP_GENS + 4)
     return gen_id < next_needed + limit
-
-
-def seed_fountain_window(
-    fountain_gens: set[int],
-    next_needed: int,
-    sent_before: int,
-    *,
-    window: int = _FOUNTAIN_WINDOW,
-    max_track: int = _FOUNTAIN_TRACK_MAX,
-) -> None:
-    """Ensure inflight gens near the frontier are tracked while at cap."""
-    if sent_before <= next_needed:
-        return
-    hi = min(sent_before, next_needed + window)
-    for gid in range(next_needed, hi):
-        fountain_gens.add(gid)
-    cap_fountain_gens(fountain_gens, next_needed, max_track=max_track)
 
 
 def cap_fountain_gens(
@@ -287,14 +255,8 @@ def track_fountain_gen(
     next_needed: int,
     *,
     at_cap: bool,
-    fountain_mode: bool = False,
 ) -> None:
-    if not should_track_fountain_gen(
-        gen_id,
-        next_needed,
-        at_cap=at_cap,
-        fountain_mode=fountain_mode,
-    ):
+    if not should_track_fountain_gen(gen_id, next_needed, at_cap=at_cap):
         return
     fountain_gens.add(gen_id)
     cap_fountain_gens(fountain_gens, next_needed)
@@ -1156,14 +1118,13 @@ def run_gen_server(
                     send_batch(wires)
                     if bootstrap:
                         repair_extra[gen_id] = bootstrap
-                    if fountain_mode or stressed:
+                    if stressed:
                         with fountain_lock:
                             track_fountain_gen(
                                 fountain_gens,
                                 gen_id,
                                 next_needed,
                                 at_cap=at_cap,
-                                fountain_mode=fountain_mode,
                             )
                     gens_sent += 1
                     bytes_sent_payload += source_bytes

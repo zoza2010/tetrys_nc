@@ -17,7 +17,7 @@ def main() -> int:
     p.add_argument("--size", default="64M")
     p.add_argument("--port", type=int, default=9100)
     p.add_argument("--gen-k", type=int, default=48)
-    p.add_argument("--gen-overhead", type=int, default=8)
+    p.add_argument("--gen-overhead", type=int, default=0)
     p.add_argument("--rate", type=float, default=2000.0)
     args = p.parse_args()
 
