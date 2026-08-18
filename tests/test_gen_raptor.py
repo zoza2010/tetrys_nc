@@ -36,6 +36,18 @@ def test_fountain_targets_prefers_frontier_and_skips_full_rank():
     assert len(got) <= 4
 
 
+def test_fountain_targets_prioritizes_largest_symbol_deficit():
+    got = fountain_targets(
+        10,
+        40,
+        nacks=[10, 11, 12, 13],
+        nack_rx={10: 180, 11: 150, 12: 20, 13: 100},
+        gen_k=192,
+        limit=4,
+    )
+    assert got == [10, 12, 13, 11]
+
+
 def test_fountain_targets_walks_window_without_nacks():
     got = fountain_targets(5, 20, nacks=[], nack_rx={}, gen_k=192, limit=3)
     assert got == [5, 6, 7]

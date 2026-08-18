@@ -13,12 +13,12 @@ PKT_META = 0x10
 PKT_FIN = 0x11
 PKT_READY = 0x12
 PKT_GEN = 0x20  # RaptorQ generation symbol (opaque rq packet)
-PKT_GEN_FB = 0x21  # generation feedback / NACK
+PKT_GEN_FB = 0x21  # generation state feedback
 
 # GEN: hdr4 + gen_id4 + esi4 + send_ts4 = 16
 GEN_HDR_SIZE = 16
 FLAG_META_XFER = 0x08  # META always carries gen params trailer
-FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
+FLAG_FB_RX_COUNTS = 0x01  # each open gen carries uint16 unique symbols received
 XFER_GEN = 1
 
 _HDR = struct.Struct("!BBBB")
@@ -63,7 +63,11 @@ class GenPacket:
 
 @dataclass(slots=True)
 class GenFeedbackPacket:
-    """Client feedback for generation transfer: next needed + NACK gen ids."""
+    """Receiver state: frontier plus open generations and symbol counts.
+
+    ``nack_gens`` remains the wire-compatible field name; it is telemetry for
+    fountain scheduling, not a request to retransmit packets.
+    """
 
     next_needed_gen: int
     nack_gens: list[int]

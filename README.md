@@ -45,7 +45,7 @@ server:
   --rate / --rate-mbit целевая скорость UDP (Mbit/s)
   --ramp-s S           разгон 0→rate (default 2)
   --gen-k N            символов на поколение (default 48)
-  --gen-overhead PCT   blast repair overhead % (0=fountain default)
+  repair redundancy is selected automatically by the fountain scheduler
   --skip-hash          не считать SHA-256 на сервере
 
 client:

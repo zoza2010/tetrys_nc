@@ -45,12 +45,6 @@ def main(argv: list[str] | None = None) -> int:
         default=192,
         help="symbols per generation (~K; default 192)",
     )
-    p.add_argument(
-        "--gen-overhead",
-        type=int,
-        default=0,
-        help="RaptorQ repair overhead percent in blast (0=fountain-only; default 0)",
-    )
     args = p.parse_args(argv)
 
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
@@ -66,7 +60,6 @@ def main(argv: list[str] | None = None) -> int:
         args.file,
         symbol_size=symbol,
         gen_k=args.gen_k,
-        overhead_pct=args.gen_overhead,
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
