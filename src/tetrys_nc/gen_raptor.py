@@ -24,17 +24,18 @@ def repair_count(k: int, overhead_pct: int) -> int:
     return max(1, r)
 
 
-# When overhead_pct=0, still ship a small bootstrap in the initial blast so
-# one RTT of loss does not stall the whole inflight window on WAN paths.
-_MIN_BLAST_OVERHEAD_PCT = 4
-
-
 def blast_repair_budget(k: int, overhead_pct: int) -> int:
-    if k <= 0:
+    """Repair symbols bundled into the initial systematic blast."""
+    if k <= 0 or overhead_pct <= 0:
         return 0
-    if overhead_pct <= 0:
-        return repair_count(k, _MIN_BLAST_OVERHEAD_PCT)
     return repair_count(k, overhead_pct)
+
+
+def fountain_blast_budget(k: int, target_pct: int = 8) -> int:
+    """Per-gen repair bundled with systematic when overhead_pct=0 (fountain mode)."""
+    if k <= 0 or target_pct <= 0:
+        return 0
+    return repair_count(k, target_pct)
 
 
 @dataclass

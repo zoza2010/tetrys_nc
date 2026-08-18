@@ -21,6 +21,7 @@ from .gen_raptor import (
     GenDecoder,
     GenEncoder,
     blast_repair_budget,
+    fountain_blast_budget,
     repair_count,
     require_raptorq,
 )
@@ -75,6 +76,10 @@ _ENCODE_PREFETCH = 16
 # Hybrid pipeline: fountain only when client lags or inflight is high.
 _PIPELINE_LAG_GENS = 64
 _PIPELINE_INFLIGHT_FRAC = 3 / 4
+# When overhead_pct=0, blast is K systematic only; fountain carries redundancy.
+_FOUNTAIN_TARGET_OVERHEAD_PCT = 8
+# One async repair batch per gen (mirrors blast bootstrap, without blocking encode).
+_FOUNTAIN_BOOTSTRAP_COOLDOWN_S = 1.0
 # Fountain tick every N systematic sends when not at hard cap.
 _FOUNTAIN_EVERY_N = 4
 # How many incomplete gens to fountain-repair per send-loop turn.
@@ -86,8 +91,8 @@ _REPAIR_ROUND_MAX = 32
 # (send loop only). Rate is limited by the token bucket, not a hard pkts/s cap.
 # Pipelined blast: K (+ bootstrap) then advance; async fountain fills gaps.
 _FOUNTAIN_CAP_GENS = 3
-_FOUNTAIN_CAP_COOLDOWN_S = 0.008
-_FOUNTAIN_CAP_PER_GEN = 16
+_FOUNTAIN_CAP_COOLDOWN_S = 0.05
+_FOUNTAIN_CAP_PER_GEN = 8
 # Track fountain state only near the client frontier (not the whole inflight tail).
 _FOUNTAIN_TRACK_MAX = 64
 _FOUNTAIN_WINDOW = 48
@@ -98,6 +103,48 @@ _REPAIR_STORM_PKTS_S = 25_000
 _REPAIR_STORM_BACKOFF_S = 0.75
 # Bound repair_extra / cooldown dicts (one int/float per gen touched by repair).
 _REPAIR_META_KEEP = 256
+
+
+def fountain_redundancy(overhead_pct: int) -> bool:
+    """True when blast is systematic-only and repair comes from the fountain."""
+    return overhead_pct <= 0
+
+
+def repair_round_size(gen_k: int, overhead_pct: int) -> int:
+    """Default repair symbols per fountain round."""
+    pct = (
+        overhead_pct
+        if overhead_pct > 0
+        else _FOUNTAIN_TARGET_OVERHEAD_PCT
+    )
+    return max(1, repair_count(gen_k, pct))
+
+
+def fountain_gen_budget(gen_k: int) -> int:
+    """Target repair symbols per generation in fountain-only mode."""
+    return fountain_blast_budget(gen_k, _FOUNTAIN_TARGET_OVERHEAD_PCT)
+
+
+def cap_fountain_send(
+    gen_k: int,
+    prior_extra: int,
+    send_n: int | None,
+    symbols_rx: int | None,
+    *,
+    decode_margin: int = _DECODE_MARGIN,
+    round_max: int = _REPAIR_ROUND_MAX,
+) -> int:
+    """Cap fountain repair to ~bootstrap budget; allow deficit top-up beyond."""
+    budget = fountain_gen_budget(gen_k)
+    if prior_extra >= budget:
+        if symbols_rx is not None and symbols_rx < gen_k + decode_margin:
+            deficit = max(1, gen_k + decode_margin - symbols_rx)
+            want = send_n if send_n is not None else deficit
+            return max(1, min(int(want), round_max))
+        return 0
+    room = budget - prior_extra
+    want = send_n if send_n is not None else room
+    return max(1, min(int(want), room, round_max))
 
 
 def pipeline_stressed(
@@ -119,10 +166,13 @@ def should_fountain_tick(
     tick_n: int,
     every_n: int = _FOUNTAIN_EVERY_N,
     storm_active: bool = False,
+    fountain_mode: bool = False,
 ) -> bool:
     """Rate-limit fountain submits on the send loop when not at hard cap."""
     if storm_active:
         return False
+    if fountain_mode:
+        return at_cap
     return stressed and (at_cap or tick_n % every_n == 0)
 
 
@@ -132,12 +182,33 @@ def should_track_fountain_gen(
     *,
     at_cap: bool,
     window: int = _FOUNTAIN_WINDOW,
+    fountain_mode: bool = False,
 ) -> bool:
-    """Only track gens near the frontier; bootstrap in blast covers clean path."""
+    """Track gens near the frontier for async fountain repair."""
     if gen_id < next_needed:
         return False
+    if fountain_mode:
+        limit = window if at_cap else min(window // 2, _FOUNTAIN_CAP_GENS + 4)
+        return gen_id < next_needed + limit
     limit = window if at_cap else min(window // 2, _FOUNTAIN_CAP_GENS + 4)
     return gen_id < next_needed + limit
+
+
+def seed_fountain_window(
+    fountain_gens: set[int],
+    next_needed: int,
+    sent_before: int,
+    *,
+    window: int = _FOUNTAIN_WINDOW,
+    max_track: int = _FOUNTAIN_TRACK_MAX,
+) -> None:
+    """Ensure inflight gens near the frontier are tracked while at cap."""
+    if sent_before <= next_needed:
+        return
+    hi = min(sent_before, next_needed + window)
+    for gid in range(next_needed, hi):
+        fountain_gens.add(gid)
+    cap_fountain_gens(fountain_gens, next_needed, max_track=max_track)
 
 
 def cap_fountain_gens(
@@ -216,8 +287,14 @@ def track_fountain_gen(
     next_needed: int,
     *,
     at_cap: bool,
+    fountain_mode: bool = False,
 ) -> None:
-    if not should_track_fountain_gen(gen_id, next_needed, at_cap=at_cap):
+    if not should_track_fountain_gen(
+        gen_id,
+        next_needed,
+        at_cap=at_cap,
+        fountain_mode=fountain_mode,
+    ):
         return
     fountain_gens.add(gen_id)
     cap_fountain_gens(fountain_gens, next_needed)
@@ -313,6 +390,7 @@ def _encode_gen_worker(
     file_size: int,
     symbol_size: int,
     overhead_pct: int,
+    fountain_bootstrap: bool = False,
 ) -> tuple[float, int, list[bytes], int]:
     """Encode one generation; returns (cpu_s, src_bytes, wires, bootstrap_repair_pkts)."""
     global _worker_mm, _worker_path
@@ -336,6 +414,8 @@ def _encode_gen_worker(
     k_est = max(1, (len(raw) + symbol_size - 1) // symbol_size)
     enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=True)
     bootstrap = blast_repair_budget(k_est, overhead_pct)
+    if bootstrap <= 0 and fountain_bootstrap:
+        bootstrap = fountain_blast_budget(k_est, _FOUNTAIN_TARGET_OVERHEAD_PCT)
     if bootstrap:
         enc.ensure_repair(bootstrap)
     ts = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
@@ -403,7 +483,7 @@ def run_gen_server(
     *,
     symbol_size: int = 1350,
     gen_k: int = 192,
-    overhead_pct: int = 8,
+    overhead_pct: int = 0,
     rate_mbit: float = 1500.0,
     ramp_s: float = 4.0,
     skip_hash: bool = True,
@@ -433,13 +513,14 @@ def run_gen_server(
         f"file={file_path.name} size={file_size}"
         f"{' (hash skipped)' if skip_hash else ''}"
     )
+    fountain_mode = fountain_redundancy(overhead_pct)
     print(
         f"xfer=gen gens={total_gens} T={symbol_size} K~={gen_k} "
         f"block={block_bytes} overhead={overhead_pct}% "
-        f"{'(4% blast bootstrap) ' if overhead_pct <= 0 else ''}"
+        f"{'(fountain redundancy) ' if fountain_mode else ''}"
         f"cc={'delay' if delay_cc else 'off'} "
         f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
-        f"mode=hybrid+async_fountain "
+        f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
     print("waiting for client READY...")
@@ -626,7 +707,7 @@ def run_gen_server(
         if nid < 0 or nid >= total_gens:
             return []
         prior_extra = repair_extra.get(nid, 0)
-        base_r = max(1, repair_count(gen_k, overhead_pct))
+        base_r = repair_round_size(gen_k, overhead_pct)
         if send_n is None:
             if symbols_rx is None or symbols_rx <= 0:
                 send_n = base_r
@@ -777,13 +858,22 @@ def run_gen_server(
                             win.add_qdrop()
                     return bool(wires)
                 prior_extra = repair_extra.get(nid, 0)
-                base_r = max(1, repair_count(gen_k, overhead_pct))
+                base_r = repair_round_size(gen_k, overhead_pct)
                 if send_n is None:
                     if symbols_rx is None or symbols_rx <= 0:
                         send_n = base_r
                     else:
                         deficit = max(1, gen_k + _DECODE_MARGIN - symbols_rx)
                         send_n = math.ceil(deficit * (1.0 + _REPAIR_SURPLUS))
+                if fountain_mode:
+                    send_n = cap_fountain_send(
+                        gen_k,
+                        prior_extra,
+                        send_n,
+                        symbols_rx,
+                    )
+                    if send_n <= 0:
+                        return False
                 send_n = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
                 ts_us = int(now * 1_000_000) & 0xFFFFFFFF
                 with repair_fut_lock:
@@ -864,9 +954,10 @@ def run_gen_server(
                 if sent_before <= 0 or now < storm_state["until"]:
                     return 0
                 prune_fountain(next_needed, nack_rx, nacks, sent_before)
-                with fountain_lock:
-                    if not fountain_gens:
-                        return 0
+                if not fountain_mode:
+                    with fountain_lock:
+                        if not fountain_gens:
+                            return 0
                 targets = fountain_targets(
                     next_needed,
                     sent_before,
@@ -878,16 +969,13 @@ def run_gen_server(
                 )
                 queued = 0
                 for i, nid in enumerate(targets):
-                    send_n = (
-                        _REPAIR_ROUND_MAX if i == 0 else _FOUNTAIN_CAP_PER_GEN
-                    )
                     if repair_submit_async(
                         mm,
                         nid,
                         now=now,
                         symbols_rx=nack_rx.get(nid),
                         cooldown_s=_FOUNTAIN_CAP_COOLDOWN_S,
-                        send_n=send_n,
+                        send_n=_FOUNTAIN_CAP_PER_GEN,
                     ):
                         queued += 1
                 if targets:
@@ -907,6 +995,7 @@ def run_gen_server(
                         file_size,
                         symbol_size,
                         overhead_pct,
+                        fountain_mode,
                     )
 
             def repair_loop() -> None:
@@ -1030,6 +1119,7 @@ def run_gen_server(
                         at_cap=at_cap,
                         tick_n=fountain_tick_n,
                         storm_active=storm_active,
+                        fountain_mode=fountain_mode,
                     ):
                         fountain_send_tick(
                             mm,
@@ -1066,13 +1156,14 @@ def run_gen_server(
                     send_batch(wires)
                     if bootstrap:
                         repair_extra[gen_id] = bootstrap
-                    if stressed:
+                    if fountain_mode or stressed:
                         with fountain_lock:
                             track_fountain_gen(
                                 fountain_gens,
                                 gen_id,
                                 next_needed,
                                 at_cap=at_cap,
+                                fountain_mode=fountain_mode,
                             )
                     gens_sent += 1
                     bytes_sent_payload += source_bytes
@@ -1108,7 +1199,9 @@ def run_gen_server(
                         if repair_storm_detected(repair_rate, fount_n):
                             storm_state["until"] = now + _REPAIR_STORM_BACKOFF_S
                         storm_flag = "storm" if now < storm_state["until"] else (
-                            "stress" if stressed else "clean"
+                            "fountain" if fountain_mode else (
+                                "stress" if stressed else "clean"
+                            )
                         )
                         print(
                             f"progress {gen_id}/{total_gens} "
@@ -1218,7 +1311,7 @@ def run_gen_client(
     require_raptorq()
     symbol_size = meta.gen_symbol_size or meta.payload_size or 1350
     gen_k = meta.gen_k or 48
-    overhead_pct = meta.gen_overhead_pct or 8
+    overhead_pct = meta.gen_overhead_pct
     block_bytes = gen_k * symbol_size
     file_size = meta.file_size
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0

@@ -45,7 +45,7 @@ def test_repair_count():
     assert repair_count(48, 8) == 4
     assert repair_count(10, 8) >= 1
     assert repair_count(48, 0) == 0
-    assert blast_repair_budget(48, 0) == repair_count(48, 4)
+    assert blast_repair_budget(48, 0) == 0
     assert blast_repair_budget(48, 8) == repair_count(48, 8)
 
 

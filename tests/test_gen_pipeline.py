@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tetrys_nc.gen_raptor import GenEncoder, blast_repair_budget, require_raptorq
+from tetrys_nc.gen_raptor import GenEncoder, blast_repair_budget, fountain_blast_budget, require_raptorq
 from tetrys_nc.gen_xfer import (
     _FOUNTAIN_CAP_GENS,
     _FOUNTAIN_EVERY_N,
@@ -17,10 +17,15 @@ from tetrys_nc.gen_xfer import (
     _REPAIR_META_KEEP,
     _encode_gen_worker,
     cap_fountain_gens,
+    cap_fountain_send,
+    fountain_gen_budget,
+    fountain_redundancy,
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
+    repair_round_size,
     repair_storm_detected,
+    seed_fountain_window,
     should_fountain_tick,
     should_track_fountain_gen,
     track_fountain_gen,
@@ -44,6 +49,22 @@ def test_should_fountain_tick_skips_clean_path():
     for tick in range(20):
         assert not should_fountain_tick(stressed=False, at_cap=False, tick_n=tick)
         assert not should_fountain_tick(stressed=False, at_cap=True, tick_n=tick)
+
+
+def test_should_fountain_tick_fountain_mode():
+    for tick in range(8):
+        assert should_fountain_tick(
+            stressed=False,
+            at_cap=True,
+            tick_n=tick,
+            fountain_mode=True,
+        )
+        assert not should_fountain_tick(
+            stressed=False,
+            at_cap=False,
+            tick_n=tick,
+            fountain_mode=True,
+        )
 
 
 def test_should_fountain_tick_stressed_throttles_off_cap():
@@ -97,6 +118,34 @@ def test_should_track_fountain_gen_clean_vs_cap():
     assert should_track_fountain_gen(103, 100, at_cap=False)
     assert should_track_fountain_gen(140, 100, at_cap=True)
     assert not should_track_fountain_gen(200, 100, at_cap=True)
+
+
+def test_should_track_fountain_gen_fountain_mode():
+    assert not should_track_fountain_gen(140, 100, at_cap=False, fountain_mode=True)
+    assert should_track_fountain_gen(140, 100, at_cap=True, fountain_mode=True)
+
+
+def test_cap_fountain_send_budget_and_deficit():
+    k = 192
+    budget = fountain_gen_budget(k)
+    assert budget == repair_round_size(k, 0)
+    assert cap_fountain_send(k, 0, budget, None) == budget
+    assert cap_fountain_send(k, budget, budget, None) == 0
+    assert cap_fountain_send(k, budget, 8, 100) > 0
+
+
+def test_seed_fountain_window_populates_inflight():
+    s: set[int] = set()
+    seed_fountain_window(s, next_needed=10, sent_before=80, window=48)
+    assert 10 in s and 57 in s
+    assert 58 not in s
+    assert len(s) == 48
+
+
+def test_fountain_redundancy_and_repair_round():
+    assert fountain_redundancy(0)
+    assert not fountain_redundancy(8)
+    assert repair_round_size(192, 0) == repair_round_size(192, 8)
 
 
 def test_track_fountain_gen_respects_cap():
@@ -193,6 +242,29 @@ def test_encode_worker_bootstrap_in_initial_blast(tmp_path: Path):
     esis = {p.esi for p in parsed}
     assert len(esis) == len(wires)
     assert max(esis) >= K + bootstrap - 1
+
+
+def test_encode_worker_fountain_mode_bootstrap(tmp_path: Path):
+    require_raptorq()
+    T = 1350
+    K = 48
+    block = K * T
+    path = tmp_path / "block0.bin"
+    path.write_bytes(bytes((i * 11) & 0xFF for i in range(block)))
+
+    _enc_cpu_s, src_bytes, wires, bootstrap = _encode_gen_worker(
+        str(path),
+        0,
+        block,
+        block,
+        T,
+        0,
+        True,
+    )
+    assert src_bytes == block
+    assert bootstrap == fountain_blast_budget(K, 8)
+    assert bootstrap > 0
+    assert len(wires) >= K + bootstrap
 
 
 def test_encode_worker_process_pool_parallel(tmp_path: Path):

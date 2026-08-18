@@ -48,8 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--gen-overhead",
         type=int,
-        default=8,
-        help="RaptorQ repair overhead percent (default 8)",
+        default=0,
+        help="RaptorQ repair overhead percent in blast (0=fountain-only; default 0)",
     )
     p.add_argument(
         "--no-cc",
