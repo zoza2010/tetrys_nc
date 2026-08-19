@@ -27,6 +27,7 @@ from tetrys_nc.gen_xfer import (
     should_fountain_tick,
     should_track_fountain_gen,
     track_fountain_gen,
+    update_adaptive_pace_bps,
 )
 from tetrys_nc.packets import GenPacket
 
@@ -47,6 +48,47 @@ def test_should_fountain_tick_skips_clean_path():
     for tick in range(20):
         assert not should_fountain_tick(stressed=False, at_cap=False, tick_n=tick)
         assert not should_fountain_tick(stressed=False, at_cap=True, tick_n=tick)
+
+
+def test_update_adaptive_pace_backoff_only():
+    max_bps = 100_000_000.0
+    # Healthy delivery: stay at max.
+    bps, streak, bad = update_adaptive_pace_bps(
+        delivery_bps=95_000_000.0,
+        cur_bps=max_bps,
+        max_bps=max_bps,
+        good_streak=0,
+    )
+    assert bps == max_bps
+    assert streak == 1
+    assert bad == 0
+    # One lagging sample: hold pace (bad streak not reached).
+    bps, streak, bad = update_adaptive_pace_bps(
+        delivery_bps=20_000_000.0,
+        cur_bps=max_bps,
+        max_bps=max_bps,
+        good_streak=0,
+    )
+    assert bps == max_bps
+    assert bad == 1
+    # Sustained lag: back off.
+    bps, streak, bad = update_adaptive_pace_bps(
+        delivery_bps=20_000_000.0,
+        cur_bps=max_bps,
+        max_bps=max_bps,
+        good_streak=0,
+        bad_streak=2,
+    )
+    assert bps < max_bps
+    assert bad == 0
+    # Recovery ramps toward max after good samples.
+    bps, streak, bad = update_adaptive_pace_bps(
+        delivery_bps=95_000_000.0,
+        cur_bps=50_000_000.0,
+        max_bps=max_bps,
+        good_streak=2,
+    )
+    assert bps == max_bps
 
 
 def test_should_fountain_tick_fountain_mode():

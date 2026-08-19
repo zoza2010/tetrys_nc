@@ -101,6 +101,14 @@ _REPAIR_STORM_PKTS_S = 25_000
 _REPAIR_STORM_BACKOFF_S = 0.75
 # Bound repair_extra / cooldown dicts (one int/float per gen touched by repair).
 _REPAIR_META_KEEP = 256
+# Delivery-rate pacing: only back off when client goodput lags wire pace.
+_ADAPT_PACE_MIN_FRAC = 0.10
+_ADAPT_PACE_BACKOFF_FRAC = 0.82  # delivery < pace×this → slow down
+_ADAPT_PACE_RECOVER_FRAC = 0.92  # delivery ≥ pace×this → ease toward --rate
+_ADAPT_PACE_RECOVER_STEP = 1.12
+_ADAPT_PACE_GOOD_SNAP = 3  # consecutive good samples before full --rate
+_ADAPT_PACE_WARMUP_S = 6.0  # ignore bursty early decode after ramp
+_ADAPT_PACE_BAD_SNAP = 3  # consecutive lagging samples before backoff
 
 
 def fountain_redundancy(overhead_pct: int) -> bool:
@@ -151,6 +159,37 @@ def pipeline_stressed(
     return incomplete >= int(inflight_gen_limit * _PIPELINE_INFLIGHT_FRAC) or (
         lag > _PIPELINE_LAG_GENS
     )
+
+
+def update_adaptive_pace_bps(
+    *,
+    delivery_bps: float,
+    cur_bps: float,
+    max_bps: float,
+    good_streak: int,
+    bad_streak: int = 0,
+    min_frac: float = _ADAPT_PACE_MIN_FRAC,
+    backoff_frac: float = _ADAPT_PACE_BACKOFF_FRAC,
+    recover_frac: float = _ADAPT_PACE_RECOVER_FRAC,
+    recover_step: float = _ADAPT_PACE_RECOVER_STEP,
+    good_snap: int = _ADAPT_PACE_GOOD_SNAP,
+) -> tuple[float, int, int]:
+    """Backoff-only pacing: hold --rate unless delivery clearly lags."""
+    floor = max_bps * min_frac
+    if delivery_bps < cur_bps * backoff_frac:
+        bad_streak += 1
+        if bad_streak >= _ADAPT_PACE_BAD_SNAP:
+            return max(floor, delivery_bps * 1.08), 0, 0
+        return cur_bps, 0, bad_streak
+    bad_streak = 0
+    if delivery_bps >= max_bps * recover_frac:
+        streak = good_streak + 1
+        if streak >= good_snap:
+            return max_bps, 0, 0
+        if cur_bps < max_bps:
+            return min(max_bps, cur_bps * recover_step), streak, 0
+        return cur_bps, streak, 0
+    return cur_bps, good_streak, 0
 
 
 def should_fountain_tick(
@@ -468,6 +507,7 @@ def run_gen_server(
         _MIN_INFLIGHT_GENS,
         _MAX_INFLIGHT_BYTES // block_bytes,
     )
+    adapt_pace = os.environ.get("TETRYS_ADAPT_PACE", "").lower() in ("1", "true", "yes")
     digest = "" if skip_hash else _file_sha256(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -487,6 +527,7 @@ def run_gen_server(
         f"{'(fountain redundancy) ' if fountain_mode else ''}"
         f"cc=off "
         f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
+        f"adapt_pace={'on' if adapt_pace else 'off'} "
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
@@ -529,10 +570,18 @@ def run_gen_server(
     limiter = RateLimiter(
         max_bps,
         start_bps=1.0 if ramp_s > 0 else max_bps,
-        min_frac=0.90,
+        min_frac=_ADAPT_PACE_MIN_FRAC if adapt_pace else 0.90,
     )
     t_ramp0 = time.monotonic()
     last_meta_ts = t_ramp0
+    pace_state = {
+        "bps": max_bps,
+        "last_completed": -1,
+        "last_ts": t_ramp0,
+        "good_streak": 0,
+        "bad_streak": 0,
+    }
+    pace_lock = threading.Lock()
     if ramp_s > 0:
         print(f"pace ramp {ramp_s:.1f}s 0→{max_bps / (1024 * 1024):.1f} MiB/s")
 
@@ -570,16 +619,40 @@ def run_gen_server(
                 except ValueError:
                     continue
                 if isinstance(pkt, GenFeedbackPacket):
+                    now = time.monotonic()
+                    completed = pkt.completed_gens
                     with fb_lock:
                         fb_state["next_needed"] = pkt.next_needed_gen
-                        fb_state["completed"] = pkt.completed_gens
+                        fb_state["completed"] = completed
                         fb_state["nacks"] = list(pkt.nack_gens)
                         counts = pkt.nack_rx_counts or []
                         fb_state["nack_rx"] = dict(zip(pkt.nack_gens, counts))
                         fb_state["hol_miss_esi"] = list(pkt.hol_miss_esi or [])
                         fb_state["echo"] = pkt.echo_ts_us
-                        if pkt.completed_gens >= total_gens and total_gens > 0:
+                        if completed >= total_gens and total_gens > 0:
                             fb_state["done"] = True
+                    if adapt_pace and (now - t_ramp0) >= ramp_s + _ADAPT_PACE_WARMUP_S:
+                        with pace_lock:
+                            last_c = pace_state["last_completed"]
+                            last_ts = pace_state["last_ts"]
+                            cur = pace_state["bps"]
+                            if last_c >= 0 and completed > last_c:
+                                dt = now - last_ts
+                                if dt >= 0.12:
+                                    delivery_bps = (completed - last_c) * block_bytes / dt
+                                    cur, streak, bad = update_adaptive_pace_bps(
+                                        delivery_bps=delivery_bps,
+                                        cur_bps=cur,
+                                        max_bps=max_bps,
+                                        good_streak=pace_state["good_streak"],
+                                        bad_streak=pace_state["bad_streak"],
+                                    )
+                                    pace_state["bps"] = cur
+                                    pace_state["good_streak"] = streak
+                                    pace_state["bad_streak"] = bad
+                            pace_state["last_completed"] = completed
+                            pace_state["last_ts"] = now
+                            limiter.set_rate(pace_state["bps"])
                 elif isinstance(pkt, FinPacket):
                     with fb_lock:
                         fb_state["done"] = True
@@ -596,7 +669,11 @@ def run_gen_server(
                 frac = (elapsed / ramp_s) ** 2
                 limiter.set_rate(max(1.0, max_bps * frac))
                 return
-        limiter.set_rate(max_bps)
+        if adapt_pace:
+            with pace_lock:
+                limiter.set_rate(pace_state["bps"])
+        else:
+            limiter.set_rate(max_bps)
 
     def send_batch(wires: list[bytes], *, repair: bool = False) -> None:
         nonlocal send_s, pace_s, wire_bytes, blast_pkts, repair_pkts_w
@@ -1188,6 +1265,14 @@ def run_gen_server(
                             fount_n = len(fountain_gens)
                         if repair_storm_detected(repair_rate, fount_n):
                             storm_state["until"] = now + _REPAIR_STORM_BACKOFF_S
+                            if adapt_pace:
+                                with pace_lock:
+                                    floor = max_bps * _ADAPT_PACE_MIN_FRAC
+                                    pace_state["bps"] = max(
+                                        floor, pace_state["bps"] * 0.70
+                                    )
+                                    pace_state["good_streak"] = 0
+                                    limiter.set_rate(pace_state["bps"])
                         storm_flag = "storm" if now < storm_state["until"] else (
                             "fountain" if fountain_mode else (
                                 "stress" if stressed else "clean"
