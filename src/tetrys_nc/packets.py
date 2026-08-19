@@ -19,6 +19,7 @@ PKT_GEN_FB = 0x21  # generation feedback / NACK
 GEN_HDR_SIZE = 16
 FLAG_META_XFER = 0x08  # META always carries gen params trailer
 FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
+FLAG_FB_HOL_MISS = 0x02  # trailing uint8 + uint16 source ESIs for next_needed
 XFER_GEN = 1
 
 _HDR = struct.Struct("!BBBB")
@@ -71,11 +72,14 @@ class GenFeedbackPacket:
     completed_gens: int = 0
     # Aligned with nack_gens. 0 means no symbols received / no decoder yet.
     nack_rx_counts: list[int] | None = None
+    # Missing systematic source ESIs for next_needed_gen (sparse retransmit).
+    hol_miss_esi: list[int] | None = None
 
     def pack(self) -> bytes:
         nacks = self.nack_gens[:64]
         counts = (self.nack_rx_counts or [])[: len(nacks)]
         with_counts = len(counts) == len(nacks)
+        hol = self.hol_miss_esi or []
         body = struct.pack(
             "!IIH",
             self.next_needed_gen & 0xFFFFFFFF,
@@ -88,8 +92,14 @@ class GenFeedbackPacket:
         else:
             for g in nacks:
                 body += struct.pack("!I", g & 0xFFFFFFFF)
+        if hol:
+            body += struct.pack("!B", min(32, len(hol)))
+            for esi in hol[:32]:
+                body += struct.pack("!H", esi & 0xFFFF)
         body += struct.pack("!I", self.echo_ts_us & 0xFFFFFFFF)
-        flags = FLAG_FB_RX_COUNTS if with_counts else 0
+        flags = (FLAG_FB_RX_COUNTS if with_counts else 0) | (
+            FLAG_FB_HOL_MISS if hol else 0
+        )
         return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, flags) + body
 
     @classmethod
@@ -101,6 +111,7 @@ class GenFeedbackPacket:
         nacks: list[int] = []
         counts: list[int] = []
         with_counts = bool(data[3] & FLAG_FB_RX_COUNTS)
+        with_hol = bool(data[3] & FLAG_FB_HOL_MISS)
         item_size = 6 if with_counts else 4
         if len(data) < off + n * item_size:
             raise ValueError("gen feedback NACK list truncated")
@@ -112,8 +123,26 @@ class GenFeedbackPacket:
             else:
                 nacks.append(struct.unpack_from("!I", data, off)[0])
             off += item_size
+        hol: list[int] = []
+        if with_hol:
+            if len(data) < off + 1:
+                raise ValueError("gen feedback HOL miss truncated")
+            hol_n = data[off]
+            off += 1
+            if len(data) < off + hol_n * 2:
+                raise ValueError("gen feedback HOL miss list truncated")
+            for _ in range(hol_n):
+                hol.append(struct.unpack_from("!H", data, off)[0])
+                off += 2
         echo = struct.unpack_from("!I", data, off)[0] if len(data) >= off + 4 else 0
-        return cls(next_needed, nacks, echo, completed, counts if with_counts else None)
+        return cls(
+            next_needed,
+            nacks,
+            echo,
+            completed,
+            counts if with_counts else None,
+            hol if hol else None,
+        )
 
 
 @dataclass(slots=True)

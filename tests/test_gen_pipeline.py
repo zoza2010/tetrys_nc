@@ -57,12 +57,17 @@ def test_should_fountain_tick_fountain_mode():
             tick_n=tick,
             fountain_mode=True,
         )
-        assert not should_fountain_tick(
+    off = [
+        should_fountain_tick(
             stressed=False,
             at_cap=False,
-            tick_n=tick,
+            tick_n=n,
             fountain_mode=True,
+            every_n=4,
         )
+        for n in range(8)
+    ]
+    assert off == [True, False, False, False, True, False, False, False]
 
 
 def test_should_fountain_tick_stressed_throttles_off_cap():
@@ -122,7 +127,8 @@ def test_cap_fountain_send_budget_and_deficit():
     k = 192
     budget = repair_round_size(k, 0)
     assert cap_fountain_send(k, 0, budget, None) == budget
-    assert cap_fountain_send(k, budget, budget, None) == 0
+    assert cap_fountain_send(k, budget, budget, None) == 4
+    assert cap_fountain_send(k, k, 8, None) == 0
     assert cap_fountain_send(k, budget, 8, 100) > 0
 
 

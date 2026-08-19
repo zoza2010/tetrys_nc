@@ -126,7 +126,12 @@ def cap_fountain_send(
     """Cap fountain repair to per-gen budget; allow deficit top-up beyond."""
     budget = repair_round_size(gen_k, 0)
     if prior_extra >= budget:
-        if symbols_rx is not None and symbols_rx < gen_k + decode_margin:
+        if symbols_rx is None:
+            if prior_extra >= gen_k:
+                return 0
+            want = send_n if send_n is not None else 2
+            return max(1, min(int(want), 4, round_max))
+        if symbols_rx < gen_k + decode_margin:
             deficit = max(1, gen_k + decode_margin - symbols_rx)
             want = send_n if send_n is not None else deficit
             return max(1, min(int(want), round_max))
@@ -161,7 +166,8 @@ def should_fountain_tick(
     if storm_active:
         return False
     if fountain_mode:
-        return at_cap
+        # 8 MiB / loss-half never hits inflight cap (1035); still need ESI.
+        return at_cap or tick_n % every_n == 0
     return stressed and (at_cap or tick_n % every_n == 0)
 
 
@@ -516,7 +522,7 @@ def run_gen_server(
         gen_k=gen_k,
         gen_overhead_pct=overhead_pct,
     ).pack()
-    for _ in range(3):
+    for _ in range(16):
         sock.sendto(meta, client_addr)
 
     max_bps = max(rate_mbit, 1.0) * 1_000_000 / 8
@@ -526,6 +532,7 @@ def run_gen_server(
         min_frac=0.90,
     )
     t_ramp0 = time.monotonic()
+    last_meta_ts = t_ramp0
     if ramp_s > 0:
         print(f"pace ramp {ramp_s:.1f}s 0→{max_bps / (1024 * 1024):.1f} MiB/s")
 
@@ -541,6 +548,7 @@ def run_gen_server(
         "completed": 0,
         "nacks": [],
         "nack_rx": {},
+        "hol_miss_esi": [],
         "echo": 0,
         "done": False,
     }
@@ -568,6 +576,7 @@ def run_gen_server(
                         fb_state["nacks"] = list(pkt.nack_gens)
                         counts = pkt.nack_rx_counts or []
                         fb_state["nack_rx"] = dict(zip(pkt.nack_gens, counts))
+                        fb_state["hol_miss_esi"] = list(pkt.hol_miss_esi or [])
                         fb_state["echo"] = pkt.echo_ts_us
                         if pkt.completed_gens >= total_gens and total_gens > 0:
                             fb_state["done"] = True
@@ -650,10 +659,24 @@ def run_gen_server(
         symbols_rx: int | None = None,
         cooldown_s: float = _REPAIR_COOLDOWN_S,
         send_n: int | None = None,
+        source_esis: list[int] | None = None,
     ) -> list[bytes]:
         """Sync repair encode (repair thread fallback)."""
         if (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
             return []
+        if source_esis:
+            enc = get_or_make_encoder(mm, nid)
+            if enc is not None:
+                pkts = enc.packets()
+                ts_us = int(now * 1_000_000) & 0xFFFFFFFF
+                wires = [
+                    GenPacket(nid, esi, pkts[esi], ts_us).pack()
+                    for esi in source_esis[:16]
+                    if 0 <= esi < len(pkts)
+                ]
+                if wires:
+                    last_repair_ts[nid] = now
+                    return wires
         if (
             symbols_rx is not None
             and symbols_rx >= gen_k + _DECODE_MARGIN
@@ -723,6 +746,7 @@ def run_gen_server(
         now: float,
         limit: int,
         sent_before: int,
+        hol_miss_esi: list[int] | None = None,
     ) -> list[bytes]:
         ordered = sorted(
             (g for g in nacks if 0 <= g < sent_before),
@@ -730,7 +754,16 @@ def run_gen_server(
         )[:limit]
         wires: list[bytes] = []
         for nid in ordered:
-            wires.extend(repair_one(mm, nid, now=now, symbols_rx=nack_rx.get(nid)))
+            miss = hol_miss_esi if nid == next_needed else None
+            wires.extend(
+                repair_one(
+                    mm,
+                    nid,
+                    now=now,
+                    symbols_rx=nack_rx.get(nid),
+                    source_esis=miss,
+                )
+            )
         if ordered:
             prune_encoders(set(ordered))
         return wires
@@ -963,6 +996,7 @@ def run_gen_server(
                         nack_rx = dict(fb_state["nack_rx"])
                         next_needed = int(fb_state["next_needed"])
                         completed = int(fb_state["completed"])
+                        hol_miss = list(fb_state.get("hol_miss_esi") or [])
                     gid = cursor["gen_id"]
                     if gid <= 0:
                         time.sleep(0.005)
@@ -986,10 +1020,13 @@ def run_gen_server(
                             next_needed,
                             now=now,
                             symbols_rx=nack_rx.get(next_needed),
+                            source_esis=hol_miss or None,
                         )
                         if extra:
                             last_full_ts[next_needed] = now
                             wires.extend(extra)
+                    if not nacks and 0 <= next_needed < gid:
+                        nacks = [next_needed]
                     repair_limit = 1 if storm_active else (
                         _REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN
                     )
@@ -1003,6 +1040,7 @@ def run_gen_server(
                                 now=now,
                                 limit=repair_limit,
                                 sent_before=gid,
+                                hol_miss_esi=hol_miss or None,
                             )
                         )
                     if wires:
@@ -1040,6 +1078,9 @@ def run_gen_server(
                         completed = int(fb_state["completed"])
 
                     now = time.monotonic()
+                    if completed <= 0 and (now - last_meta_ts) >= 0.15:
+                        sock.sendto(meta, client_addr)
+                        last_meta_ts = now
                     if ramp_s <= 0 or (now - t_ramp0) >= ramp_s:
                         pace_tick()
                     if next_needed != stuck_nn:
@@ -1192,7 +1233,7 @@ def run_gen_server(
                 repair_sent += drain_repair_futures()
 
                 fin = FinPacket(True, total_gens).pack()
-                for _ in range(3):
+                for _ in range(16):
                     sock.sendto(fin, client_addr)
 
                 drain_deadline = time.monotonic() + 300.0
@@ -1203,10 +1244,14 @@ def run_gen_server(
                         nacks = list(fb_state["nacks"])
                         nack_rx = dict(fb_state["nack_rx"])
                         next_needed = int(fb_state["next_needed"])
+                        hol_miss = list(fb_state.get("hol_miss_esi") or [])
                     if not nacks:
-                        sock.sendto(fin, client_addr)
-                        time.sleep(0.02)
-                        continue
+                        if 0 <= next_needed < total_gens:
+                            nacks = [next_needed]
+                        else:
+                            sock.sendto(fin, client_addr)
+                            time.sleep(0.02)
+                            continue
                     now = time.monotonic()
                     wires = repair_nacks(
                         mm,
@@ -1216,6 +1261,7 @@ def run_gen_server(
                         now=now,
                         limit=24,
                         sent_before=total_gens,
+                        hol_miss_esi=hol_miss or None,
                     )
                     if wires:
                         send_batch(wires, repair=True)
@@ -1351,8 +1397,7 @@ def run_gen_client(
         next_needed = total_gens
         nacks: list[int] = []
         nack_rx: list[int] = []
-        # Cover the server inflight window so repairs are not limited to the
-        # first 64 holes after next_needed.
+        # Cover the server inflight window so repairs are not limited to HOL.
         horizon = 256
         for i in range(total_gens):
             if bit_get(i):
@@ -1365,12 +1410,20 @@ def run_gen_client(
                 nack_rx.append(dec.symbols_rx if dec is not None else 0)
             if len(nacks) >= 64:
                 break
+        hol_miss_esi: list[int] | None = None
+        if next_needed < total_gens:
+            dec = decoders.get(next_needed)
+            if dec is not None and dec.done is None:
+                miss = dec.missing_source_esi(gen_k, limit=24)
+                if miss:
+                    hol_miss_esi = miss
         pkt = GenFeedbackPacket(
             next_needed,
             nacks,
             last_echo,
             completed,
             nack_rx,
+            hol_miss_esi,
         )
         sock.sendto(pkt.pack(), server)
         last_fb = time.monotonic()

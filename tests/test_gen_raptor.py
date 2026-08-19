@@ -135,6 +135,30 @@ def test_gen_feedback_wire():
     assert got.nack_rx_counts == [45, 12, 0]
 
 
+def test_gen_feedback_hol_miss_wire():
+    fb = GenFeedbackPacket(
+        3,
+        [3, 7],
+        echo_ts_us=9,
+        completed_gens=2,
+        nack_rx_counts=[10, 0],
+        hol_miss_esi=[1, 4, 12],
+    )
+    got = GenFeedbackPacket.unpack(fb.pack())
+    assert got.hol_miss_esi == [1, 4, 12]
+
+
+def test_decoder_missing_source_esi():
+    T = 64
+    K = 8
+    data = bytes(range(T)) * K
+    enc = GenEncoder(data, T, overhead_pct=2)
+    dec = GenDecoder(len(data), T)
+    dec.add_packet(enc.packets()[0], esi=0)
+    dec.add_packet(enc.packets()[2], esi=2)
+    assert dec.missing_source_esi(K) == [1, 3, 4, 5, 6, 7]
+
+
 def test_gen_feedback_legacy_without_counts():
     fb = GenFeedbackPacket(2, [2, 5], echo_ts_us=1, completed_gens=1)
     got = GenFeedbackPacket.unpack(fb.pack())

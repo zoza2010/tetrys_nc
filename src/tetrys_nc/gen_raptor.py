@@ -111,3 +111,15 @@ class GenDecoder:
         if out is not None:
             self.done = bytes(out)
         return self.done
+
+    def missing_source_esi(self, source_k: int, *, limit: int = 24) -> list[int]:
+        """Systematic ESIs in [0, source_k) not yet received."""
+        if self.done is not None or source_k <= 0:
+            return []
+        out: list[int] = []
+        for esi in range(source_k):
+            if esi not in self._seen_esi:
+                out.append(esi)
+                if len(out) >= limit:
+                    break
+        return out
