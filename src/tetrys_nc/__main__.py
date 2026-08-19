@@ -12,6 +12,7 @@ def main() -> int:
             "  python -m tetrys_nc server --file PATH [--port 9000] [--gen-k 48]\n"
             "  python -m tetrys_nc client --output PATH [--host HOST --port 9000]\n"
             "  python -m tetrys_nc genfile --output PATH [--size 1G]\n"
+            "  python -m tetrys_nc netem --listen 127.0.0.1:7495 --forward 127.0.0.1:7494 --profile spain\n"
         )
         return 0
     cmd = sys.argv[1]
@@ -28,6 +29,10 @@ def main() -> int:
         from .genfile import main as gen_main
 
         return gen_main(argv)
+    if cmd == "netem":
+        from .netem_udp import main as netem_main
+
+        return netem_main(argv)
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 1
 
