@@ -101,6 +101,10 @@ _REPAIR_STORM_PKTS_S = 25_000
 _REPAIR_STORM_BACKOFF_S = 0.75
 # Bound repair_extra / cooldown dicts (one int/float per gen touched by repair).
 _REPAIR_META_KEEP = 256
+# Per-worker repair encoder cache (incremental ensure_repair, not full rebuild).
+_REPAIR_ENC_CACHE_MAX = 48
+# Client NACK horizon slack beyond byte-bounded inflight window.
+_FEEDBACK_HORIZON_SLACK = 32
 # Delivery-rate pacing: only back off when client goodput lags wire pace.
 _ADAPT_PACE_MIN_FRAC = 0.10
 _ADAPT_PACE_BACKOFF_FRAC = 0.82  # delivery < pace×this → slow down
@@ -109,6 +113,42 @@ _ADAPT_PACE_RECOVER_STEP = 1.12
 _ADAPT_PACE_GOOD_SNAP = 3  # consecutive good samples before full --rate
 _ADAPT_PACE_WARMUP_S = 6.0  # ignore bursty early decode after ramp
 _ADAPT_PACE_BAD_SNAP = 3  # consecutive lagging samples before backoff
+
+
+def compute_inflight_gen_limit(gen_k: int, symbol_size: int) -> int:
+    """Byte-bounded pipeline window in generations (size-independent in bytes)."""
+    block_bytes = max(1, gen_k) * max(64, symbol_size)
+    return max(_MIN_INFLIGHT_GENS, _MAX_INFLIGHT_BYTES // block_bytes)
+
+
+def client_feedback_horizon(inflight_gen_limit: int) -> int:
+    """NACK coverage must match server inflight, not a fixed small constant."""
+    return inflight_gen_limit + _FEEDBACK_HORIZON_SLACK
+
+
+def should_pause_blast(
+    incomplete: int,
+    frontier_lag: int,
+    *,
+    inflight_gen_limit: int,
+) -> bool:
+    """Pause new data when occupancy or frontier lag hits the window."""
+    return incomplete >= inflight_gen_limit or frontier_lag >= inflight_gen_limit
+
+
+def repair_thread_limit(
+    *,
+    at_cap: bool,
+    storm_active: bool,
+    nack_count: int,
+    frontier_lag: int,
+) -> int:
+    """Scale repair parallelism with backlog; storm keeps urgent path only."""
+    if storm_active:
+        return 1
+    base = _REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN
+    backlog = max(nack_count, frontier_lag // 64, 1)
+    return min(16, max(base, backlog // 4))
 
 
 def fountain_redundancy(overhead_pct: int) -> bool:
@@ -388,6 +428,30 @@ def _pct(part: float, wall: float) -> int:
 # Per-worker-process state for blast encoding (initialized lazily).
 _worker_mm: mmap.mmap | None = None
 _worker_path: str | None = None
+_worker_repair_enc: dict[int, GenEncoder] = {}
+_worker_repair_order: list[int] = []
+
+
+def _worker_repair_encoder(
+    gid: int,
+    raw: bytes,
+    symbol_size: int,
+    overhead_pct: int,
+) -> GenEncoder:
+    """LRU GenEncoder per gid so ensure_repair() is incremental across rounds."""
+    enc = _worker_repair_enc.get(gid)
+    if enc is not None:
+        if gid in _worker_repair_order:
+            _worker_repair_order.remove(gid)
+        _worker_repair_order.append(gid)
+        return enc
+    enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=True)
+    _worker_repair_enc[gid] = enc
+    _worker_repair_order.append(gid)
+    while len(_worker_repair_order) > _REPAIR_ENC_CACHE_MAX:
+        drop = _worker_repair_order.pop(0)
+        _worker_repair_enc.pop(drop, None)
+    return enc
 
 
 def _encode_gen_worker(
@@ -457,7 +521,7 @@ def _repair_gen_worker(
     raw = bytes(_worker_mm[off:end])
     if len(raw) < block_bytes:
         raw = raw + b"\x00" * (block_bytes - len(raw))
-    enc = GenEncoder(raw, symbol_size, overhead_pct, systematic_only=True)
+    enc = _worker_repair_encoder(gid, raw, symbol_size, overhead_pct)
     want = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
     target_budget = prior_extra + want
     new_pkts = enc.ensure_repair(target_budget)
@@ -503,10 +567,7 @@ def run_gen_server(
     file_size = file_path.stat().st_size
     block_bytes = max(1, gen_k) * max(64, symbol_size)
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0
-    inflight_gen_limit = max(
-        _MIN_INFLIGHT_GENS,
-        _MAX_INFLIGHT_BYTES // block_bytes,
-    )
+    inflight_gen_limit = compute_inflight_gen_limit(gen_k, symbol_size)
     adapt_pace = os.environ.get("TETRYS_ADAPT_PACE", "").lower() in ("1", "true", "yes")
     digest = "" if skip_hash else _file_sha256(file_path)
 
@@ -748,7 +809,7 @@ def run_gen_server(
                 ts_us = int(now * 1_000_000) & 0xFFFFFFFF
                 wires = [
                     GenPacket(nid, esi, pkts[esi], ts_us).pack()
-                    for esi in source_esis[:16]
+                    for esi in source_esis[:32]
                     if 0 <= esi < len(pkts)
                 ]
                 if wires:
@@ -1015,9 +1076,10 @@ def run_gen_server(
                 nacks: list[int],
                 nack_rx: dict[int, int],
                 sent_before: int,
+                at_cap: bool,
             ) -> int:
                 """Queue async fountain repair; returns number of submits."""
-                if sent_before <= 0 or now < storm_state["until"]:
+                if sent_before <= 0:
                     return 0
                 prune_fountain(next_needed, nack_rx, nacks, sent_before)
                 if not fountain_mode:
@@ -1030,8 +1092,8 @@ def run_gen_server(
                     nacks,
                     nack_rx,
                     gen_k=gen_k,
-                    limit=_FOUNTAIN_CAP_GENS,
-                    frontier_only=True,
+                    limit=_FOUNTAIN_CAP_GENS if not at_cap else _FOUNTAIN_CAP_GENS * 2,
+                    frontier_only=not at_cap,
                 )
                 queued = 0
                 for i, nid in enumerate(targets):
@@ -1104,8 +1166,12 @@ def run_gen_server(
                             wires.extend(extra)
                     if not nacks and 0 <= next_needed < gid:
                         nacks = [next_needed]
-                    repair_limit = 1 if storm_active else (
-                        _REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN
+                    frontier_lag = max(0, gid - next_needed)
+                    repair_limit = repair_thread_limit(
+                        at_cap=at_cap,
+                        storm_active=storm_active,
+                        nack_count=len(nacks),
+                        frontier_lag=frontier_lag,
                     )
                     if not storm_active or nacks:
                         wires.extend(
@@ -1199,10 +1265,15 @@ def run_gen_server(
                             nacks=nacks,
                             nack_rx=nack_rx,
                             sent_before=gen_id,
+                            at_cap=at_cap,
                         )
                     fountain_tick_n += 1
                     repair_sent += drain_repair_futures()
-                    if incomplete >= inflight_gen_limit:
+                    if should_pause_blast(
+                        incomplete,
+                        lag,
+                        inflight_gen_limit=inflight_gen_limit,
+                    ):
                         if repair_q.empty() and not repair_futures:
                             time.sleep(0.001)
                             cap_s += 0.001
@@ -1391,6 +1462,8 @@ def run_gen_client(
     block_bytes = gen_k * symbol_size
     file_size = meta.file_size
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0
+    inflight_gen_limit = compute_inflight_gen_limit(gen_k, symbol_size)
+    feedback_horizon = client_feedback_horizon(inflight_gen_limit)
 
     print(
         f"gen-xfer: gens={total_gens} T={symbol_size} K={gen_k} "
@@ -1412,6 +1485,8 @@ def run_gen_client(
     decoders: dict[int, GenDecoder] = {}
     done_bits = bytearray((total_gens + 7) // 8) if total_gens else bytearray()
     completed = 0
+    next_needed_hint = 0
+    max_gid_seen = -1
     gens_recovered = 0
     last_echo = 0
     fin_seen = False
@@ -1441,11 +1516,14 @@ def run_gen_client(
         return bool(done_bits[i >> 3] & (1 << (i & 7)))
 
     def bit_set(i: int) -> None:
-        nonlocal completed
+        nonlocal completed, next_needed_hint
         if i < 0 or i >= total_gens or bit_get(i):
             return
         done_bits[i >> 3] |= 1 << (i & 7)
         completed += 1
+        if i == next_needed_hint:
+            while next_needed_hint < total_gens and bit_get(next_needed_hint):
+                next_needed_hint += 1
 
     def pwrite_one(off: int, data: bytes) -> None:
         nonlocal bytes_written, write_s
@@ -1479,27 +1557,37 @@ def run_gen_client(
 
     def send_fb() -> None:
         nonlocal last_fb
-        next_needed = total_gens
+        next_needed = next_needed_hint
         nacks: list[int] = []
         nack_rx: list[int] = []
-        # Cover the server inflight window so repairs are not limited to HOL.
-        horizon = 256
-        for i in range(total_gens):
+        seen: set[int] = set()
+        hi = min(total_gens, next_needed + feedback_horizon + 1)
+        for i in range(next_needed, hi):
             if bit_get(i):
                 continue
-            if next_needed == total_gens:
-                next_needed = i
-            if i <= next_needed + horizon or i in decoders:
-                nacks.append(i)
-                dec = decoders.get(i)
-                nack_rx.append(dec.symbols_rx if dec is not None else 0)
+            if i not in decoders and i > max_gid_seen:
+                continue
+            nacks.append(i)
+            seen.add(i)
+            dec = decoders.get(i)
+            nack_rx.append(dec.symbols_rx if dec is not None else 0)
             if len(nacks) >= 64:
                 break
+        if len(nacks) < 64:
+            for i in sorted(decoders):
+                if i in seen or bit_get(i):
+                    continue
+                nacks.append(i)
+                seen.add(i)
+                dec = decoders[i]
+                nack_rx.append(dec.symbols_rx)
+                if len(nacks) >= 64:
+                    break
         hol_miss_esi: list[int] | None = None
         if next_needed < total_gens:
             dec = decoders.get(next_needed)
             if dec is not None and dec.done is None:
-                miss = dec.missing_source_esi(gen_k, limit=24)
+                miss = dec.missing_source_esi(gen_k, limit=32)
                 if miss:
                     hol_miss_esi = miss
         pkt = GenFeedbackPacket(
@@ -1555,6 +1643,7 @@ def run_gen_client(
                         rx_bytes += len(data)
                         last_echo = gp.send_ts_us
                         gid = gp.gen_id
+                        max_gid_seen = max(max_gid_seen, gid)
                         if bit_get(gid):
                             skip_done += 1
                             continue

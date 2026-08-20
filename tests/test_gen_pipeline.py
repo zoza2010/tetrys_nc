@@ -18,18 +18,45 @@ from tetrys_nc.gen_xfer import (
     _encode_gen_worker,
     cap_fountain_gens,
     cap_fountain_send,
+    client_feedback_horizon,
+    compute_inflight_gen_limit,
     fountain_redundancy,
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
     repair_round_size,
     repair_storm_detected,
+    repair_thread_limit,
     should_fountain_tick,
+    should_pause_blast,
     should_track_fountain_gen,
     track_fountain_gen,
     update_adaptive_pace_bps,
 )
 from tetrys_nc.packets import GenPacket
+
+
+def test_compute_inflight_and_feedback_horizon():
+    assert compute_inflight_gen_limit(48, 1350) == 1035
+    assert compute_inflight_gen_limit(192, 1350) == 258
+    assert client_feedback_horizon(1035) >= 1035
+
+
+def test_should_pause_blast_occupancy_and_lag():
+    cap = 1035
+    assert not should_pause_blast(100, 200, inflight_gen_limit=cap)
+    assert should_pause_blast(cap, 10, inflight_gen_limit=cap)
+    assert should_pause_blast(10, cap, inflight_gen_limit=cap)
+
+
+def test_repair_thread_limit_scales_with_backlog():
+    assert repair_thread_limit(
+        at_cap=True, storm_active=True, nack_count=64, frontier_lag=900
+    ) == 1
+    lim = repair_thread_limit(
+        at_cap=True, storm_active=False, nack_count=64, frontier_lag=900
+    )
+    assert lim >= 8
 
 
 def test_pipeline_stressed_clean_vs_pressure():
