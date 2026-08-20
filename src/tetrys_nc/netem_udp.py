@@ -50,6 +50,10 @@ class PathSpec:
     dup_p: float = 0.0
     delay_up_s: float | None = None
     loss_up: float | None = None
+    # Long-transfer skew: good path early, degraded later (hits 2G harder than 1G).
+    phase2_start_s: float = 0.0
+    phase2_loss: float | None = None
+    phase2_rate_mbit: float | None = None
 
 
 PROFILES: dict[str, PathSpec] = {
@@ -118,12 +122,66 @@ PROFILES: dict[str, PathSpec] = {
         seed=4,
     ),
     # wan5: 84.1 MiB/s, wire avg 98 max 106, repair ~3.4k
-        "wan-fast": PathSpec(
+    "wan-fast": PathSpec(
         delay_s=0.042,
         jitter_s=0.004,
         loss=0.010,
         rate_mbit=1000.0,
         seed=5,
+    ),
+    # Long WAN: ~35s good (1G @ ~30 MiB/s mostly clean), then loss+rate dip.
+    # 8–64 MiB finish before phase2; 256M–2G accumulate repair in phase2.
+    "wan-long": PathSpec(
+        delay_s=0.048,
+        jitter_s=0.006,
+        loss=0.015,
+        rate_mbit=850.0,
+        phase2_start_s=36.0,
+        phase2_loss=0.060,
+        phase2_rate_mbit=260.0,
+        seed=6,
+    ),
+    # Same timing + data blackout (HOL hole) like afternoon 2G WAN runs.
+    "wan-long-dip": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.008,
+        loss=0.02,
+        rate_mbit=600.0,
+        blackout_start_s=38.0,
+        blackout_dur_s=2.20,
+        blackout_down=True,
+        blackout_up=False,
+        loss_after=0.14,
+        phase2_start_s=40.0,
+        phase2_loss=0.08,
+        phase2_rate_mbit=200.0,
+        seed=7,
+    ),
+    # Loopback @ ~15 MiB/s: phase2 ~9s hits 64M/256M, 8M still clean.
+    "wan-long-local": PathSpec(
+        delay_s=0.048,
+        jitter_s=0.006,
+        loss=0.015,
+        rate_mbit=850.0,
+        phase2_start_s=9.0,
+        phase2_loss=0.060,
+        phase2_rate_mbit=260.0,
+        seed=8,
+    ),
+    "wan-long-dip-local": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.008,
+        loss=0.02,
+        rate_mbit=600.0,
+        blackout_start_s=10.0,
+        blackout_dur_s=1.80,
+        blackout_down=True,
+        blackout_up=False,
+        loss_after=0.14,
+        phase2_start_s=11.0,
+        phase2_loss=0.08,
+        phase2_rate_mbit=200.0,
+        seed=9,
     ),
     "ack-blackout": PathSpec(
         delay_s=0.050,
@@ -225,11 +283,21 @@ class Direction:
         self.ge_bad = False
         self._tokens = 0.0
         self._last = self.t0
+        bps = self._rate_bps(self.t0)
+        if bps > 0:
+            self._tokens = bps * 0.05
+
+    def _in_phase2(self, now: float) -> bool:
+        spec = self.spec
+        return spec.phase2_start_s > 0 and (now - self.t0) >= spec.phase2_start_s
+
+    def _rate_bps(self, now: float) -> float:
+        spec = self.spec
+        if self._in_phase2(now) and spec.phase2_rate_mbit is not None:
+            return spec.phase2_rate_mbit * 1_000_000 / 8
         if spec.rate_mbit > 0:
-            self._bps = spec.rate_mbit * 1_000_000 / 8
-            self._tokens = self._bps * 0.05
-        else:
-            self._bps = 0.0
+            return spec.rate_mbit * 1_000_000 / 8
+        return 0.0
 
     def _loss_p(self, now: float) -> float:
         spec = self.spec
@@ -258,7 +326,10 @@ class Direction:
             elif self.rng.random() < spec.ge_p_gb:
                 self.ge_bad = True
             return spec.ge_loss_bad if self.ge_bad else spec.ge_loss_good
-        return spec.loss
+        base = spec.loss
+        if self.is_down and self._in_phase2(now) and spec.phase2_loss is not None:
+            base = spec.phase2_loss
+        return base
 
     def decide(self, now: float, nbytes: int) -> float | None:
         """Return delivery deadline, or None to drop (model)."""
@@ -271,13 +342,14 @@ class Direction:
             delay = max(0.0, delay + self.rng.gauss(0.0, self.spec.jitter_s))
         if self.spec.reorder_p > 0 and self.rng.random() < self.spec.reorder_p:
             delay += self.spec.reorder_extra_s
-        if self._bps > 0:
+        bps = self._rate_bps(now)
+        if bps > 0:
             elapsed = max(0.0, now - self._last)
             self._last = now
-            self._tokens = min(self._bps * 0.25, self._tokens + elapsed * self._bps)
+            self._tokens = min(bps * 0.25, self._tokens + elapsed * bps)
             need = float(nbytes)
             if self._tokens < need:
-                extra = (need - self._tokens) / self._bps
+                extra = (need - self._tokens) / bps
                 delay += extra
                 self._tokens = 0.0
             else:
@@ -413,6 +485,9 @@ def spec_from_args(args: argparse.Namespace) -> PathSpec:
         dup_p=base.dup_p,
         delay_up_s=base.delay_up_s,
         loss_up=base.loss_up,
+        phase2_start_s=base.phase2_start_s,
+        phase2_loss=base.phase2_loss,
+        phase2_rate_mbit=base.phase2_rate_mbit,
     )
 
 
