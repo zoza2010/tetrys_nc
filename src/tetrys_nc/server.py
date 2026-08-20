@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes up from ~18%%",
+        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes up from 150 Mbit",
     )
     p.add_argument(
         "--ramp-s",
@@ -42,8 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--gen-k",
         type=int,
-        default=192,
-        help="symbols per generation (~K; default 192)",
+        default=None,
+        help="symbols per generation (~K; WAN default 96, LAN default 192)",
     )
     p.add_argument(
         "--gen-overhead",
@@ -65,13 +65,14 @@ def main(argv: list[str] | None = None) -> int:
         overhead_pct = 10
     else:
         overhead_pct = 0
+    gen_k = args.gen_k if args.gen_k is not None else (96 if args.wan else 192)
 
     return run_gen_server(
         args.host,
         args.port,
         args.file,
         symbol_size=symbol,
-        gen_k=args.gen_k,
+        gen_k=gen_k,
         overhead_pct=overhead_pct,
         rate_mbit=rate,
         ramp_s=args.ramp_s,

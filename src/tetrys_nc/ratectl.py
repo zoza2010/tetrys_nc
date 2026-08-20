@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import time
+
+
+def _oversleep_credit() -> float:
+    try:
+        v = float(os.environ.get("TETRYS_PACE_OVERSLEEP", "0") or "0")
+    except ValueError:
+        return 0.0
+    return min(1.0, max(0.0, v))
 
 
 class RateLimiter:
@@ -32,6 +41,7 @@ class RateLimiter:
         self.burst = burst if burst is not None else max(self.rate * self._burst_s, 256_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
+        self.oversleep_credit = _oversleep_credit()
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
@@ -53,8 +63,16 @@ class RateLimiter:
             # Cap single sleep — prefer short yields over multi-second stalls.
             if sleep_s > 0.05:
                 sleep_s = 0.05
+            t_sleep = time.monotonic()
             time.sleep(sleep_s)
-            self.updated = time.monotonic()
-            self.tokens = 0.0
+            now2 = time.monotonic()
+            self.updated = now2
+            overslept = now2 - t_sleep - sleep_s
+            if overslept > 0 and self.oversleep_credit > 0:
+                self.tokens = min(
+                    self.burst, overslept * self.rate * self.oversleep_credit
+                )
+            else:
+                self.tokens = 0.0
             return sleep_s
         return 0.0

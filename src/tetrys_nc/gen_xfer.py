@@ -73,7 +73,9 @@ _STUCK_REPAIR_COOLDOWN_S = 0.25
 # RaptorQ normally decodes near K; add a small rank margin and enough surplus
 # for loss of the repair packets themselves.
 _DECODE_MARGIN = 2
-_REPAIR_SURPLUS = 0.25
+_REPAIR_SURPLUS = max(
+    0.0, min(1.0, float(os.environ.get("TETRYS_REPAIR_SURPLUS", "0.25")))
+)
 # Bound incomplete source data rather than generation count so larger K does
 # not recreate an unbounded repair tail. This is well above the path BDP.
 _MAX_INFLIGHT_BYTES = 64 * 1024 * 1024
@@ -128,9 +130,10 @@ _ADAPT_PACE_GOOD_SNAP = 3  # consecutive good samples before full --rate
 _ADAPT_PACE_WARMUP_S = 6.0  # ignore bursty early decode after ramp
 _ADAPT_PACE_BAD_SNAP = 3  # consecutive lagging samples before backoff
 # Delay-based pacing from echoed send timestamps (same clock → RTT).
-# Start at an absolute low rate so a high configured ceiling is safe on a slow
-# network. Confirm several clean samples before each probe step.
-_DELAY_CC_START_MBIT = 12.0
+# Start well below the --rate ceiling and climb only on confirmed clean RTT.
+# 150 Mbit is high enough that 1–2 GiB transfers are not dominated by the
+# probe, and still 6× below the WAN 900 Mbit cap.
+_DELAY_CC_START_MBIT = 150.0
 _DELAY_CC_MIN_FRAC = 0.005
 _DELAY_CC_TARGET_QUEUE_MIN_S = 0.006
 _DELAY_CC_TARGET_QUEUE_RTT_FRAC = 0.25
@@ -139,10 +142,10 @@ _DELAY_CC_HIGH_QUEUE_RTT_FRAC = 0.50
 _DELAY_CC_DOWN = 0.92
 _DELAY_CC_DOWN_HARD = 0.82
 _DELAY_CC_UP = 1.08
-_DELAY_CC_UP_PROBE = 1.25
+_DELAY_CC_UP_PROBE = 1.40
 _DELAY_CC_WARMUP_S = 0.5
 _DELAY_CC_UPDATE_S = 0.10
-_DELAY_CC_CLEAN_SAMPLES = 3
+_DELAY_CC_CLEAN_SAMPLES = 2
 _DELAY_CC_CONGESTION_SAMPLES = 3
 _DELAY_CC_BACKOFF_HOLD_S = 0.8
 # Two seconds supports long-distance links but rejects old feedback after stalls.
@@ -834,6 +837,35 @@ def run_gen_server(
         "false",
         "no",
     ) and overhead_pct > 0
+    server_synth_nack = os.environ.get("TETRYS_SERVER_SYNTH_NACK", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    try:
+        delay_start_mbit = float(
+            os.environ.get("TETRYS_DELAY_START_MBIT", str(_DELAY_CC_START_MBIT))
+            or str(_DELAY_CC_START_MBIT)
+        )
+    except ValueError:
+        delay_start_mbit = _DELAY_CC_START_MBIT
+    delay_start_mbit = min(rate_mbit, max(1.0, delay_start_mbit))
+    try:
+        delay_up_probe = float(
+            os.environ.get("TETRYS_DELAY_UP", str(_DELAY_CC_UP_PROBE))
+            or str(_DELAY_CC_UP_PROBE)
+        )
+    except ValueError:
+        delay_up_probe = _DELAY_CC_UP_PROBE
+    delay_up_probe = min(2.0, max(1.01, delay_up_probe))
+    try:
+        delay_clean_n = int(
+            os.environ.get("TETRYS_DELAY_CLEAN", str(_DELAY_CC_CLEAN_SAMPLES))
+            or str(_DELAY_CC_CLEAN_SAMPLES)
+        )
+    except ValueError:
+        delay_clean_n = _DELAY_CC_CLEAN_SAMPLES
+    delay_clean_n = min(8, max(1, delay_clean_n))
     digest = "" if skip_hash else _file_sha256(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -856,6 +888,7 @@ def run_gen_server(
         f"adapt_pace={'on' if adapt_pace else 'off'} "
         f"delay_cc={'on' if delay_cc else 'off'} "
         f"adapt_oh={'on' if adapt_overhead else 'off'} "
+        f"synth_nack={'on' if server_synth_nack else 'off'} "
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
@@ -896,7 +929,7 @@ def run_gen_server(
 
     max_bps = max(rate_mbit, 1.0) * 1_000_000 / 8
     if delay_cc:
-        start_bps = min(max_bps, _DELAY_CC_START_MBIT * 1_000_000 / 8)
+        start_bps = min(max_bps, delay_start_mbit * 1_000_000 / 8)
         pace_min_frac = _DELAY_CC_MIN_FRAC
         # Probe owns the climb — skip the time-based ease-in to --rate.
         effective_ramp_s = 0.0
@@ -936,7 +969,8 @@ def run_gen_server(
         print(
             f"delay probe "
             f"{start_bps * 8 / 1_000_000:.0f}→{rate_mbit:.0f} Mbit "
-            f"(fec base {overhead_pct}%, floor {_OH_FLOOR_PCT}%)"
+            f"(fec base {overhead_pct}%, floor {_OH_FLOOR_PCT}%, "
+            f"up={delay_up_probe:.2f} clean={delay_clean_n})"
         )
     elif effective_ramp_s > 0:
         print(
@@ -1055,7 +1089,7 @@ def run_gen_server(
                                 )
                                 probe_ready = (
                                     pace_state["clean_streak"]
-                                    >= _DELAY_CC_CLEAN_SAMPLES
+                                    >= delay_clean_n
                                     and now >= pace_state["hold_until"]
                                 )
                                 if (
@@ -1069,6 +1103,7 @@ def run_gen_server(
                                         min_rtt_s=pace_state["min_rtt_s"],
                                         cur_bps=pace_state["bps"],
                                         max_bps=max_bps,
+                                        up_probe=delay_up_probe,
                                     )
                                     pace_state["bps"] = cur
                                     pace_state["min_rtt_s"] = min_rtt
@@ -1579,7 +1614,7 @@ def run_gen_server(
                         if extra:
                             last_full_ts[next_needed] = now
                             wires.extend(extra)
-                    if not nacks and 0 <= next_needed < gid:
+                    if server_synth_nack and not nacks and 0 <= next_needed < gid:
                         nacks = [next_needed]
                     frontier_lag = max(0, gid - next_needed)
                     repair_limit = repair_thread_limit(
