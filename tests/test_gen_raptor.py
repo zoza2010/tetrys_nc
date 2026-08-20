@@ -15,6 +15,8 @@ from tetrys_nc.packets import (
     GenFeedbackPacket,
     GenPacket,
     MetaPacket,
+    merge_feedback_nacks,
+    miss_bitmap_to_nacks,
     parse_packet,
 )
 
@@ -146,6 +148,23 @@ def test_gen_feedback_hol_miss_wire():
     )
     got = GenFeedbackPacket.unpack(fb.pack())
     assert got.hol_miss_esi == [1, 4, 12]
+
+
+def test_gen_feedback_miss_bitmap_wire():
+    bitmap = bytes([0b00000101, 0b00010000])  # gens 0,2,12 from base 10
+    fb = GenFeedbackPacket(
+        10,
+        [10],
+        echo_ts_us=3,
+        completed_gens=5,
+        nack_rx_counts=[7],
+        miss_bitmap=bitmap,
+    )
+    got = GenFeedbackPacket.unpack(fb.pack())
+    assert got.miss_bitmap == bitmap
+    nacks, rx = merge_feedback_nacks(got)
+    assert 10 in nacks and rx[10] == 7
+    assert miss_bitmap_to_nacks(10, bitmap) == [10, 12, 22]
 
 
 def test_decoder_missing_source_esi():

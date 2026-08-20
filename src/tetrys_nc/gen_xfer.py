@@ -39,11 +39,13 @@ from .packets import (
     PKT_META,
     PKT_READY,
     XFER_GEN,
+    FEEDBACK_BITMAP_MAX_BYTES,
     FinPacket,
     GenFeedbackPacket,
     GenPacket,
     MetaPacket,
     ReadyPacket,
+    merge_feedback_nacks,
     parse_packet,
 )
 from .ratectl import RateLimiter
@@ -124,6 +126,34 @@ def compute_inflight_gen_limit(gen_k: int, symbol_size: int) -> int:
 def client_feedback_horizon(inflight_gen_limit: int) -> int:
     """NACK coverage must match server inflight, not a fixed small constant."""
     return inflight_gen_limit + _FEEDBACK_HORIZON_SLACK
+
+
+def build_feedback_miss_bitmap(
+    *,
+    next_needed: int,
+    total_gens: int,
+    horizon: int,
+    bit_get,
+    decoders: dict[int, object],
+    max_gid_seen: int,
+) -> bytes:
+    """Compact miss map for [next_needed, next_needed+horizon); gap-aware."""
+    if next_needed >= total_gens or horizon <= 0:
+        return b""
+    window = min(horizon + 1, total_gens - next_needed)
+    nbytes = min(FEEDBACK_BITMAP_MAX_BYTES, (window + 7) // 8)
+    if nbytes <= 0:
+        return b""
+    buf = bytearray(nbytes)
+    max_bits = nbytes * 8
+    for off in range(min(window, max_bits)):
+        gid = next_needed + off
+        if bit_get(gid):
+            continue
+        if gid not in decoders and gid > max_gid_seen:
+            continue
+        buf[off >> 3] |= 1 << (off & 7)
+    return bytes(buf)
 
 
 def should_pause_blast(
@@ -682,12 +712,12 @@ def run_gen_server(
                 if isinstance(pkt, GenFeedbackPacket):
                     now = time.monotonic()
                     completed = pkt.completed_gens
+                    nacks, nack_rx = merge_feedback_nacks(pkt)
                     with fb_lock:
                         fb_state["next_needed"] = pkt.next_needed_gen
                         fb_state["completed"] = completed
-                        fb_state["nacks"] = list(pkt.nack_gens)
-                        counts = pkt.nack_rx_counts or []
-                        fb_state["nack_rx"] = dict(zip(pkt.nack_gens, counts))
+                        fb_state["nacks"] = nacks
+                        fb_state["nack_rx"] = nack_rx
                         fb_state["hol_miss_esi"] = list(pkt.hol_miss_esi or [])
                         fb_state["echo"] = pkt.echo_ts_us
                         if completed >= total_gens and total_gens > 0:
@@ -1561,28 +1591,28 @@ def run_gen_client(
         nacks: list[int] = []
         nack_rx: list[int] = []
         seen: set[int] = set()
-        hi = min(total_gens, next_needed + feedback_horizon + 1)
-        for i in range(next_needed, hi):
-            if bit_get(i):
-                continue
-            if i not in decoders and i > max_gid_seen:
+        if next_needed < total_gens:
+            dec = decoders.get(next_needed)
+            if dec is not None and dec.done is None:
+                nacks.append(next_needed)
+                nack_rx.append(dec.symbols_rx)
+                seen.add(next_needed)
+        for i in sorted(decoders):
+            if i in seen or bit_get(i):
                 continue
             nacks.append(i)
+            nack_rx.append(decoders[i].symbols_rx)
             seen.add(i)
-            dec = decoders.get(i)
-            nack_rx.append(dec.symbols_rx if dec is not None else 0)
             if len(nacks) >= 64:
                 break
-        if len(nacks) < 64:
-            for i in sorted(decoders):
-                if i in seen or bit_get(i):
-                    continue
-                nacks.append(i)
-                seen.add(i)
-                dec = decoders[i]
-                nack_rx.append(dec.symbols_rx)
-                if len(nacks) >= 64:
-                    break
+        miss_bitmap = build_feedback_miss_bitmap(
+            next_needed=next_needed,
+            total_gens=total_gens,
+            horizon=feedback_horizon,
+            bit_get=bit_get,
+            decoders=decoders,
+            max_gid_seen=max_gid_seen,
+        )
         hol_miss_esi: list[int] | None = None
         if next_needed < total_gens:
             dec = decoders.get(next_needed)
@@ -1597,6 +1627,7 @@ def run_gen_client(
             completed,
             nack_rx,
             hol_miss_esi,
+            miss_bitmap,
         )
         sock.sendto(pkt.pack(), server)
         last_fb = time.monotonic()

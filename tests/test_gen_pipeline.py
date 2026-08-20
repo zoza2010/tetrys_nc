@@ -16,6 +16,7 @@ from tetrys_nc.gen_xfer import (
     _FOUNTAIN_WINDOW,
     _REPAIR_META_KEEP,
     _encode_gen_worker,
+    build_feedback_miss_bitmap,
     cap_fountain_gens,
     cap_fountain_send,
     client_feedback_horizon,
@@ -33,6 +34,7 @@ from tetrys_nc.gen_xfer import (
     track_fountain_gen,
     update_adaptive_pace_bps,
 )
+from tetrys_nc.packets import miss_bitmap_to_nacks
 from tetrys_nc.packets import GenPacket
 
 
@@ -57,6 +59,28 @@ def test_repair_thread_limit_scales_with_backlog():
         at_cap=True, storm_active=False, nack_count=64, frontier_lag=900
     )
     assert lim >= 8
+
+
+def test_build_feedback_miss_bitmap_gap_aware():
+    done = {0, 1, 3}
+    decoders = {5: object()}
+
+    def bit_get(i: int) -> bool:
+        return i in done
+
+    bitmap = build_feedback_miss_bitmap(
+        next_needed=0,
+        total_gens=20,
+        horizon=16,
+        bit_get=bit_get,
+        decoders=decoders,
+        max_gid_seen=7,
+    )
+    missing = miss_bitmap_to_nacks(0, bitmap)
+    assert 2 in missing  # gap before max_gid_seen
+    assert 5 in missing  # partial decoder
+    assert 6 in missing  # gap before max_gid_seen
+    assert 8 not in missing  # beyond max_gid_seen, still in flight
 
 
 def test_pipeline_stressed_clean_vs_pressure():

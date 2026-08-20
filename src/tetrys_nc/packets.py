@@ -20,6 +20,9 @@ GEN_HDR_SIZE = 16
 FLAG_META_XFER = 0x08  # META always carries gen params trailer
 FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
 FLAG_FB_HOL_MISS = 0x02  # trailing uint8 + uint16 source ESIs for next_needed
+FLAG_FB_BITMAP = 0x04  # uint16 len + miss bitmap anchored at next_needed_gen
+# Max miss bitmap bytes (1088 bits; covers K=48 inflight window + slack).
+FEEDBACK_BITMAP_MAX_BYTES = 136
 XFER_GEN = 1
 
 _HDR = struct.Struct("!BBBB")
@@ -74,6 +77,8 @@ class GenFeedbackPacket:
     nack_rx_counts: list[int] | None = None
     # Missing systematic source ESIs for next_needed_gen (sparse retransmit).
     hol_miss_esi: list[int] | None = None
+    # Bit i set => gen (next_needed_gen + i) needs repair (gap/partial).
+    miss_bitmap: bytes | None = None
 
     def pack(self) -> bytes:
         nacks = self.nack_gens[:64]
@@ -96,10 +101,14 @@ class GenFeedbackPacket:
             body += struct.pack("!B", min(32, len(hol)))
             for esi in hol[:32]:
                 body += struct.pack("!H", esi & 0xFFFF)
+        bitmap = self.miss_bitmap or b""
+        if bitmap:
+            body += struct.pack("!H", len(bitmap))
+            body += bitmap
         body += struct.pack("!I", self.echo_ts_us & 0xFFFFFFFF)
         flags = (FLAG_FB_RX_COUNTS if with_counts else 0) | (
             FLAG_FB_HOL_MISS if hol else 0
-        )
+        ) | (FLAG_FB_BITMAP if bitmap else 0)
         return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, flags) + body
 
     @classmethod
@@ -112,6 +121,7 @@ class GenFeedbackPacket:
         counts: list[int] = []
         with_counts = bool(data[3] & FLAG_FB_RX_COUNTS)
         with_hol = bool(data[3] & FLAG_FB_HOL_MISS)
+        with_bitmap = bool(data[3] & FLAG_FB_BITMAP)
         item_size = 6 if with_counts else 4
         if len(data) < off + n * item_size:
             raise ValueError("gen feedback NACK list truncated")
@@ -134,6 +144,16 @@ class GenFeedbackPacket:
             for _ in range(hol_n):
                 hol.append(struct.unpack_from("!H", data, off)[0])
                 off += 2
+        bitmap = b""
+        if with_bitmap:
+            if len(data) < off + 2:
+                raise ValueError("gen feedback bitmap truncated")
+            blen = struct.unpack_from("!H", data, off)[0]
+            off += 2
+            if len(data) < off + blen:
+                raise ValueError("gen feedback bitmap payload truncated")
+            bitmap = bytes(data[off : off + blen])
+            off += blen
         echo = struct.unpack_from("!I", data, off)[0] if len(data) >= off + 4 else 0
         return cls(
             next_needed,
@@ -142,7 +162,32 @@ class GenFeedbackPacket:
             completed,
             counts if with_counts else None,
             hol if hol else None,
+            bitmap if bitmap else None,
         )
+
+
+def miss_bitmap_to_nacks(next_needed: int, bitmap: bytes) -> list[int]:
+    """Expand a miss bitmap anchored at next_needed into gen ids."""
+    out: list[int] = []
+    for off in range(len(bitmap) * 8):
+        if bitmap[off >> 3] & (1 << (off & 7)):
+            out.append(next_needed + off)
+    return out
+
+
+def merge_feedback_nacks(
+    pkt: GenFeedbackPacket,
+) -> tuple[list[int], dict[int, int]]:
+    """Merge explicit NACK list with optional miss bitmap."""
+    nacks = list(pkt.nack_gens)
+    counts = pkt.nack_rx_counts or []
+    nack_rx = dict(zip(pkt.nack_gens, counts))
+    if pkt.miss_bitmap:
+        for gid in miss_bitmap_to_nacks(pkt.next_needed_gen, pkt.miss_bitmap):
+            if gid not in nack_rx:
+                nacks.append(gid)
+                nack_rx[gid] = 0
+    return nacks, nack_rx
 
 
 @dataclass(slots=True)
