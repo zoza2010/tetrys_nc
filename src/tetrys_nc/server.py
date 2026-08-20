@@ -48,8 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--gen-overhead",
         type=int,
-        default=0,
-        help="RaptorQ repair overhead percent in blast (0=fountain-only; default 0)",
+        default=None,
+        help="RaptorQ repair overhead percent in blast (0=fountain-only; WAN default 20)",
     )
     args = p.parse_args(argv)
 
@@ -59,6 +59,12 @@ def main(argv: list[str] | None = None) -> int:
         rate = 1000.0
     elif rate <= 0:
         rate = 1500.0
+    if args.gen_overhead is not None:
+        overhead_pct = args.gen_overhead
+    elif args.wan:
+        overhead_pct = 20
+    else:
+        overhead_pct = 0
 
     return run_gen_server(
         args.host,
@@ -66,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         args.file,
         symbol_size=symbol,
         gen_k=args.gen_k,
-        overhead_pct=args.gen_overhead,
+        overhead_pct=overhead_pct,
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
