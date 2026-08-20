@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import queue
 import select
+import shutil
 import socket
 import sys
 import threading
@@ -19,7 +20,9 @@ from pathlib import Path
 from .gen_raptor import (
     GenDecoder,
     GenEncoder,
+    GenReceiveSlot,
     blast_repair_budget,
+    disk_spool_enabled,
     fountain_blast_budget,
     repair_count,
     require_raptorq,
@@ -55,6 +58,11 @@ from .ratectl import RateLimiter
 _ENCODER_KEEP = 128
 # Do not re-repair the same gen on every send-loop iteration.
 _REPAIR_COOLDOWN_S = 0.10
+# Sparse HOL source resend: faster than a full RTT, never zero (that floods).
+_HOL_REPAIR_COOLDOWN_S = 0.05
+# Wait for late/reordered packets before NACK / hol_miss (path OOO is often <10ms).
+# WAN sweep: 5ms ≈81 MiB/s, 8ms ≈54, 12ms ≈71, 20ms stalled/disk issues.
+_REORDER_HOLDOFF_S = 0.005
 # Start frontier repair when client lags this many gens behind send cursor.
 _REPAIR_LAG = 48
 # If next_needed is unchanged this long, send deficit-sized fountain repair.
@@ -107,6 +115,9 @@ _REPAIR_META_KEEP = 256
 _REPAIR_ENC_CACHE_MAX = 48
 # Client NACK horizon slack beyond byte-bounded inflight window.
 _FEEDBACK_HORIZON_SLACK = 32
+# Fast client feedback while the frontier is stalled or any gen is open.
+_FB_EVERY_S = 0.02
+_FB_EVERY_FIN_S = 0.05
 # Delivery-rate pacing: only back off when client goodput lags wire pace.
 _ADAPT_PACE_MIN_FRAC = 0.10
 _ADAPT_PACE_BACKOFF_FRAC = 0.82  # delivery < pace×this → slow down
@@ -136,6 +147,7 @@ def build_feedback_miss_bitmap(
     bit_get,
     decoders: dict[int, object],
     max_gid_seen: int,
+    include_gid=None,
 ) -> bytes:
     """Compact miss map for [next_needed, next_needed+horizon); gap-aware."""
     if next_needed >= total_gens or horizon <= 0:
@@ -152,6 +164,8 @@ def build_feedback_miss_bitmap(
             continue
         if gid not in decoders and gid > max_gid_seen:
             continue
+        if include_gid is not None and not include_gid(gid):
+            continue
         buf[off >> 3] |= 1 << (off & 7)
     return bytes(buf)
 
@@ -163,7 +177,127 @@ def should_pause_blast(
     inflight_gen_limit: int,
 ) -> bool:
     """Pause new data when occupancy or frontier lag hits the window."""
-    return incomplete >= inflight_gen_limit or frontier_lag >= inflight_gen_limit
+    if incomplete >= inflight_gen_limit or frontier_lag >= inflight_gen_limit:
+        return True
+    soft = (inflight_gen_limit * 3) // 4
+    return incomplete >= soft and frontier_lag >= soft // 2
+
+
+def repair_pressure(
+    incomplete: int,
+    frontier_lag: int,
+    *,
+    inflight_gen_limit: int,
+) -> float:
+    """0..1 pressure from occupancy and frontier lag (size-independent)."""
+    cap = max(1, inflight_gen_limit)
+    return min(1.0, max(incomplete / cap, frontier_lag / cap))
+
+
+def adaptive_blast_overhead_pct(
+    *,
+    base_pct: int,
+    frontier_lag: int,
+    nack_count: int,
+    incomplete: int,
+    inflight_gen_limit: int,
+    min_pct: int = 8,
+    max_pct: int | None = None,
+) -> int:
+    """Keep base FEC on a clean path; raise toward max under repair pressure.
+
+    Going below base (e.g. 8% when base=10) loses more goodput to HOL repair
+    than it gains from lower wire overhead on this WAN path.
+    """
+    if base_pct <= 0:
+        return 0
+    lo = max(base_pct, min_pct) if min_pct > base_pct else base_pct
+    hi = max(lo, max_pct if max_pct is not None else base_pct)
+    pressure = repair_pressure(
+        incomplete, frontier_lag, inflight_gen_limit=inflight_gen_limit
+    )
+    if pressure >= 0.45 or nack_count >= 12 or frontier_lag >= 64:
+        return hi
+    if pressure >= 0.15 or nack_count >= 2 or frontier_lag >= 16:
+        return max(lo, (lo + hi) // 2)
+    return lo
+
+
+def should_yield_blast_to_repair(
+    pressure: float,
+    *,
+    repair_pending: bool,
+    nack_count: int,
+) -> bool:
+    """Dual-queue: under pressure, prefer draining repair over new blast."""
+    if pressure >= 0.85:
+        return True
+    if pressure >= 0.45 and (repair_pending or nack_count > 12):
+        return True
+    if pressure >= 0.25 and repair_pending and nack_count > 48:
+        return True
+    return False
+
+
+def hol_repair_cooldown_s(
+    nid: int,
+    next_needed: int,
+    *,
+    hol_miss: bool = False,
+) -> float:
+    """HOL sparse resend is quicker; other gens keep the full cooldown."""
+    if nid == next_needed and hol_miss:
+        return _HOL_REPAIR_COOLDOWN_S
+    return _REPAIR_COOLDOWN_S
+
+
+def reorder_holdoff_s() -> float:
+    raw = os.environ.get("TETRYS_REORDER_HOLDOFF_MS")
+    if raw is None or raw == "":
+        return _REORDER_HOLDOFF_S
+    try:
+        return max(0.0, float(raw) / 1000.0)
+    except ValueError:
+        return _REORDER_HOLDOFF_S
+
+
+def note_gen_deficit(deficit_since: dict[int, float], gid: int, now: float) -> None:
+    if gid >= 0 and gid not in deficit_since:
+        deficit_since[gid] = now
+
+
+def clear_gen_deficit(deficit_since: dict[int, float], gid: int) -> None:
+    deficit_since.pop(gid, None)
+
+
+def repair_holdoff_ready(
+    deficit_since: dict[int, float],
+    gid: int,
+    now: float,
+    *,
+    holdoff_s: float | None = None,
+) -> bool:
+    """True once an incomplete gen has been open longer than the reorder window."""
+    first = deficit_since.get(gid)
+    if first is None:
+        return False
+    wait = _REORDER_HOLDOFF_S if holdoff_s is None else holdoff_s
+    return (now - first) >= wait
+
+
+def client_feedback_interval(
+    *,
+    fin_seen: bool,
+    next_needed: int,
+    total_gens: int,
+    open_gens: int,
+    nack_count: int,
+) -> float:
+    if fin_seen:
+        return _FB_EVERY_FIN_S
+    if next_needed < total_gens or open_gens > 0 or nack_count > 0:
+        return _FB_EVERY_S
+    return _FB_EVERY_S
 
 
 def repair_thread_limit(
@@ -172,13 +306,17 @@ def repair_thread_limit(
     storm_active: bool,
     nack_count: int,
     frontier_lag: int,
+    inflight_gen_limit: int,
 ) -> int:
-    """Scale repair parallelism with backlog; storm keeps urgent path only."""
-    if storm_active:
-        return 1
+    """Scale repair parallelism with backlog; storm throttles blast, not HOL."""
     base = _REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN
     backlog = max(nack_count, frontier_lag // 64, 1)
-    return min(16, max(base, backlog // 4))
+    scaled = min(16, max(base, backlog // 4))
+    if not storm_active:
+        return scaled
+    if frontier_lag >= max(64, inflight_gen_limit // 4):
+        return min(8, max(2, backlog // 8))
+    return 1
 
 
 def fountain_redundancy(overhead_pct: int) -> bool:
@@ -273,7 +411,7 @@ def should_fountain_tick(
 ) -> bool:
     """Rate-limit fountain submits on the send loop when not at hard cap."""
     if storm_active:
-        return False
+        return at_cap and stressed
     if fountain_mode:
         # 8 MiB / loss-half never hits inflight cap (1035); still need ESI.
         return at_cap or tick_n % every_n == 0
@@ -599,6 +737,11 @@ def run_gen_server(
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0
     inflight_gen_limit = compute_inflight_gen_limit(gen_k, symbol_size)
     adapt_pace = os.environ.get("TETRYS_ADAPT_PACE", "").lower() in ("1", "true", "yes")
+    adapt_overhead = os.environ.get("TETRYS_ADAPT_OVERHEAD", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    ) and overhead_pct > 0
     digest = "" if skip_hash else _file_sha256(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -619,6 +762,7 @@ def run_gen_server(
         f"cc=off "
         f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
         f"adapt_pace={'on' if adapt_pace else 'off'} "
+        f"adapt_oh={'on' if adapt_overhead else 'off'} "
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
@@ -930,6 +1074,9 @@ def run_gen_server(
                     now=now,
                     symbols_rx=nack_rx.get(nid),
                     source_esis=miss,
+                    cooldown_s=hol_repair_cooldown_s(
+                        nid, next_needed, hol_miss=bool(miss)
+                    ),
                 )
             )
         if ordered:
@@ -975,6 +1122,8 @@ def run_gen_server(
             fountain_lock = threading.Lock()
             fountain_tick_n = 0
             storm_state = {"until": 0.0}
+            repair_pending_gids: set[int] = set()
+            overhead_state = {"pct": overhead_pct}
 
             def repair_pending_count() -> int:
                 with repair_fut_lock:
@@ -988,10 +1137,17 @@ def run_gen_server(
                 symbols_rx: int | None = None,
                 cooldown_s: float = _REPAIR_COOLDOWN_S,
                 send_n: int | None = None,
+                allow_in_storm: bool = False,
             ) -> bool:
-                if now < storm_state["until"] and send_n is not None:
+                if (
+                    now < storm_state["until"]
+                    and send_n is not None
+                    and not allow_in_storm
+                ):
                     return False
-                if (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
+                if nid in repair_pending_gids:
+                    return False
+                if cooldown_s > 0 and (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
                     return False
                 if (
                     symbols_rx is not None
@@ -1036,6 +1192,7 @@ def run_gen_server(
                 with repair_fut_lock:
                     if len(repair_futures) >= _REPAIR_FUTURES_MAX:
                         return False
+                    repair_pending_gids.add(nid)
                 fut = encode_pool.submit(
                     _repair_gen_worker,
                     file_path_str,
@@ -1066,6 +1223,7 @@ def run_gen_server(
                     if not fut.done():
                         still.append((fut, nid, prior_extra))
                         continue
+                    repair_pending_gids.discard(nid)
                     try:
                         enc_cpu_s, sent, wires = fut.result()
                     except Exception:
@@ -1142,6 +1300,7 @@ def run_gen_server(
 
             def fill_encode_queue(start: int) -> None:
                 stop = min(total_gens, start + _ENCODE_PREFETCH)
+                pct = int(overhead_state["pct"])
                 for gid in range(start, stop):
                     if gid in encode_futures:
                         continue
@@ -1152,7 +1311,7 @@ def run_gen_server(
                         block_bytes,
                         file_size,
                         symbol_size,
-                        overhead_pct,
+                        pct,
                         fountain_mode,
                     )
 
@@ -1202,6 +1361,7 @@ def run_gen_server(
                         storm_active=storm_active,
                         nack_count=len(nacks),
                         frontier_lag=frontier_lag,
+                        inflight_gen_limit=inflight_gen_limit,
                     )
                     if not storm_active or nacks:
                         wires.extend(
@@ -1266,6 +1426,18 @@ def run_gen_server(
                             next_needed,
                         )
                     incomplete = max(0, gen_id - completed)
+                    lag = gen_id - next_needed
+                    if adapt_overhead:
+                        with fb_lock:
+                            nacks_oh = list(fb_state["nacks"])
+                        overhead_state["pct"] = adaptive_blast_overhead_pct(
+                            base_pct=overhead_pct,
+                            frontier_lag=lag,
+                            nack_count=len(nacks_oh),
+                            incomplete=incomplete,
+                            inflight_gen_limit=inflight_gen_limit,
+                            max_pct=max(overhead_pct, 20),
+                        )
                     if incomplete >= (inflight_gen_limit * 3) // 4:
                         limiter.set_burst_s(0.002)
                     elif incomplete <= inflight_gen_limit // 2:
@@ -1281,6 +1453,11 @@ def run_gen_server(
                         nacks = list(fb_state["nacks"])
                         nack_rx = dict(fb_state["nack_rx"])
                     storm_active = now < storm_state["until"]
+                    pressure = repair_pressure(
+                        incomplete,
+                        lag,
+                        inflight_gen_limit=inflight_gen_limit,
+                    )
                     if should_fountain_tick(
                         stressed=stressed,
                         at_cap=at_cap,
@@ -1299,6 +1476,26 @@ def run_gen_server(
                         )
                     fountain_tick_n += 1
                     repair_sent += drain_repair_futures()
+                    repair_pending = (
+                        not repair_q.empty() or repair_pending_count() > 0
+                    )
+                    if should_yield_blast_to_repair(
+                        pressure,
+                        repair_pending=repair_pending,
+                        nack_count=len(nacks),
+                    ):
+                        if stressed and not storm_active:
+                            fountain_send_tick(
+                                mm,
+                                now=now,
+                                next_needed=next_needed,
+                                nacks=nacks,
+                                nack_rx=nack_rx,
+                                sent_before=gen_id,
+                                at_cap=at_cap,
+                            )
+                        repair_sent += drain_repairs()
+                        repair_sent += drain_repair_futures()
                     if should_pause_blast(
                         incomplete,
                         lag,
@@ -1431,6 +1628,7 @@ def run_gen_server(
                         nack_rx = dict(fb_state["nack_rx"])
                         next_needed = int(fb_state["next_needed"])
                         hol_miss = list(fb_state.get("hol_miss_esi") or [])
+                    now = time.monotonic()
                     if not nacks:
                         if 0 <= next_needed < total_gens:
                             nacks = [next_needed]
@@ -1438,7 +1636,6 @@ def run_gen_server(
                             sock.sendto(fin, client_addr)
                             time.sleep(0.02)
                             continue
-                    now = time.monotonic()
                     wires = repair_nacks(
                         mm,
                         nacks,
@@ -1494,10 +1691,13 @@ def run_gen_client(
     total_gens = (file_size + block_bytes - 1) // block_bytes if file_size else 0
     inflight_gen_limit = compute_inflight_gen_limit(gen_k, symbol_size)
     feedback_horizon = client_feedback_horizon(inflight_gen_limit)
+    holdoff_s = reorder_holdoff_s()
 
     print(
         f"gen-xfer: gens={total_gens} T={symbol_size} K={gen_k} "
-        f"block={block_bytes} overhead={overhead_pct}%"
+        f"block={block_bytes} overhead={overhead_pct}% "
+        f"disk_spool={'ram' if disk_spool_enabled() else 'off'} "
+        f"reorder_holdoff_ms={holdoff_s * 1000:.0f}"
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1512,7 +1712,16 @@ def run_gen_client(
     except OSError:
         pass
 
+    use_disk_spool = disk_spool_enabled()
+    spool_dir = out_path.parent / f".{out_path.name}.spool"
+
     decoders: dict[int, GenDecoder] = {}
+    slots: dict[int, GenReceiveSlot] = {}
+    active_gens = slots if use_disk_spool else decoders
+    # Decoded but not yet on disk: late packets must not reopen the generation.
+    pending_write: set[int] = set()
+    # First time we observed an incomplete gen (reorder holdoff clock).
+    deficit_since: dict[int, float] = {}
     done_bits = bytearray((total_gens + 7) // 8) if total_gens else bytearray()
     completed = 0
     next_needed_hint = 0
@@ -1533,11 +1742,10 @@ def run_gen_client(
     write_s = 0.0
     write_inline = 0
     rx_bytes = 0
-    # Unbounded: a 1s disk stall at 90 MiB/s is ~350 gens. A 128-deep queue
-    # overflows and used to pwrite on the recv thread, dropping the UDP
-    # socket and collapsing the rest of the transfer.
-    write_q: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
+    # Async pwrite; protocol treats the gen as done as soon as it decodes.
+    write_q: queue.Queue[tuple[int, int, bytes] | None] = queue.Queue()
     write_lock = threading.Lock()
+    write_fail: dict[str, OSError | None] = {"err": None}
     _fadv_dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
 
     def bit_get(i: int) -> bool:
@@ -1551,8 +1759,10 @@ def run_gen_client(
             return
         done_bits[i >> 3] |= 1 << (i & 7)
         completed += 1
+        clear_gen_deficit(deficit_since, i)
         if i == next_needed_hint:
             while next_needed_hint < total_gens and bit_get(next_needed_hint):
+                clear_gen_deficit(deficit_since, next_needed_hint)
                 next_needed_hint += 1
 
     def pwrite_one(off: int, data: bytes) -> None:
@@ -1577,31 +1787,57 @@ def run_gen_client(
             item = write_q.get()
             if item is None:
                 break
-            pwrite_one(item[0], item[1])
+            gid, off, data = item
+            try:
+                pwrite_one(off, data)
+            except OSError as e:
+                write_fail["err"] = e
+                print(f"disk write failed gen={gid}: {e}", file=sys.stderr)
+            finally:
+                pending_write.discard(gid)
 
-    def enqueue_write(off: int, data: bytes) -> None:
-        write_q.put_nowait((off, data))
+    def enqueue_write(gid: int, off: int, data: bytes) -> None:
+        pending_write.add(gid)
+        bit_set(gid)
+        write_q.put_nowait((gid, off, data))
 
     write_thread = threading.Thread(target=write_loop, name="gen-write", daemon=True)
     write_thread.start()
 
     def send_fb() -> None:
         nonlocal last_fb
+        now_fb = time.monotonic()
         next_needed = next_needed_hint
+        # Later gens imply a hole/reorder on the frontier.
+        if next_needed < total_gens and max_gid_seen > next_needed:
+            note_gen_deficit(deficit_since, next_needed, now_fb)
+            for gid in list(active_gens):
+                if gid > next_needed and not bit_get(gid):
+                    note_gen_deficit(deficit_since, gid, now_fb)
+        if fin_seen:
+            for gid in list(active_gens):
+                if not bit_get(gid):
+                    note_gen_deficit(deficit_since, gid, now_fb)
         nacks: list[int] = []
         nack_rx: list[int] = []
         seen: set[int] = set()
+
+        def aged(gid: int) -> bool:
+            return repair_holdoff_ready(
+                deficit_since, gid, now_fb, holdoff_s=holdoff_s
+            )
+
         if next_needed < total_gens:
-            dec = decoders.get(next_needed)
-            if dec is not None and dec.done is None:
+            slot = active_gens.get(next_needed)
+            if slot is not None and aged(next_needed):
                 nacks.append(next_needed)
-                nack_rx.append(dec.symbols_rx)
+                nack_rx.append(slot.symbols_rx)
                 seen.add(next_needed)
-        for i in sorted(decoders):
-            if i in seen or bit_get(i):
+        for i in sorted(active_gens):
+            if i in seen or bit_get(i) or not aged(i):
                 continue
             nacks.append(i)
-            nack_rx.append(decoders[i].symbols_rx)
+            nack_rx.append(active_gens[i].symbols_rx)
             seen.add(i)
             if len(nacks) >= 64:
                 break
@@ -1610,14 +1846,15 @@ def run_gen_client(
             total_gens=total_gens,
             horizon=feedback_horizon,
             bit_get=bit_get,
-            decoders=decoders,
+            decoders=active_gens,
             max_gid_seen=max_gid_seen,
+            include_gid=aged,
         )
         hol_miss_esi: list[int] | None = None
-        if next_needed < total_gens:
-            dec = decoders.get(next_needed)
-            if dec is not None and dec.done is None:
-                miss = dec.missing_source_esi(gen_k, limit=32)
+        if next_needed < total_gens and aged(next_needed):
+            slot = active_gens.get(next_needed)
+            if slot is not None:
+                miss = slot.missing_source_esi(gen_k, limit=32)
                 if miss:
                     hol_miss_esi = miss
         pkt = GenFeedbackPacket(
@@ -1630,20 +1867,24 @@ def run_gen_client(
             miss_bitmap,
         )
         sock.sendto(pkt.pack(), server)
-        last_fb = time.monotonic()
+        last_fb = now_fb
 
     try:
         while True:
+            if write_fail["err"] is not None:
+                print(f"abort: {write_fail['err']}", file=sys.stderr)
+                return 1
             timeout = 0.02 if fin_seen else 0.05
             t_sel = time.monotonic()
             r, _, _ = select.select([sock], [], [], timeout)
             now = time.monotonic()
-            if fin_seen:
-                fb_every = 0.05
-            elif len(decoders) >= 16:
-                fb_every = 0.02
-            else:
-                fb_every = 0.1
+            fb_every = client_feedback_interval(
+                fin_seen=fin_seen,
+                next_needed=next_needed_hint,
+                total_gens=total_gens,
+                open_gens=len(active_gens),
+                nack_count=len(active_gens),
+            )
             if not r:
                 wait_rx_s += now - t_sel
                 send_fb()
@@ -1675,7 +1916,7 @@ def run_gen_client(
                         last_echo = gp.send_ts_us
                         gid = gp.gen_id
                         max_gid_seen = max(max_gid_seen, gid)
-                        if bit_get(gid):
+                        if bit_get(gid) or gid in pending_write:
                             skip_done += 1
                             continue
                         rem = file_size - gid * block_bytes
@@ -1683,22 +1924,68 @@ def run_gen_client(
                             bit_set(gid)
                             continue
                         tlen = min(block_bytes, rem)
-                        dec = decoders.get(gid)
-                        if dec is None:
-                            dec = GenDecoder(block_bytes, symbol_size)
-                            decoders[gid] = dec
-                        t_dec = time.monotonic()
-                        dups0 = dec.dup_esi
-                        out = dec.add_packet(gp.payload, gp.esi)
-                        dec_s += time.monotonic() - t_dec
-                        dup_esi += dec.dup_esi - dups0
-                        if out is not None:
-                            if dec.symbols_rx > gen_k + 1:
-                                gens_recovered += 1
-                            payload = out[:tlen]
-                            bit_set(gid)
-                            decoders.pop(gid, None)
-                            enqueue_write(gid * block_bytes, payload)
+                        if use_disk_spool:
+                            slot = slots.get(gid)
+                            if slot is None:
+                                slot = GenReceiveSlot(
+                                    gid,
+                                    gen_k=gen_k,
+                                    symbol_size=symbol_size,
+                                    block_bytes=block_bytes,
+                                    tlen=tlen,
+                                    spool_dir=spool_dir,
+                                )
+                                slots[gid] = slot
+                            t_dec = time.monotonic()
+                            dups0 = slot.dup_esi
+                            out = slot.add_packet(gp.payload, gp.esi)
+                            dec_s += time.monotonic() - t_dec
+                            dup_esi += slot.dup_esi - dups0
+                            if out is not None:
+                                if slot.symbols_rx > gen_k + 1:
+                                    gens_recovered += 1
+                                slots.pop(gid, None)
+                                slot.close()
+                                clear_gen_deficit(deficit_since, gid)
+                                enqueue_write(gid, gid * block_bytes, out[:tlen])
+                            else:
+                                now_rx = time.monotonic()
+                                if gid > next_needed_hint:
+                                    note_gen_deficit(
+                                        deficit_since, next_needed_hint, now_rx
+                                    )
+                                    note_gen_deficit(deficit_since, gid, now_rx)
+                                else:
+                                    hole = slot.missing_source_esi(gen_k, limit=1)
+                                    if hole and gp.esi > hole[0]:
+                                        note_gen_deficit(deficit_since, gid, now_rx)
+                        else:
+                            dec = decoders.get(gid)
+                            if dec is None:
+                                dec = GenDecoder(block_bytes, symbol_size)
+                                decoders[gid] = dec
+                            t_dec = time.monotonic()
+                            dups0 = dec.dup_esi
+                            out = dec.add_packet(gp.payload, gp.esi)
+                            dec_s += time.monotonic() - t_dec
+                            dup_esi += dec.dup_esi - dups0
+                            if out is not None:
+                                if dec.symbols_rx > gen_k + 1:
+                                    gens_recovered += 1
+                                decoders.pop(gid, None)
+                                clear_gen_deficit(deficit_since, gid)
+                                enqueue_write(gid, gid * block_bytes, out[:tlen])
+                            else:
+                                now_rx = time.monotonic()
+                                if gid > next_needed_hint:
+                                    note_gen_deficit(
+                                        deficit_since, next_needed_hint, now_rx
+                                    )
+                                    note_gen_deficit(deficit_since, gid, now_rx)
+                                else:
+                                    hole = dec.missing_source_esi(gen_k, limit=1)
+                                    if hole and gp.esi > hole[0]:
+                                        note_gen_deficit(deficit_since, gid, now_rx)
                     elif ptype == PKT_FIN:
                         fin_seen = True
                     elif ptype == PKT_META:
@@ -1725,7 +2012,7 @@ def run_gen_client(
                 print(
                     f"progress {completed}/{total_gens} ({pct:.1f}%) "
                     f"gens_recovered≈{gens_recovered} "
-                    f"decoders={len(decoders)} "
+                    f"open_gens={len(active_gens)} "
                     f"{rate:.1f} MiB/s"
                 )
                 print(
@@ -1750,6 +2037,10 @@ def run_gen_client(
         write_q.put(None)
         write_thread.join(timeout=60.0)
         os.close(fd)
+        if use_disk_spool:
+            for slot in slots.values():
+                slot.close()
+            shutil.rmtree(spool_dir, ignore_errors=True)
         for _ in range(5):
             sock.sendto(FinPacket(True, total_gens).pack(), server)
             time.sleep(0.02)

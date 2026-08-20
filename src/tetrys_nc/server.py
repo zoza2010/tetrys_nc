@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         "--gen-overhead",
         type=int,
         default=None,
-        help="RaptorQ repair overhead percent in blast (0=fountain-only; WAN default 20)",
+        help="RaptorQ repair overhead percent in blast (0=fountain-only; WAN default 10)",
     )
     args = p.parse_args(argv)
 
@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.gen_overhead is not None:
         overhead_pct = args.gen_overhead
     elif args.wan:
-        overhead_pct = 20
+        overhead_pct = 10
     else:
         overhead_pct = 0
 

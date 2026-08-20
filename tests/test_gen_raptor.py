@@ -8,7 +8,7 @@ import pytest
 
 raptorq = pytest.importorskip("raptorq")
 
-from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, blast_repair_budget, repair_count
+from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, GenReceiveSlot, blast_repair_budget, repair_count
 from tetrys_nc.gen_xfer import fountain_targets
 from tetrys_nc.packets import (
     XFER_GEN,
@@ -72,6 +72,42 @@ def test_systematic_only_smaller_than_full_blast():
     sys_only = GenEncoder(data, T, overhead_pct=8, systematic_only=True)
     assert len(sys_only.packets()) >= K
     assert len(sys_only.packets()) < len(full.packets())
+
+
+def test_gen_receive_slot_systematic_spool(tmp_path: Path):
+    T = 512
+    K = 16
+    data = bytes((i * 3) & 0xFF for i in range(K * T))
+    enc = GenEncoder(data, T, overhead_pct=8, systematic_only=True)
+    pkts = enc.packets()
+    spool = tmp_path / "spool"
+    slot = GenReceiveSlot(0, gen_k=K, symbol_size=T, block_bytes=len(data), tlen=len(data), spool_dir=spool)
+    out = None
+    for esi in range(K):
+        out = slot.add_packet(pkts[esi], esi)
+    slot.close()
+    assert out == data
+    assert not list(spool.glob("*.pkts"))
+
+
+def test_gen_receive_slot_repair_spool(tmp_path: Path):
+    T = 512
+    K = 16
+    data = bytes((i * 7) & 0xFF for i in range(K * T))
+    enc = GenEncoder(data, T, overhead_pct=8, systematic_only=False)
+    pkts = enc.packets()
+    drop = {3, 7}
+    spool = tmp_path / "spool"
+    slot = GenReceiveSlot(0, gen_k=K, symbol_size=T, block_bytes=len(data), tlen=len(data), spool_dir=spool)
+    out = None
+    for esi, blob in enumerate(pkts):
+        if esi in drop and esi < K:
+            continue
+        out = slot.add_packet(blob, esi)
+        if out is not None:
+            break
+    slot.close()
+    assert out == data
 
 
 def test_gen_roundtrip():

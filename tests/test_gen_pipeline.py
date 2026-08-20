@@ -14,23 +14,34 @@ from tetrys_nc.gen_xfer import (
     _FOUNTAIN_EVERY_N,
     _FOUNTAIN_TRACK_MAX,
     _FOUNTAIN_WINDOW,
+    _HOL_REPAIR_COOLDOWN_S,
+    _REORDER_HOLDOFF_S,
+    _REPAIR_COOLDOWN_S,
     _REPAIR_META_KEEP,
     _encode_gen_worker,
+    adaptive_blast_overhead_pct,
     build_feedback_miss_bitmap,
     cap_fountain_gens,
     cap_fountain_send,
+    clear_gen_deficit,
     client_feedback_horizon,
+    client_feedback_interval,
     compute_inflight_gen_limit,
     fountain_redundancy,
+    hol_repair_cooldown_s,
+    note_gen_deficit,
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
+    repair_holdoff_ready,
     repair_round_size,
+    repair_pressure,
     repair_storm_detected,
     repair_thread_limit,
     should_fountain_tick,
     should_pause_blast,
     should_track_fountain_gen,
+    should_yield_blast_to_repair,
     track_fountain_gen,
     update_adaptive_pace_bps,
 )
@@ -49,14 +60,113 @@ def test_should_pause_blast_occupancy_and_lag():
     assert not should_pause_blast(100, 200, inflight_gen_limit=cap)
     assert should_pause_blast(cap, 10, inflight_gen_limit=cap)
     assert should_pause_blast(10, cap, inflight_gen_limit=cap)
+    soft = (cap * 3) // 4
+    assert should_pause_blast(soft, soft // 2, inflight_gen_limit=cap)
+
+
+def test_repair_pressure_and_yield():
+    cap = 1000
+    assert repair_pressure(100, 50, inflight_gen_limit=cap) == 0.1
+    assert repair_pressure(900, 200, inflight_gen_limit=cap) == 0.9
+    assert should_yield_blast_to_repair(0.9, repair_pending=False, nack_count=0)
+    assert not should_yield_blast_to_repair(
+        0.1, repair_pending=False, nack_count=0
+    )
+    assert should_yield_blast_to_repair(
+        0.5, repair_pending=True, nack_count=20
+    )
+
+
+def test_hol_repair_uses_short_cooldown():
+    assert hol_repair_cooldown_s(10, 10, hol_miss=True) == _HOL_REPAIR_COOLDOWN_S
+    assert hol_repair_cooldown_s(10, 10, hol_miss=False) == _REPAIR_COOLDOWN_S
+    assert hol_repair_cooldown_s(11, 10, hol_miss=True) == _REPAIR_COOLDOWN_S
+    assert 0.0 < _HOL_REPAIR_COOLDOWN_S < _REPAIR_COOLDOWN_S
+
+
+def test_reorder_holdoff_gates_repair_feedback():
+    deficit: dict[int, float] = {}
+    t0 = 100.0
+    note_gen_deficit(deficit, 7, t0)
+    assert not repair_holdoff_ready(deficit, 7, t0 + 0.002, holdoff_s=0.005)
+    assert repair_holdoff_ready(deficit, 7, t0 + 0.006, holdoff_s=0.005)
+    clear_gen_deficit(deficit, 7)
+    assert not repair_holdoff_ready(deficit, 7, t0 + 1.0, holdoff_s=0.005)
+    assert _REORDER_HOLDOFF_S == 0.005
+
+
+def test_adaptive_blast_overhead_scales_with_pressure():
+    cap = 1000
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=0,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+    ) == 10
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=20,
+        nack_count=3,
+        incomplete=100,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 15
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=20,
+        incomplete=500,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 20
+    assert adaptive_blast_overhead_pct(
+        base_pct=0,
+        frontier_lag=100,
+        nack_count=50,
+        incomplete=500,
+        inflight_gen_limit=cap,
+    ) == 0
+
+
+def test_client_feedback_interval_is_fast_while_open():
+    assert client_feedback_interval(
+        fin_seen=False,
+        next_needed=0,
+        total_gens=100,
+        open_gens=1,
+        nack_count=1,
+    ) == 0.02
+    assert client_feedback_interval(
+        fin_seen=True,
+        next_needed=100,
+        total_gens=100,
+        open_gens=0,
+        nack_count=0,
+    ) == 0.05
 
 
 def test_repair_thread_limit_scales_with_backlog():
     assert repair_thread_limit(
-        at_cap=True, storm_active=True, nack_count=64, frontier_lag=900
+        at_cap=True,
+        storm_active=True,
+        nack_count=64,
+        frontier_lag=900,
+        inflight_gen_limit=1035,
+    ) >= 2
+    assert repair_thread_limit(
+        at_cap=True,
+        storm_active=True,
+        nack_count=2,
+        frontier_lag=10,
+        inflight_gen_limit=1035,
     ) == 1
     lim = repair_thread_limit(
-        at_cap=True, storm_active=False, nack_count=64, frontier_lag=900
+        at_cap=True,
+        storm_active=False,
+        nack_count=64,
+        frontier_lag=900,
+        inflight_gen_limit=1035,
     )
     assert lim >= 8
 
@@ -176,8 +286,11 @@ def test_should_fountain_tick_stressed_at_cap_every_turn():
         assert should_fountain_tick(stressed=True, at_cap=True, tick_n=tick)
 
 
-def test_should_fountain_tick_disabled_during_storm():
+def test_should_fountain_tick_disabled_during_storm_unless_cap_stressed():
     assert not should_fountain_tick(
+        stressed=False, at_cap=True, tick_n=0, storm_active=True
+    )
+    assert should_fountain_tick(
         stressed=True, at_cap=True, tick_n=0, storm_active=True
     )
 

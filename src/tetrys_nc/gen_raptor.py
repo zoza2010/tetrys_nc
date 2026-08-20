@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def require_raptorq():
@@ -123,3 +125,129 @@ class GenDecoder:
                 if len(out) >= limit:
                     break
         return out
+
+
+def disk_spool_enabled() -> bool:
+    """Legacy name: keep GenReceiveSlot (RAM-buffered) path; disk I/O is off."""
+    return os.environ.get("TETRYS_DISK_SPOOL", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _source_full_mask(gen_k: int) -> int:
+    if gen_k <= 0:
+        return 0
+    return (1 << gen_k) - 1
+
+
+class GenReceiveSlot:
+    """Generation receive with in-memory packet buffer.
+
+    Disk spool was the decode bottleneck (flush/seek/replay per gen). Packets
+    stay in RAM; open gens are already bounded by the server inflight window.
+    """
+
+    __slots__ = (
+        "gid",
+        "gen_k",
+        "symbol_size",
+        "block_bytes",
+        "tlen",
+        "symbols_rx",
+        "dup_esi",
+        "_seen",
+        "_source_mask",
+        "_has_repair",
+        "_decoder",
+        "_decoder_ready",
+        "_pkts",
+    )
+
+    def __init__(
+        self,
+        gid: int,
+        *,
+        gen_k: int,
+        symbol_size: int,
+        block_bytes: int,
+        tlen: int,
+        spool_dir: Path | None = None,
+    ) -> None:
+        del spool_dir  # API compat; no longer used
+        self.gid = gid
+        self.gen_k = gen_k
+        self.symbol_size = symbol_size
+        self.block_bytes = block_bytes
+        self.tlen = tlen
+        self.symbols_rx = 0
+        self.dup_esi = 0
+        self._seen: set[int] = set()
+        self._source_mask = 0
+        self._has_repair = False
+        self._decoder: GenDecoder | None = None
+        self._decoder_ready = False
+        self._pkts: list[tuple[int, bytes]] = []
+
+    def close(self) -> None:
+        self._pkts.clear()
+        self._decoder = None
+        self._decoder_ready = False
+
+    def missing_source_esi(self, source_k: int, *, limit: int = 24) -> list[int]:
+        if source_k <= 0:
+            return []
+        if self._decoder is not None and self._decoder.done is None:
+            return self._decoder.missing_source_esi(source_k, limit=limit)
+        out: list[int] = []
+        for esi in range(source_k):
+            if not (self._source_mask & (1 << esi)):
+                out.append(esi)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def add_packet(self, rq_blob: bytes, esi: int) -> bytes | None:
+        if esi in self._seen:
+            self.dup_esi += 1
+            return None
+        self._seen.add(esi)
+        self.symbols_rx += 1
+        self._pkts.append((esi, rq_blob))
+        if esi < self.gen_k:
+            self._source_mask |= 1 << esi
+        else:
+            self._has_repair = True
+
+        full = _source_full_mask(self.gen_k)
+        if self._source_mask == full and not self._has_repair:
+            return self._finalize_all_systematic()
+
+        if self._has_repair:
+            if not self._decoder_ready:
+                self._build_decoder_from_memory()
+                self._decoder_ready = True
+            else:
+                assert self._decoder is not None
+                out = self._decoder.add_packet(rq_blob, esi)
+                if out is not None:
+                    return out[: self.tlen]
+            if self._decoder is not None and self._decoder.done is not None:
+                return self._decoder.done[: self.tlen]
+        return None
+
+    def _finalize_all_systematic(self) -> bytes | None:
+        dec = GenDecoder(self.block_bytes, self.symbol_size)
+        for esi, blob in self._pkts:
+            if esi < self.gen_k:
+                dec.add_packet(blob, esi)
+        if dec.done is None:
+            return None
+        return dec.done[: self.tlen]
+
+    def _build_decoder_from_memory(self) -> None:
+        dec = GenDecoder(self.block_bytes, self.symbol_size)
+        for esi, blob in self._pkts:
+            dec.add_packet(blob, esi)
+        self._decoder = dec
