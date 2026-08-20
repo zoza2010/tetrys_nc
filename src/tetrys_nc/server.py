@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: symbol size 1350; default rate 1000 Mbit/s if --rate omitted",
+        help="WAN: symbol size 1350; default rate 900 Mbit/s; delay probe + adaptive FEC",
     )
     p.add_argument(
         "--payload-size",
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="target UDP send rate in Mbit/s (alias: --rate). WAN default 1000",
+        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes up from ~18%%",
     )
     p.add_argument(
         "--ramp-s",
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
     rate = args.rate_mbit
     if args.wan and rate <= 0:
-        rate = 1000.0
+        rate = 900.0
     elif rate <= 0:
         rate = 1500.0
     if args.gen_overhead is not None:

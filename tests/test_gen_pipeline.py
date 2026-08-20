@@ -15,6 +15,7 @@ from tetrys_nc.gen_xfer import (
     _FOUNTAIN_TRACK_MAX,
     _FOUNTAIN_WINDOW,
     _HOL_REPAIR_COOLDOWN_S,
+    _OH_CLEAN_HOLD_S,
     _REORDER_HOLDOFF_S,
     _REPAIR_COOLDOWN_S,
     _REPAIR_META_KEEP,
@@ -27,6 +28,7 @@ from tetrys_nc.gen_xfer import (
     client_feedback_horizon,
     client_feedback_interval,
     compute_inflight_gen_limit,
+    echo_rtt_s,
     fountain_redundancy,
     hol_repair_cooldown_s,
     note_gen_deficit,
@@ -44,6 +46,7 @@ from tetrys_nc.gen_xfer import (
     should_yield_blast_to_repair,
     track_fountain_gen,
     update_adaptive_pace_bps,
+    update_delay_pace_bps,
 )
 from tetrys_nc.packets import miss_bitmap_to_nacks
 from tetrys_nc.packets import GenPacket
@@ -103,18 +106,37 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         nack_count=0,
         incomplete=10,
         inflight_gen_limit=cap,
+        clean_s=0.0,
     ) == 10
     assert adaptive_blast_overhead_pct(
         base_pct=10,
-        frontier_lag=20,
-        nack_count=3,
+        frontier_lag=0,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+        clean_s=_OH_CLEAN_HOLD_S,
+        floor_pct=8,
+    ) == 8
+    # Steady ~100-gen pipeline on a 1k window stays at base (pressure ~0.1).
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=100,
+        nack_count=0,
         incomplete=100,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 10
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=200,
+        nack_count=3,
+        incomplete=200,
         inflight_gen_limit=cap,
         max_pct=20,
     ) == 15
     assert adaptive_blast_overhead_pct(
         base_pct=10,
-        frontier_lag=80,
+        frontier_lag=500,
         nack_count=20,
         incomplete=500,
         inflight_gen_limit=cap,
@@ -127,6 +149,64 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=500,
         inflight_gen_limit=cap,
     ) == 0
+
+
+def test_echo_rtt_and_delay_pace():
+    now = 1000.0
+    echo = int((now - 0.100) * 1_000_000) & 0xFFFFFFFF
+    rtt = echo_rtt_s(echo, now)
+    assert rtt is not None
+    assert abs(rtt - 0.100) < 0.002
+    assert echo_rtt_s(0, now) is None
+    # Stale / stall echo (> max RTT) ignored.
+    stale = int((now - 3.000) * 1_000_000) & 0xFFFFFFFF
+    assert echo_rtt_s(stale, now) is None
+    max_bps = 100_000_000.0
+    # Standing queue → back off.
+    bps, min_rtt, q = update_delay_pace_bps(
+        rtt_s=0.120,
+        min_rtt_s=0.080,
+        cur_bps=max_bps,
+        max_bps=max_bps,
+    )
+    assert q == pytest.approx(0.040)
+    assert bps < max_bps
+    assert bps >= max_bps * 0.12
+    # Empty queue while probing → climb faster.
+    bps2, _, q2 = update_delay_pace_bps(
+        rtt_s=0.081,
+        min_rtt_s=0.080,
+        cur_bps=30_000_000.0,
+        max_bps=max_bps,
+    )
+    assert q2 < 0.005
+    assert bps2 > 30_000_000.0 * 1.04
+    assert min_rtt > 0
+    # Near ceiling → gentler climb.
+    bps3, _, _ = update_delay_pace_bps(
+        rtt_s=0.081,
+        min_rtt_s=0.080,
+        cur_bps=80_000_000.0,
+        max_bps=max_bps,
+    )
+    assert bps3 == pytest.approx(80_000_000.0 * 1.08)
+    # Thresholds scale with base RTT: 40ms queue is acceptable on a 300ms path.
+    long_bps, _, long_q = update_delay_pace_bps(
+        rtt_s=0.340,
+        min_rtt_s=0.300,
+        cur_bps=30_000_000.0,
+        max_bps=max_bps,
+    )
+    assert long_q == pytest.approx(0.040)
+    assert long_bps > 30_000_000.0
+    # The same queue is severe on a low-latency path.
+    short_bps, _, _ = update_delay_pace_bps(
+        rtt_s=0.050,
+        min_rtt_s=0.010,
+        cur_bps=80_000_000.0,
+        max_bps=max_bps,
+    )
+    assert short_bps < 80_000_000.0
 
 
 def test_client_feedback_interval_is_fast_while_open():
