@@ -21,8 +21,10 @@ from tetrys_nc.gen_xfer import (
     _REPAIR_META_KEEP,
     _encode_gen_worker,
     adaptive_blast_overhead_pct,
+    adaptive_inflight_mib,
     bbr_pacing_gain,
     bbr_still_startup,
+    bdp_bytes,
     build_feedback_miss_bitmap,
     cap_fountain_gens,
     cap_fountain_send,
@@ -32,18 +34,25 @@ from tetrys_nc.gen_xfer import (
     compute_inflight_gen_limit,
     delay_cc_may_probe,
     echo_rtt_s,
+    even_spread,
     fountain_redundancy,
+    fountain_targets,
+    gen_rank_deficit,
+    hol_blocks_tail_repair,
     hol_hole_gens,
     hol_repair_cooldown_s,
     note_gen_deficit,
+    order_repair_nacks,
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
     repair_holdoff_ready,
     repair_round_size,
     repair_pressure,
+    repair_send_n,
     repair_storm_detected,
     repair_thread_limit,
+    select_repair_feedback_gens,
     should_fountain_tick,
     should_pause_blast,
     should_track_fountain_gen,
@@ -66,6 +75,59 @@ def test_compute_inflight_and_feedback_horizon():
     assert compute_inflight_gen_limit(192, 1350) == 258
     assert compute_inflight_gen_limit(96, 1350) == 517
     assert client_feedback_horizon(1035) >= 1035
+    assert compute_inflight_gen_limit(96, 1350, inflight_mib=8) == 64
+    assert compute_inflight_gen_limit(96, 1350, inflight_mib=16) == 129
+
+
+def test_adaptive_inflight_tracks_bdp():
+    # 900 Mbit × 80 ms ≈ 8.58 MiB BDP; gain 8 → cap 64.
+    wan_bps = 900_000_000 / 8.0
+    assert bdp_bytes(wan_bps, 0.080) == pytest.approx(8.58 * 1024 * 1024, rel=0.02)
+    assert (
+        adaptive_inflight_mib(
+            btlbw_bps=wan_bps,
+            min_rtt_s=0.080,
+            current_mib=64.0,
+            mix_up=1.0,
+            mix_down=1.0,
+        )
+        == 64.0
+    )
+    # Narrower path: 200 Mbit × 80 ms ≈ 1.91 MiB; gain 8 → ~15 MiB.
+    slow_bps = 200_000_000 / 8.0
+    got = adaptive_inflight_mib(
+        btlbw_bps=slow_bps,
+        min_rtt_s=0.080,
+        current_mib=64.0,
+        mix_up=1.0,
+        mix_down=1.0,
+    )
+    assert 14.0 <= got <= 17.0
+    # No samples yet: keep the current window.
+    assert (
+        adaptive_inflight_mib(
+            btlbw_bps=0.0, min_rtt_s=0.0, current_mib=64.0
+        )
+        == 64.0
+    )
+    # Do not shrink under live occupancy (would pause blast).
+    held = adaptive_inflight_mib(
+        btlbw_bps=slow_bps,
+        min_rtt_s=0.080,
+        current_mib=64.0,
+        occupancy_bytes=30 * 1024 * 1024,
+        mix_up=1.0,
+        mix_down=1.0,
+    )
+    assert held >= 30 / 0.70 - 0.5
+    # Mix toward the target rather than jumping in one sample.
+    stepped = adaptive_inflight_mib(
+        btlbw_bps=slow_bps,
+        min_rtt_s=0.080,
+        current_mib=64.0,
+        mix_down=0.15,
+    )
+    assert got < stepped < 64.0
 
 
 def test_should_pause_blast_occupancy_and_lag():
@@ -489,14 +551,14 @@ def test_client_feedback_interval_is_fast_while_open():
     ) == 0.05
 
 
-def test_repair_thread_limit_scales_with_backlog():
+def test_repair_thread_limit_stays_thin():
     assert repair_thread_limit(
         at_cap=True,
         storm_active=True,
         nack_count=64,
         frontier_lag=900,
         inflight_gen_limit=1035,
-    ) >= 2
+    ) == 2
     assert repair_thread_limit(
         at_cap=True,
         storm_active=True,
@@ -511,7 +573,97 @@ def test_repair_thread_limit_scales_with_backlog():
         frontier_lag=900,
         inflight_gen_limit=1035,
     )
-    assert lim >= 8
+    assert lim == 8
+    assert repair_thread_limit(
+        at_cap=False,
+        storm_active=False,
+        nack_count=64,
+        frontier_lag=900,
+        inflight_gen_limit=1035,
+    ) == 4
+
+
+def test_even_spread_covers_window():
+    items = list(range(10, 40))
+    got = even_spread(items, 6)
+    assert len(got) == 6
+    assert got[0] == 10
+    assert max(got) >= 34
+    shifted = even_spread(items, 6, offset=5)
+    assert shifted != got
+    assert even_spread(items, 50) == items
+    assert even_spread([], 4) == []
+
+
+def test_repair_send_n_deficit_and_probe():
+    k = 96
+    assert repair_send_n(None, k, hol=True) == 2
+    assert repair_send_n(k + 2, k) == 0
+    # near-complete: deficit 4 (enough=98, rx=94)
+    assert repair_send_n(94, k, hol=False) == 4
+    assert repair_send_n(94, k, hol=True) == 5
+    assert repair_send_n(0, k, hol=True) == 16
+    assert repair_send_n(0, k, hol=False) == 16
+    assert gen_rank_deficit(None, k) is None
+    assert gen_rank_deficit(90, k) == 8
+    assert hol_blocks_tail_repair(20, k)
+    assert not hol_blocks_tail_repair(94, k)
+    assert not hol_blocks_tail_repair(None, k)
+
+
+def test_select_repair_feedback_gens_hol_then_cheap():
+    k = 192
+    open_rx = {g: 50 for g in range(10, 40)}
+    open_rx[10] = 20  # deep HOL
+    open_rx[25] = 190  # near-complete
+    open_rx[22] = 10  # largest deficit
+    got = select_repair_feedback_gens(10, open_rx, gen_k=k, limit=8)
+    assert got[0] == 10
+    assert 25 in got
+    assert max(got) >= 28
+    open_rx[10] = 190  # HOL almost closed
+    cheap = select_repair_feedback_gens(10, open_rx, gen_k=k, limit=8)
+    assert cheap[0] == 10
+    assert 25 in cheap
+
+
+def test_order_repair_nacks_blocks_tail_on_deep_hol():
+    nacks = list(range(10, 40))
+    nack_rx = {g: 50 for g in nacks}
+    nack_rx[10] = 20
+    nack_rx[25] = 190
+    got = order_repair_nacks(
+        nacks, 10, nack_rx, gen_k=192, limit=8, sent_before=80
+    )
+    assert got[0] == 10
+    assert 25 in got
+    assert max(got) >= 28
+    loose = order_repair_nacks(
+        nacks, 10, nack_rx, gen_k=192, limit=4, sent_before=80
+    )
+    assert loose[0] == 10
+    assert len(loose) == 4
+
+
+def test_fountain_targets_hol_first_no_window_walk():
+    assert fountain_targets(5, 20, nacks=[], nack_rx={}, gen_k=192, limit=3) == [5]
+    nacks = list(range(10, 30))
+    nack_rx = {g: 50 for g in nacks}
+    nack_rx[10] = 20
+    nack_rx[25] = 190
+    nack_rx[22] = 10
+    stuck = fountain_targets(
+        10, 40, nacks=nacks, nack_rx=nack_rx, gen_k=192, limit=8
+    )
+    assert stuck[0] == 10
+    assert 25 in stuck
+    assert max(stuck) >= 24
+    nack_rx[10] = 192
+    open_hol = fountain_targets(
+        10, 40, nacks=nacks, nack_rx=nack_rx, gen_k=192, limit=8
+    )
+    assert open_hol[0] == 10
+    assert 25 in open_hol
 
 
 def test_build_feedback_miss_bitmap_gap_aware():
@@ -552,6 +704,43 @@ def test_should_fountain_tick_skips_clean_path():
     for tick in range(20):
         assert not should_fountain_tick(stressed=False, at_cap=False, tick_n=tick)
         assert not should_fountain_tick(stressed=False, at_cap=True, tick_n=tick)
+        # Reorder NACKs on a thin pipeline must not start fountain.
+        assert not should_fountain_tick(
+            stressed=False,
+            at_cap=False,
+            tick_n=tick,
+            pressure=0.10,
+            nack_count=64,
+        )
+
+
+def test_should_fountain_tick_on_occupancy_nacks():
+    ticks = [
+        should_fountain_tick(
+            stressed=False,
+            at_cap=False,
+            tick_n=n,
+            every_n=4,
+            pressure=0.15,
+            nack_count=40,
+        )
+        for n in range(8)
+    ]
+    assert ticks == [True, False, False, False, True, False, False, False]
+    assert should_fountain_tick(
+        stressed=False,
+        at_cap=True,
+        tick_n=1,
+        pressure=0.15,
+        nack_count=40,
+    )
+    assert not should_fountain_tick(
+        stressed=False,
+        at_cap=True,
+        tick_n=1,
+        pressure=0.10,
+        nack_count=40,
+    )
 
 
 def test_update_adaptive_pace_backoff_only():

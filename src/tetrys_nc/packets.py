@@ -178,15 +178,10 @@ def miss_bitmap_to_nacks(next_needed: int, bitmap: bytes) -> list[int]:
 def merge_feedback_nacks(
     pkt: GenFeedbackPacket,
 ) -> tuple[list[int], dict[int, int]]:
-    """Merge explicit NACK list with optional miss bitmap."""
+    """Use explicit NACK ranks. Bitmap holes are not rx=0 (unknown ≠ empty)."""
     nacks = list(pkt.nack_gens)
     counts = pkt.nack_rx_counts or []
     nack_rx = dict(zip(pkt.nack_gens, counts))
-    if pkt.miss_bitmap:
-        for gid in miss_bitmap_to_nacks(pkt.next_needed_gen, pkt.miss_bitmap):
-            if gid not in nack_rx:
-                nacks.append(gid)
-                nack_rx[gid] = 0
     return nacks, nack_rx
 
 

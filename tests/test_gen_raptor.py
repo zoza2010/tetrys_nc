@@ -31,16 +31,17 @@ def test_fountain_targets_prefers_frontier_and_skips_full_rank():
         limit=4,
         decode_margin=2,
     )
-    # 12 already has K+margin symbols; 10 is the frontier even if nacked.
+    # 12 already has K+margin symbols. 18 is a known-rank hole; a leftover
+    # slot can repair it without walking the decoded window.
     assert got[0] == 10
     assert 12 not in got
     assert 18 in got
     assert len(got) <= 4
 
 
-def test_fountain_targets_walks_window_without_nacks():
+def test_fountain_targets_does_not_spray_unknown_window():
     got = fountain_targets(5, 20, nacks=[], nack_rx={}, gen_k=192, limit=3)
-    assert got == [5, 6, 7]
+    assert got == [5]
 
 
 def test_repair_count():
@@ -200,6 +201,8 @@ def test_gen_feedback_miss_bitmap_wire():
     assert got.miss_bitmap == bitmap
     nacks, rx = merge_feedback_nacks(got)
     assert 10 in nacks and rx[10] == 7
+    assert 12 not in nacks
+    assert 12 not in rx
     assert miss_bitmap_to_nacks(10, bitmap) == [10, 12, 22]
 
 
