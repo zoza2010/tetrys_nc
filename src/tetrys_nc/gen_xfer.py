@@ -89,7 +89,6 @@ _MIN_INFLIGHT_GENS = 64
 _ENCODE_WORKERS = 4
 _ENCODE_PREFETCH = 16
 # Hybrid pipeline: fountain only when unrecovered occupancy is high.
-_PIPELINE_INFLIGHT_FRAC = 3 / 4
 # Fountain mode (overhead=0): per-gen repair in encode worker; cap top-up at inflight limit.
 _FOUNTAIN_TARGET_OVERHEAD_PCT = 8
 # Fountain tick every N systematic sends when hybrid path is stressed (not at hard cap).
@@ -162,6 +161,11 @@ _DELAY_CC_DELIVERY_CUT_HARD = 0.55
 _DELAY_CC_MAX_RTT_S = 2.0
 # Slowly forget optimistic min_rtt so a lucky early sample cannot stick forever.
 _DELAY_CC_MIN_RTT_GROW = 1.0008
+# EWMA + spike gate: a single 75→187 ms echo must not slam pace to the floor.
+_DELAY_CC_RTT_ALPHA = 0.20
+_DELAY_CC_SPIKE_MULT = 1.75
+_DELAY_CC_SPIKE_MIN_S = 0.040
+_DELAY_CC_SPIKE_CONFIRM = 3
 # FEC may ease below base only after this much continuous clean path time.
 _OH_CLEAN_HOLD_S = 4.0
 _OH_FLOOR_PCT = 8
@@ -232,6 +236,11 @@ def should_pause_blast(
     return incomplete >= (inflight_gen_limit * 3) // 4
 
 
+def delay_cc_may_probe(occupancy: int, inflight_gen_limit: int) -> bool:
+    """Climb only while the pipeline still has room (≈BDP, not a full window)."""
+    return int(occupancy) < max(1, int(inflight_gen_limit) // 4)
+
+
 def repair_pressure(
     incomplete: int,
     frontier_lag: int,
@@ -288,6 +297,39 @@ def echo_rtt_s(echo_ts_us: int, now_s: float) -> float | None:
     if delta == 0 or delta > int(_DELAY_CC_MAX_RTT_S * 1_000_000):
         return None
     return delta / 1_000_000.0
+
+
+def smooth_delay_rtt_s(
+    sample_s: float,
+    ewma_s: float,
+    spike_streak: int = 0,
+    *,
+    alpha: float = _DELAY_CC_RTT_ALPHA,
+    spike_mult: float = _DELAY_CC_SPIKE_MULT,
+    spike_min_s: float = _DELAY_CC_SPIKE_MIN_S,
+    spike_confirm: int = _DELAY_CC_SPIKE_CONFIRM,
+) -> tuple[float, bool, int]:
+    """EWMA RTT. Isolated spikes do not move the filter or count as congestion.
+
+    Returns (ewma_s, is_spike, spike_streak). After ``spike_confirm`` consecutive
+    outliers the rise is treated as real delay and mixed in with ``alpha``.
+    """
+    if sample_s <= 0.0:
+        return ewma_s, False, 0
+    if ewma_s <= 0.0:
+        return sample_s, False, 0
+    outlier = (
+        sample_s >= ewma_s * spike_mult
+        and (sample_s - ewma_s) >= spike_min_s
+    )
+    if outlier:
+        streak = int(spike_streak) + 1
+        if streak < max(1, spike_confirm):
+            return ewma_s, True, streak
+        mixed = ewma_s * (1.0 - alpha) + sample_s * alpha
+        return mixed, False, streak
+    mixed = ewma_s * (1.0 - alpha) + sample_s * alpha
+    return mixed, False, 0
 
 
 def update_delay_pace_bps(
@@ -350,6 +392,7 @@ def update_delivery_guard_bps(
     min_bps: float,
     wire_bps: float = 0.0,
     fill_frac: float = 0.80,
+    window_full: bool = False,
     bad_frac: float = _DELAY_CC_DELIVERY_BAD,
     ok_frac: float = _DELAY_CC_DELIVERY_OK,
     cut: float = _DELAY_CC_DELIVERY_CUT,
@@ -358,12 +401,17 @@ def update_delivery_guard_bps(
     """Cut pace when goodput lags bytes actually put on the wire.
 
     Compare to send volume, not the limiter target: a 900 Mbit ceiling with
-    80 MiB/s wire is encode/pacer limited, not a policer. Only back off when
-    the limiter is filling and the receiver still gets a small fraction.
+    80 MiB/s wire is encode/pacer limited, not a policer. When the inflight
+    window is full we are paused, wire collapses, and that fill check would
+    never fire — then compare to the limiter target instead.
     """
-    if wire_bps > 0.0 and wire_bps < cur_bps * fill_frac:
+    if (
+        (not window_full)
+        and wire_bps > 0.0
+        and wire_bps < cur_bps * fill_frac
+    ):
         return cur_bps, "hold"
-    offer = wire_bps if wire_bps > 0.0 else cur_bps
+    offer = cur_bps if window_full else (wire_bps if wire_bps > 0.0 else cur_bps)
     oh = max(0, int(overhead_pct)) / 100.0
     expected_app = offer / (1.0 + oh)
     if expected_app < 1.0 or delivery_bps <= 0.0:
@@ -468,7 +516,15 @@ def repair_thread_limit(
     inflight_gen_limit: int,
 ) -> int:
     """Scale repair parallelism with backlog; storm throttles blast, not HOL."""
-    base = _REPAIR_AT_CAP if at_cap else _REPAIR_PER_TURN
+    if at_cap:
+        backlog = max(nack_count, frontier_lag // 16, 1)
+        scaled = min(16, max(_REPAIR_AT_CAP, backlog // 2))
+        if not storm_active:
+            return scaled
+        if frontier_lag >= max(64, inflight_gen_limit // 4):
+            return min(8, max(2, backlog // 8))
+        return 1
+    base = _REPAIR_PER_TURN
     backlog = max(nack_count, frontier_lag // 64, 1)
     scaled = min(16, max(base, backlog // 4))
     if not storm_active:
@@ -522,13 +578,10 @@ def pipeline_stressed(
     *,
     inflight_gen_limit: int,
 ) -> bool:
-    """Fountain pipeline when unrecovered occupancy is high.
-
-    Frontier lag alone is BDP/HOL on a long-delay path (~70 gens at 900 Mbit
-    / 80 ms). Treating that as stress pins FEC high on an otherwise clean WAN.
-    """
-    del lag
-    return incomplete >= int(inflight_gen_limit * _PIPELINE_INFLIGHT_FRAC)
+    """Fountain pipeline when unrecovered occupancy hits the blast pause."""
+    return should_pause_blast(
+        incomplete, lag, inflight_gen_limit=inflight_gen_limit
+    )
 
 
 def update_adaptive_pace_bps(
@@ -1049,6 +1102,8 @@ def run_gen_server(
         "bad_streak": 0,
         "min_rtt_s": 0.0,
         "rtt_s": 0.0,
+        "rtt_ewma_s": 0.0,
+        "spike_streak": 0,
         "queue_s": 0.0,
         "last_cc_ts": 0.0,
         "clean_streak": 0,
@@ -1128,11 +1183,20 @@ def run_gen_server(
                             )
                             stalled = frontier_lag >= (inflight_gen_limit * 9) // 10
                             with pace_lock:
-                                pace_state["rtt_s"] = rtt
-                                if pace_state["min_rtt_s"] <= 0 or rtt < pace_state["min_rtt_s"]:
+                                ewma, is_spike, spike_n = smooth_delay_rtt_s(
+                                    rtt,
+                                    pace_state["rtt_ewma_s"],
+                                    int(pace_state["spike_streak"]),
+                                )
+                                pace_state["rtt_ewma_s"] = ewma
+                                pace_state["spike_streak"] = spike_n
+                                pace_state["rtt_s"] = ewma
+                                if pace_state["min_rtt_s"] <= 0 or (
+                                    (not is_spike) and rtt < pace_state["min_rtt_s"]
+                                ):
                                     pace_state["min_rtt_s"] = rtt
                                 pace_state["queue_s"] = max(
-                                    0.0, rtt - pace_state["min_rtt_s"]
+                                    0.0, ewma - pace_state["min_rtt_s"]
                                 )
                                 # At a low pace with a healthy frontier, persistent
                                 # delay is baseline drift/jitter, not self-queueing.
@@ -1143,13 +1207,14 @@ def run_gen_server(
                                     < (inflight_gen_limit * 3) // 20
                                 )
                                 if (
-                                    pipeline_clean
+                                    (not is_spike)
+                                    and pipeline_clean
                                     and pace_state["queue_s"]
                                     >= _DELAY_CC_TARGET_QUEUE_MIN_S
                                 ):
                                     pace_state["min_rtt_s"] = min(
-                                        rtt,
-                                        pace_state["min_rtt_s"] * 0.85 + rtt * 0.15,
+                                        ewma,
+                                        pace_state["min_rtt_s"] * 0.85 + ewma * 0.15,
                                     )
                                     # The frontier proves this rate is sustainable;
                                     # allow one cautious probe despite RTT jitter.
@@ -1160,7 +1225,9 @@ def run_gen_server(
                                     * _DELAY_CC_TARGET_QUEUE_RTT_FRAC,
                                 )
                                 queue_s = pace_state["queue_s"]
-                                if queue_s <= target_q * 0.70:
+                                if is_spike:
+                                    pass  # keep streaks; one echo must not look like a queue
+                                elif queue_s <= target_q * 0.70:
                                     pace_state["clean_streak"] += 1
                                     pace_state["congestion_streak"] = 0
                                 elif queue_s >= target_q:
@@ -1169,9 +1236,16 @@ def run_gen_server(
                                 else:
                                     pace_state["clean_streak"] = 0
                                     pace_state["congestion_streak"] = 0
+                                occupancy = max(
+                                    0, send_frontier["gen_id"] - completed
+                                )
                                 congestion_pressure = (
-                                    send_frontier["gen_id"] - completed
-                                    >= inflight_gen_limit // 5
+                                    occupancy >= inflight_gen_limit // 5
+                                )
+                                window_full = should_pause_blast(
+                                    occupancy,
+                                    occupancy,
+                                    inflight_gen_limit=inflight_gen_limit,
                                 )
                                 congested = (
                                     congestion_pressure
@@ -1182,15 +1256,36 @@ def run_gen_server(
                                     pace_state["clean_streak"]
                                     >= delay_clean_n
                                     and now >= pace_state["hold_until"]
+                                    and delay_cc_may_probe(
+                                        occupancy, inflight_gen_limit
+                                    )
                                 )
                                 if (
+                                    not stalled
+                                    and window_full
+                                    and (now - pace_state["last_cc_ts"])
+                                    >= _DELAY_CC_UPDATE_S
+                                ):
+                                    floor = max_bps * pace_min_frac
+                                    cur = max(
+                                        floor,
+                                        pace_state["bps"] * _DELAY_CC_DOWN_HARD,
+                                    )
+                                    pace_state["bps"] = cur
+                                    pace_state["last_cc_ts"] = now
+                                    pace_state["clean_streak"] = 0
+                                    pace_state["hold_until"] = (
+                                        now + _DELAY_CC_BACKOFF_HOLD_S
+                                    )
+                                    limiter.set_rate(cur)
+                                elif (
                                     not stalled
                                     and (congested or probe_ready)
                                     and (now - pace_state["last_cc_ts"])
                                     >= _DELAY_CC_UPDATE_S
                                 ):
                                     cur, min_rtt, queue_s = update_delay_pace_bps(
-                                        rtt_s=rtt,
+                                        rtt_s=ewma,
                                         min_rtt_s=pace_state["min_rtt_s"],
                                         cur_bps=pace_state["bps"],
                                         max_bps=max_bps,
@@ -1625,7 +1720,7 @@ def run_gen_server(
                 prune_fountain(next_needed, nack_rx, nacks, sent_before)
                 if not fountain_mode:
                     with fountain_lock:
-                        if not fountain_gens:
+                        if not fountain_gens and not at_cap:
                             return 0
                 targets = fountain_targets(
                     next_needed,
@@ -1683,7 +1778,9 @@ def run_gen_server(
                         time.sleep(0.005)
                         continue
                     incomplete = max(0, gid - completed)
-                    at_cap = incomplete >= inflight_gen_limit
+                    at_cap = should_pause_blast(
+                        incomplete, 0, inflight_gen_limit=inflight_gen_limit
+                    )
                     now = time.monotonic()
                     storm_active = now < storm_state["until"]
                     stuck = (now - stuck_nn_since) >= _STUCK_S and not storm_active
@@ -1816,7 +1913,9 @@ def run_gen_server(
                     stressed = pipeline_stressed(
                         incomplete, lag, inflight_gen_limit=inflight_gen_limit
                     )
-                    at_cap = incomplete >= inflight_gen_limit
+                    at_cap = should_pause_blast(
+                        incomplete, lag, inflight_gen_limit=inflight_gen_limit
+                    )
                     with fb_lock:
                         nacks = list(fb_state["nacks"])
                         nack_rx = dict(fb_state["nack_rx"])
@@ -1940,13 +2039,19 @@ def run_gen_server(
                                     deliv_mib = delivery_bps / (1024 * 1024)
                                     wire_bps = wire_bytes / max(dt, 1e-6)
                                     filling = wire_bps >= pace_state["bps"] * 0.80
-                                    if filling:
+                                    window_full = should_pause_blast(
+                                        max(0, gen_id - int(done_g)),
+                                        0,
+                                        inflight_gen_limit=inflight_gen_limit,
+                                    )
+                                    if filling or window_full:
                                         new_bps, why = update_delivery_guard_bps(
                                             delivery_bps=delivery_bps,
                                             cur_bps=pace_state["bps"],
                                             overhead_pct=int(overhead_state["pct"]),
                                             min_bps=limiter.min_rate,
                                             wire_bps=wire_bps,
+                                            window_full=window_full,
                                         )
                                         if why.startswith("cut"):
                                             bad = int(pace_state["bad_streak"]) + 1

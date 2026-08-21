@@ -28,6 +28,7 @@ from tetrys_nc.gen_xfer import (
     client_feedback_horizon,
     client_feedback_interval,
     compute_inflight_gen_limit,
+    delay_cc_may_probe,
     echo_rtt_s,
     fountain_redundancy,
     hol_hole_gens,
@@ -45,6 +46,7 @@ from tetrys_nc.gen_xfer import (
     should_pause_blast,
     should_track_fountain_gen,
     should_yield_blast_to_repair,
+    smooth_delay_rtt_s,
     track_fountain_gen,
     update_adaptive_pace_bps,
     update_delay_pace_bps,
@@ -238,6 +240,31 @@ def test_echo_rtt_and_delay_pace():
     assert short_bps < 80_000_000.0
 
 
+def test_smooth_delay_rtt_ignores_isolated_spikes():
+    ewma, spike, n = smooth_delay_rtt_s(0.075, 0.0)
+    assert not spike and n == 0
+    assert ewma == pytest.approx(0.075)
+    # Today's WAN blip: 75 → 187 ms must not pull the filter.
+    ewma2, spike2, n2 = smooth_delay_rtt_s(0.187, ewma)
+    assert spike2 and n2 == 1
+    assert ewma2 == pytest.approx(0.075)
+    ewma3, spike3, n3 = smooth_delay_rtt_s(0.080, ewma2, n2)
+    assert not spike3 and n3 == 0
+    assert abs(ewma3 - 0.075) < 0.01
+    # Sustained jump is real delay: after 3 outliers, mix in.
+    ewma_s = 0.075
+    streak = 0
+    for _ in range(3):
+        ewma_s, is_spike, streak = smooth_delay_rtt_s(0.187, ewma_s, streak)
+    assert not is_spike
+    assert ewma_s > 0.075
+    assert ewma_s < 0.187
+    # Modest standing queue is not a spike.
+    slow, spike_slow, _ = smooth_delay_rtt_s(0.095, 0.075)
+    assert not spike_slow
+    assert 0.075 < slow < 0.095
+
+
 def test_delivery_guard_cuts_overload_not_below_floor():
     floor = 25_000_000.0  # 200 Mbit
     # 900 Mbit pace, ~13 MiB/s goodput (today's 33% loss collapse).
@@ -293,6 +320,25 @@ def test_delivery_guard_cuts_overload_not_below_floor():
         min_bps=floor,
     )
     assert why_pace == "hold" or why_pace == "ok"
+    # Paused at inflight cap: tiny wire must not hide a 2 MiB/s collapse.
+    cap_cut, why_cap = update_delivery_guard_bps(
+        delivery_bps=2.0 * 1024 * 1024,
+        cur_bps=112_500_000.0,
+        overhead_pct=20,
+        min_bps=floor,
+        wire_bps=4.0 * 1024 * 1024,
+        window_full=True,
+    )
+    assert why_cap == "cut_hard"
+    assert cap_cut == pytest.approx(112_500_000.0 * 0.55)
+
+
+def test_delay_cc_blocks_probe_on_full_pipeline():
+    cap = 517
+    assert delay_cc_may_probe(70, cap)
+    assert delay_cc_may_probe(cap // 4 - 1, cap)
+    assert not delay_cc_may_probe(cap // 4, cap)
+    assert not delay_cc_may_probe(387, cap)
 
 
 def test_client_feedback_interval_is_fast_while_open():
