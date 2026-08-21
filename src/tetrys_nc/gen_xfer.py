@@ -17,6 +17,7 @@ import time
 from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 
+from .encbench import bench_encode
 from .gen_raptor import (
     GenDecoder,
     GenEncoder,
@@ -27,6 +28,7 @@ from .gen_raptor import (
     repair_count,
     require_raptorq,
 )
+from .hostcpu import HostCpuSampler
 from .ratectl import RateLimiter
 from .netutil import (
     recv_datagrams,
@@ -964,6 +966,56 @@ def hol_blocks_tail_repair(
     return d is not None and d > near_complete
 
 
+def repair_overhead_pct(overhead_pct: int) -> int:
+    """Pad repair with the live FEC calculator, not a fixed surplus.
+
+    `overhead_pct=0` (fountain) uses the same 8% bootstrap as the blast path.
+    """
+    pct = int(overhead_pct)
+    if pct > 0:
+        return pct
+    return _FOUNTAIN_TARGET_OVERHEAD_PCT
+
+
+def hol_resend_pad_n(miss_n: int, overhead_pct: int) -> int:
+    """Fountain extras after sparse HOL ESI resend, using live FEC."""
+    n = max(0, int(miss_n))
+    if n <= 0:
+        return 0
+    pad = repair_overhead_pct(overhead_pct) / 100.0
+    extra = max(0, math.ceil(n * (1.0 + pad)) - n)
+    if extra == 0 and pad > 0:
+        extra = 1
+    return int(extra)
+
+
+def note_close_round(hist: list[int], rounds: int) -> None:
+    """Bucket a closed hole by how many NACK/repair rounds it took."""
+    if rounds <= 0 or not hist:
+        return
+    idx = min(int(rounds), len(hist)) - 1
+    hist[idx] += 1
+
+
+def format_close_rounds(hist: list[int], *, label: str) -> str:
+    names = ("r1", "r2", "r3", "r4", "r5+")
+    n = min(len(hist), len(names))
+    body = " ".join(f"{names[i]}={int(hist[i])}" for i in range(n))
+    return f"{label} {body} n={sum(hist[:n])}"
+
+
+def nack_close_rounds(elapsed_s: float, rtt_s: float | None) -> int:
+    """How many RTTs a NACK'd gen stayed open. Not feedback-tick count.
+
+    A hole closed by the first repair is typically ~1 RTT (~80ms) plus
+    holdoff; that used to land in r5+ because ACK is every 20ms.
+    """
+    rtt = float(rtt_s) if rtt_s is not None and rtt_s >= 0.02 else 0.08
+    if elapsed_s <= 0:
+        return 1
+    return max(1, int(elapsed_s / rtt + 0.5))
+
+
 def repair_send_n(
     symbols_rx: int | None,
     gen_k: int,
@@ -973,8 +1025,9 @@ def repair_send_n(
     decode_margin: int = _DECODE_MARGIN,
     round_max: int | None = None,
     probe: int = _FOUNTAIN_PROBE,
+    overhead_pct: int | None = None,
 ) -> int:
-    """Deficit-sized top-up. Unknown rank is a probe, never a full reblast."""
+    """Deficit top-up padded by live FEC so the patch survives the same loss."""
     deficit = gen_rank_deficit(symbols_rx, gen_k, decode_margin=decode_margin)
     if deficit is None:
         cap = int(round_max) if round_max is not None else _FOUNTAIN_SEND_MAX
@@ -989,6 +1042,14 @@ def repair_send_n(
         cap = _FOUNTAIN_SEND_MAX
     else:
         cap = _FOUNTAIN_TAIL_MAX
+    if overhead_pct is not None:
+        pad = repair_overhead_pct(overhead_pct) / 100.0
+        n = math.ceil(deficit * (1.0 + pad))
+        if deficit <= _FOUNTAIN_NEAR_COMPLETE:
+            # Tail cap is 4; a 4-symbol close + 10% FEC must not be clipped
+            # back to an unpadded deficit (one lost repair → extra RTT).
+            cap = max(cap, n)
+        return max(1, min(int(n), cap))
     if deficit <= _FOUNTAIN_NEAR_COMPLETE:
         n = deficit + (1 if hol else 0)
         return max(1, min(int(n), cap))
@@ -1458,6 +1519,13 @@ def run_gen_server(
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
+    print(
+        "cpu: steal=hypervisor  psi=in-VM stall  thr=cgroup quota  "
+        "mhz=freq | slow encbench+steal→host; +psi/thr→VM; "
+        "stable encbench+high wenc→our pool"
+    )
+    host_cpu = HostCpuSampler()
+    host_cpu.prime()
     print("waiting for client READY...")
 
     client_addr: tuple[str, int] | None = None
@@ -1477,6 +1545,14 @@ def run_gen_server(
         if isinstance(pkt, ReadyPacket):
             client_addr = addr
             print(f"client ready from {addr}")
+            try:
+                print(bench_encode(n=8, warmup=1).format_line("before"), flush=True)
+            except Exception as exc:  # pragma: no cover
+                print(f"encbench before failed: {exc}", file=sys.stderr)
+            snap = host_cpu.sample()
+            if snap is not None and snap.available:
+                print(snap.format_line(), flush=True)
+            host_cpu.prime()
 
     assert client_addr is not None
 
@@ -1589,6 +1665,9 @@ def run_gen_server(
     repair_extra: dict[int, int] = {}
     last_repair_ts: dict[int, float] = {}
     last_full_ts: dict[int, float] = {}
+    repair_rounds: dict[int, int] = {}
+    repair_close_hist = [0, 0, 0, 0, 0]
+    overhead_state = {"pct": overhead_pct}
     stop_fb = threading.Event()
     fb_lock = threading.Lock()
     fb_state = {
@@ -2012,32 +2091,45 @@ def run_gen_server(
         """Sync repair encode (repair thread fallback)."""
         if (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
             return []
+        esi_wires: list[bytes] = []
         if source_esis:
             enc = get_or_make_encoder(mm, nid)
             if enc is not None:
                 pkts = enc.packets()
                 ts_us = int(now * 1_000_000) & 0xFFFFFFFF
-                wires = [
+                esi_wires = [
                     GenPacket(nid, esi, pkts[esi], ts_us).pack()
                     for esi in source_esis[:32]
                     if 0 <= esi < len(pkts)
                 ]
-                if wires:
-                    last_repair_ts[nid] = now
-                    return wires
         if (
-            symbols_rx is not None
+            not esi_wires
+            and symbols_rx is not None
             and symbols_rx >= gen_k + _DECODE_MARGIN
             and send_n is None
         ):
             return []
         if nid < 0 or nid >= total_gens:
-            return []
+            return esi_wires
         prior_extra = repair_extra.get(nid, 0)
         if send_n is None:
-            send_n = repair_send_n(symbols_rx, gen_k, hol=hol)
-            if send_n <= 0:
-                return []
+            if esi_wires:
+                send_n = hol_resend_pad_n(
+                    len(esi_wires), int(overhead_state["pct"])
+                )
+                if send_n <= 0:
+                    last_repair_ts[nid] = now
+                    repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+                    return esi_wires
+            else:
+                send_n = repair_send_n(
+                    symbols_rx,
+                    gen_k,
+                    hol=hol,
+                    overhead_pct=int(overhead_state["pct"]),
+                )
+                if send_n <= 0:
+                    return []
         send_n = max(1, min(int(send_n), _REPAIR_ROUND_MAX))
         ts_us = int(now * 1_000_000) & 0xFFFFFFFF
         pool = repair_pool if repair_pool is not None else encode_pool
@@ -2057,21 +2149,34 @@ def run_gen_server(
                     ts_us,
                 ).result(timeout=30.0)
             except Exception:
-                return []
+                if esi_wires:
+                    last_repair_ts[nid] = now
+                    repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+                return esi_wires
             if not wires:
-                return []
+                if esi_wires:
+                    last_repair_ts[nid] = now
+                    repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+                return esi_wires
             win.add_repair_enc(enc_cpu_s)
             repair_extra[nid] = prior_extra + sent
             last_repair_ts[nid] = now
-            return wires
+            repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+            return esi_wires + wires
         enc = get_or_make_encoder(mm, nid)
         if enc is None:
-            return []
+            if esi_wires:
+                last_repair_ts[nid] = now
+                repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+            return esi_wires
         t_enc = time.monotonic()
         target_budget = prior_extra + send_n
         new_pkts = enc.ensure_repair(target_budget)
         if not new_pkts:
-            return []
+            if esi_wires:
+                last_repair_ts[nid] = now
+                repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
+            return esi_wires
         new_pkts = new_pkts[-send_n:]
         repair_extra[nid] = prior_extra + len(new_pkts)
         first_esi = enc.packet_count - len(new_pkts)
@@ -2080,8 +2185,9 @@ def run_gen_server(
             for i, blob in enumerate(new_pkts)
         ]
         last_repair_ts[nid] = now
+        repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
         win.add_repair_enc(time.monotonic() - t_enc)
-        return wires
+        return esi_wires + wires
 
     def repair_nacks(
         mm: mmap.mmap,
@@ -2137,6 +2243,7 @@ def run_gen_server(
     wait_enc_s = 0.0
     wire_bytes = 0
     blast_pkts = 0
+    blast_gens = 0
     repair_pkts_w = 0
 
     try:
@@ -2168,7 +2275,6 @@ def run_gen_server(
             repair_spread_n = 0
             storm_state = {"until": 0.0}
             repair_pending_gids: set[int] = set()
-            overhead_state = {"pct": overhead_pct}
 
             def repair_pending_count() -> int:
                 with repair_fut_lock:
@@ -2221,7 +2327,12 @@ def run_gen_server(
                     return bool(wires)
                 prior_extra = repair_extra.get(nid, 0)
                 if send_n is None:
-                    send_n = repair_send_n(symbols_rx, gen_k, hol=hol)
+                    send_n = repair_send_n(
+                        symbols_rx,
+                        gen_k,
+                        hol=hol,
+                        overhead_pct=int(overhead_state["pct"]),
+                    )
                     if send_n <= 0:
                         return False
                 if fountain_mode:
@@ -2278,6 +2389,7 @@ def run_gen_server(
                         continue
                     win.add_repair_enc(enc_cpu_s)
                     repair_extra[nid] = prior_extra + sent
+                    repair_rounds[nid] = repair_rounds.get(nid, 0) + 1
                     send_batch(wires, repair=True)
                     n += len(wires)
                 if still:
@@ -2337,6 +2449,7 @@ def run_gen_server(
                         nack_rx.get(nid),
                         gen_k,
                         hol=(nid == next_needed),
+                        overhead_pct=int(overhead_state["pct"]),
                     )
                     if send_n <= 0:
                         continue
@@ -2510,6 +2623,11 @@ def run_gen_server(
                     if next_needed != stuck_nn:
                         stuck_nn = next_needed
                         stuck_nn_since = now
+                        for gid in list(repair_rounds):
+                            if gid < next_needed:
+                                note_close_round(
+                                    repair_close_hist, repair_rounds.pop(gid)
+                                )
                         prune_repair_meta(
                             repair_extra,
                             last_repair_ts,
@@ -2647,6 +2765,7 @@ def run_gen_server(
                                 at_cap=at_cap,
                             )
                     gens_sent += 1
+                    blast_gens += 1
                     bytes_sent_payload += source_bytes
                     gen_id += 1
                     cursor["gen_id"] = gen_id
@@ -2744,6 +2863,11 @@ def run_gen_server(
                             oh_pct = int(overhead_state["pct"])
                             btlbw_mbit = float(pace_state["btlbw"]) * 8.0 / 1_000_000.0
                             startup_flag = "start" if pace_state["bbr_startup"] else "bw"
+                        for gid in list(repair_rounds):
+                            if gid < nn:
+                                note_close_round(
+                                    repair_close_hist, repair_rounds.pop(gid)
+                                )
                         print(
                             f"progress {gen_id}/{total_gens} "
                             f"client_done={done_g} "
@@ -2759,17 +2883,20 @@ def run_gen_server(
                             f"pipe={storm_flag} "
                             f"rtt={rtt_ms:.0f}/{q_ms:.0f}ms "
                             f"repair_extra={repair_sent} "
+                            f"{format_close_rounds(repair_close_hist, label='repair_close')} "
                             f"deliv={deliv_mib:.1f} "
                             f"app={rate:.1f} MiB/s"
                         )
                         print(
                             f"  xfer wire={wire_mib:.1f} "
-                            f"blast={blast_pkts} repair={repair_pkts_w} "
+                            f"blast={blast_pkts} gens={blast_gens} "
+                            f"repair={repair_pkts_w} "
                             f"enc_q={len(encode_futures)} "
                             f"repair_fut={repair_pending_count()} "
                             f"meta={len(repair_extra)} "
                             f"qdrop={qdrop} "
                             f"enc_cpu={enc_s * 1000:.0f}ms "
+                            f"ms/gen={enc_s / max(blast_gens, 1) * 1000:.1f} "
                             f"renc={renc_s * 1000:.0f}ms "
                             f"send={_pct(send_s, dt)}% "
                             f"(sys={sys_s * 1000:.0f}ms/{sys_n} "
@@ -2779,9 +2906,13 @@ def run_gen_server(
                             f"wenc={_pct(wait_enc_s, dt)}% "
                             f"limit={bottleneck}"
                         )
+                        snap = host_cpu.sample()
+                        if snap is not None and snap.available:
+                            print(snap.format_line(), flush=True)
                         send_s = pace_s = cap_s = wait_enc_s = 0.0
                         wire_bytes = 0
                         blast_pkts = 0
+                        blast_gens = 0
                         repair_pkts_w = 0
 
                 stop_repair.set()
@@ -2842,11 +2973,23 @@ def run_gen_server(
     goodput = file_size / max(elapsed, 1e-6) / (1024 * 1024)
     with fb_lock:
         completed = fb_state["completed"]
+        nn_done = int(fb_state["next_needed"])
+    for gid in list(repair_rounds):
+        if gid < nn_done:
+            note_close_round(repair_close_hist, repair_rounds.pop(gid))
     print(
         f"done in {elapsed:.2f}s — goodput {goodput:.2f} MiB/s — "
         f"gens_sent={gens_sent}/{total_gens} client_done={completed} "
-        f"repair_pkts={repair_sent}"
+        f"repair_pkts={repair_sent} "
+        f"{format_close_rounds(repair_close_hist, label='repair_close')}"
     )
+    try:
+        print(bench_encode(n=8, warmup=1).format_line("after"), flush=True)
+    except Exception as exc:  # pragma: no cover
+        print(f"encbench after failed: {exc}", file=sys.stderr)
+    snap = host_cpu.sample()
+    if snap is not None and snap.available:
+        print(snap.format_line(), flush=True)
     return 0
 
 
@@ -2898,6 +3041,8 @@ def run_gen_client(
     pending_write: set[int] = set()
     # First time we observed an incomplete gen (reorder holdoff clock).
     deficit_since: dict[int, float] = {}
+    nack_since: dict[int, float] = {}
+    nack_close_hist = [0, 0, 0, 0, 0]
     done_bits = bytearray((total_gens + 7) // 8) if total_gens else bytearray()
     completed = 0
     next_needed_hint = 0
@@ -2936,6 +3081,13 @@ def run_gen_client(
         done_bits[i >> 3] |= 1 << (i & 7)
         completed += 1
         clear_gen_deficit(deficit_since, i)
+        first = nack_since.pop(i, None)
+        if first is not None:
+            rtt = echo_rtt_s(last_echo, time.monotonic())
+            note_close_round(
+                nack_close_hist,
+                nack_close_rounds(time.monotonic() - first, rtt),
+            )
         if i == next_needed_hint:
             while next_needed_hint < total_gens and bit_get(next_needed_hint):
                 clear_gen_deficit(deficit_since, next_needed_hint)
@@ -3018,6 +3170,7 @@ def run_gen_client(
         ):
             nacks.append(gid)
             nack_rx.append(open_rx[gid])
+            nack_since.setdefault(gid, now_fb)
         miss_bitmap = build_feedback_miss_bitmap(
             next_needed=next_needed,
             total_gens=total_gens,
@@ -3190,6 +3343,7 @@ def run_gen_client(
                     f"progress {completed}/{total_gens} ({pct:.1f}%) "
                     f"gens_recovered≈{gens_recovered} "
                     f"open_gens={len(active_gens)} "
+                    f"{format_close_rounds(nack_close_hist, label='nack_rtt')} "
                     f"{rate:.1f} MiB/s"
                 )
                 print(
@@ -3231,6 +3385,7 @@ def run_gen_client(
     )
     print(
         f"stats: gens_done={completed}/{total_gens} "
-        f"gens_recovered≈{gens_recovered}"
+        f"gens_recovered≈{gens_recovered} "
+        f"{format_close_rounds(nack_close_hist, label='nack_rtt')}"
     )
     return 0 if ok else 2

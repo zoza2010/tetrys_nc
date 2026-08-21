@@ -19,6 +19,7 @@ WAN_PROFILES = (
     "wan-good",
     "wan-dip",
     "wan-fast",
+    "wan-ooo",
 )
 
 
@@ -115,6 +116,8 @@ def test_wan_profile_names_match_batch():
     assert PROFILES["wan-slow"].rate_mbit < PROFILES["wan-fast"].rate_mbit
     assert PROFILES["wan-dip"].blackout_dur_s > 0
     assert PROFILES["wan-good"].loss < PROFILES["wan-slow"].loss
+    assert PROFILES["wan-ooo"].reorder_p > PROFILES["wan-good"].reorder_p
+    assert PROFILES["wan-ooo"].loss < PROFILES["wan-good"].loss
 
 
 @pytest.mark.parametrize("profile", WAN_PROFILES)
@@ -141,6 +144,7 @@ def test_wan_profiles_transfer_8m(tmp_path: Path, profile: str) -> None:
         "wan-good": 17630,
         "wan-dip": 17640,
         "wan-fast": 17650,
+        "wan-ooo": 17680,
     }
     port = ports[profile]
     ok, srv, emu = _run_through_netem(

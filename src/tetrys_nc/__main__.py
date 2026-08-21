@@ -13,6 +13,7 @@ def main() -> int:
             "  python -m tetrys_nc client --output PATH [--host HOST --port 9000]\n"
             "  python -m tetrys_nc genfile --output PATH [--size 1G]\n"
             "  python -m tetrys_nc netem --listen 127.0.0.1:7495 --forward 127.0.0.1:7494 --profile spain\n"
+            "  python -m tetrys_nc encbench [--k 96] [--seconds 8]\n"
         )
         return 0
     cmd = sys.argv[1]
@@ -33,6 +34,10 @@ def main() -> int:
         from .netem_udp import main as netem_main
 
         return netem_main(argv)
+    if cmd == "encbench":
+        from .encbench import main as encbench_main
+
+        return encbench_main(argv)
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 1
 

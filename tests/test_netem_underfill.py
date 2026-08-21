@@ -48,6 +48,13 @@ def test_underfill_profiles_exist_and_are_not_starve():
 
     assert starve.rate_mbit < 30.0
     assert fat.rate_mbit >= _CEILING_MBIT
+    ooo = PROFILES["wan-ooo"]
+    assert ooo.reorder_p >= 0.40
+    assert ooo.loss <= 0.01
+    assert ooo.rate_mbit >= 850.0
+    ooo_w = PROFILES["wan-ooo-wenc"]
+    assert ooo_w.duty_off_s > ooo.duty_off_s
+    assert ooo_w.reorder_p == ooo.reorder_p
 
 
 def test_underfill_rate_slower_than_900_cap():

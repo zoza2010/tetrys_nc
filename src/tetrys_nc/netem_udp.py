@@ -157,6 +157,31 @@ PROFILES: dict[str, PathSpec] = {
         duty_down=True,
         seed=26,
     ),
+    # 2026-08-21 night Russia↔Spain. iperf3 -u -R -b 900M -l 1350:
+    # receiver 895 Mbit, loss 0.50%, jitter <1 ms, ~45% datagrams OOO.
+    # Reorder is short (ECMP-scale), not 80 ms HOL. Tetrys 1G then 40 MiB/s
+    # with client wait_rx and server wenc 65–80% (encode stall, not policer).
+    "wan-ooo": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.001,
+        loss=0.005,
+        reorder_p=0.45,
+        reorder_extra_s=0.008,
+        rate_mbit=900.0,
+        seed=28,
+    ),
+    "wan-ooo-wenc": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.001,
+        loss=0.005,
+        reorder_p=0.45,
+        reorder_extra_s=0.008,
+        rate_mbit=900.0,
+        duty_on_s=0.008,
+        duty_off_s=0.011,
+        duty_down=True,
+        seed=29,
+    ),
     # Underfill + a HOL hole: later gens complete, next_needed freezes.
     "wan-underfill-hol": PathSpec(
         delay_s=0.040,
@@ -570,10 +595,15 @@ def main(argv: list[str] | None = None) -> int:
     duty = ""
     if spec.duty_on_s > 0 and spec.duty_off_s > 0:
         duty = f" duty={spec.duty_on_s*1e3:.0f}/{spec.duty_off_s*1e3:.0f}ms"
+    reorder = ""
+    if spec.reorder_p > 0:
+        reorder = (
+            f" reorder={spec.reorder_p:.0%}/{spec.reorder_extra_s*1e3:.0f}ms"
+        )
     print(
         f"netem {listen} -> {forward} profile={args.profile} "
         f"delay={spec.delay_s*1e3:.0f}ms loss={spec.loss} "
-        f"rate={spec.rate_mbit:.0f}mbit{duty} "
+        f"rate={spec.rate_mbit:.0f}mbit{duty}{reorder} "
         f"ge={spec.ge_p_gb} seed={spec.seed}  (TETRYS_GSO=0 on sender)"
     )
     last = time.monotonic()

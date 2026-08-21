@@ -37,10 +37,14 @@ from tetrys_nc.gen_xfer import (
     even_spread,
     fountain_redundancy,
     fountain_targets,
+    format_close_rounds,
     gen_rank_deficit,
     hol_blocks_tail_repair,
     hol_hole_gens,
     hol_repair_cooldown_s,
+    hol_resend_pad_n,
+    nack_close_rounds,
+    note_close_round,
     note_gen_deficit,
     order_repair_nacks,
     pipeline_stressed,
@@ -48,6 +52,7 @@ from tetrys_nc.gen_xfer import (
     prune_repair_meta,
     repair_holdoff_ready,
     repair_round_size,
+    repair_overhead_pct,
     repair_pressure,
     repair_send_n,
     repair_storm_detected,
@@ -602,6 +607,31 @@ def test_repair_send_n_deficit_and_probe():
     # near-complete: deficit 4 (enough=98, rx=94)
     assert repair_send_n(94, k, hol=False) == 4
     assert repair_send_n(94, k, hol=True) == 5
+    # Live FEC pad: 10% → 5 packets (not clipped by tail cap=4).
+    assert repair_send_n(94, k, hol=False, overhead_pct=10) == 5
+    assert repair_send_n(94, k, hol=True, overhead_pct=10) == 5
+    assert repair_send_n(97, k, hol=False, overhead_pct=10) == 2
+    assert repair_send_n(94, k, hol=False, overhead_pct=20) == 5
+    assert repair_overhead_pct(10) == 10
+    assert repair_overhead_pct(0) == 8
+    assert hol_resend_pad_n(0, 10) == 0
+    assert hol_resend_pad_n(1, 10) == 1
+    assert hol_resend_pad_n(4, 10) == 1
+    assert hol_resend_pad_n(10, 20) == 2
+    hist = [0, 0, 0, 0, 0]
+    note_close_round(hist, 0)
+    note_close_round(hist, 1)
+    note_close_round(hist, 1)
+    note_close_round(hist, 3)
+    note_close_round(hist, 9)
+    assert hist == [2, 0, 1, 0, 1]
+    assert "r1=2" in format_close_rounds(hist, label="nack_close")
+    assert "n=4" in format_close_rounds(hist, label="nack_close")
+    # 20ms ACK ticks over one 80ms RTT must not look like r5+.
+    assert nack_close_rounds(0.10, 0.081) == 1
+    assert nack_close_rounds(0.14, 0.081) == 2
+    assert nack_close_rounds(7 * 0.02, 0.081) == 2
+    assert nack_close_rounds(0.0, None) == 1
     assert repair_send_n(0, k, hol=True) == 16
     assert repair_send_n(0, k, hol=False) == 16
     assert gen_rank_deficit(None, k) is None

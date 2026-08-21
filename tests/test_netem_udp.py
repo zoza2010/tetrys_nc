@@ -151,6 +151,29 @@ def test_ack_delay_is_asymmetric():
     assert (u - 1.0) > (dn - 1.0) + 0.1
 
 
+def test_reorder_extra_delay_is_added():
+    d = Direction(
+        PathSpec(delay_s=0.01, reorder_p=1.0, reorder_extra_s=0.02, seed=1),
+        seed=1,
+    )
+    got = d.decide(1.0, 10)
+    assert got is not None
+    assert got >= 1.0 + 0.029
+
+
+def test_wan_ooo_matches_night_iperf():
+    spec = PROFILES["wan-ooo"]
+    assert spec.rate_mbit >= 850.0
+    assert spec.loss <= 0.01
+    assert 0.40 <= spec.reorder_p <= 0.50
+    assert spec.reorder_extra_s <= 0.020
+    wenc = PROFILES["wan-ooo-wenc"]
+    assert wenc.reorder_p == spec.reorder_p
+    assert wenc.duty_on_s > 0.0 and wenc.duty_off_s > 0.0
+    on_frac = wenc.duty_on_s / (wenc.duty_on_s + wenc.duty_off_s)
+    assert 0.35 <= on_frac <= 0.50
+
+
 def test_loss_after_blackout_only_on_down():
     spec = PathSpec(
         loss=0.0,
