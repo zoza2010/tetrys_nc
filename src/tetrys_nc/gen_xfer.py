@@ -77,8 +77,10 @@ _REPAIR_SURPLUS = max(
     0.0, min(1.0, float(os.environ.get("TETRYS_REPAIR_SURPLUS", "0.25")))
 )
 # Bound incomplete source data rather than generation count so larger K does
-# not recreate an unbounded repair tail. This is well above the path BDP.
-_MAX_INFLIGHT_BYTES = 64 * 1024 * 1024
+# not recreate an unbounded repair tail. 8 MiB is ~1 BDP at 900 Mbit/80 ms and
+# pauses blast; the send loop then starves (client limit=wait_rx at ~2 MiB/s).
+# 64 MiB is the WAN window that held ~85 MiB/s on this path.
+_MAX_INFLIGHT_MIB = 64.0
 _MIN_INFLIGHT_GENS = 64
 # Blast encode runs in separate PROCESSES: the raptorq binding holds the GIL
 # for the whole native encode (measured: a sendto in the send thread waits up
@@ -168,14 +170,36 @@ _DELAY_CC_SPIKE_MIN_S = 0.040
 _DELAY_CC_SPIKE_CONFIRM = 3
 # FEC may ease below base only after this much continuous clean path time.
 _OH_CLEAN_HOLD_S = 4.0
-_OH_FLOOR_PCT = 8
+_OH_FLOOR_PCT = 0
 _OH_CEIL_PCT = 20
+# BBR-style delivery-rate pacing (ATP PROBE_BW): don't outrun drain.
+_BBR_PROBE_GAIN = 1.25
+_BBR_DRAIN_GAIN = 0.75
+_BBR_CRUISE_GAIN = 1.00
+_BBR_STARTUP_GAIN = 2.00
+_BBR_CYCLE_UNITS = 8  # 1 probe + 1 drain + 6 cruise, in RTprop
+_BBR_BTLBW_RTPROP = 10.0  # BBR default, but never shorter than _BBR_BTLBW_MIN_S
+_BBR_BTLBW_MIN_S = 3.0  # WAN: one delay bump must not expire a good probe
+_BBR_STARTUP_GROW = 1.25  # still filling the pipe if BtlBw grew this much
+_BBR_STARTUP_FLAT = 3  # exit STARTUP after this many ungrown RTprop rounds
+_BBR_SAMPLE_KEEP = 64
+
+
+def max_inflight_bytes() -> int:
+    """Byte cap for unrecovered gens. Override with TETRYS_INFLIGHT_MIB."""
+    raw = os.environ.get("TETRYS_INFLIGHT_MIB", str(_MAX_INFLIGHT_MIB))
+    try:
+        mib = float(raw or str(_MAX_INFLIGHT_MIB))
+    except ValueError:
+        mib = _MAX_INFLIGHT_MIB
+    mib = min(64.0, max(2.0, mib))
+    return int(mib * 1024 * 1024)
 
 
 def compute_inflight_gen_limit(gen_k: int, symbol_size: int) -> int:
     """Byte-bounded pipeline window in generations (size-independent in bytes)."""
     block_bytes = max(1, gen_k) * max(64, symbol_size)
-    return max(_MIN_INFLIGHT_GENS, _MAX_INFLIGHT_BYTES // block_bytes)
+    return max(_MIN_INFLIGHT_GENS, max_inflight_bytes() // block_bytes)
 
 
 def client_feedback_horizon(inflight_gen_limit: int) -> int:
@@ -237,8 +261,8 @@ def should_pause_blast(
 
 
 def delay_cc_may_probe(occupancy: int, inflight_gen_limit: int) -> bool:
-    """Climb only while the pipeline still has room (≈BDP, not a full window)."""
-    return int(occupancy) < max(1, int(inflight_gen_limit) // 4)
+    """Climb only while blast is not paused on occupancy."""
+    return int(occupancy) < (max(1, int(inflight_gen_limit)) * 3) // 4
 
 
 def repair_pressure(
@@ -274,16 +298,18 @@ def adaptive_blast_overhead_pct(
     if base_pct <= 0:
         return 0
     hi = max(base_pct, max_pct if max_pct is not None else _OH_CEIL_PCT)
-    floor = max(1, min(floor_pct, base_pct))
+    floor = max(0, min(int(floor_pct), int(base_pct)))
     pressure = repair_pressure(
         incomplete, frontier_lag, inflight_gen_limit=inflight_gen_limit
     )
     del nack_count
-    if pressure >= 0.45:
+    # Pause is 75% of the window. Fractions of 0.15/0.45 fire on a healthy
+    # BDP of a small window; require half-full before raising FEC.
+    if pressure >= 0.75:
         return hi
-    if pressure >= 0.15:
+    if pressure >= 0.50:
         return max(base_pct, (base_pct + hi) // 2)
-    if clean_s >= clean_hold_s and floor < base_pct:
+    if clean_s >= clean_hold_s and floor <= base_pct:
         return floor
     return base_pct
 
@@ -330,6 +356,89 @@ def smooth_delay_rtt_s(
         return mixed, False, streak
     mixed = ewma_s * (1.0 - alpha) + sample_s * alpha
     return mixed, False, 0
+
+
+def bbr_pacing_gain(
+    now_s: float,
+    rtprop_s: float,
+    cycle_t0: float,
+    *,
+    probe: float = _BBR_PROBE_GAIN,
+    drain: float = _BBR_DRAIN_GAIN,
+    cruise: float = _BBR_CRUISE_GAIN,
+    units: int = _BBR_CYCLE_UNITS,
+) -> float:
+    """PROBE_BW-style gain: 1.25 / 0.75 / 6× cruise, one unit = RTprop."""
+    rtprop = max(0.020, float(rtprop_s) if rtprop_s > 0.0 else 0.080)
+    period = max(1, int(units)) * rtprop
+    pos = (max(0.0, now_s - cycle_t0) % period) / rtprop
+    if pos < 1.0:
+        return probe
+    if pos < 2.0:
+        return drain
+    return cruise
+
+
+def update_btlbw_bps(
+    *,
+    delivery_bps: float,
+    samples: list[tuple[float, float]],
+    now_s: float,
+    rtprop_s: float,
+    window_rtprop: float = _BBR_BTLBW_RTPROP,
+    keep: int = _BBR_SAMPLE_KEEP,
+) -> tuple[float, list[tuple[float, float]]]:
+    """Windowed max delivery (BBR BtlBw). A slow start expires instead of pinning."""
+    out = list(samples)
+    if delivery_bps > 1.0:
+        out.append((float(now_s), float(delivery_bps)))
+    rtprop = max(0.020, float(rtprop_s) if rtprop_s > 0.0 else 0.080)
+    window_s = max(_BBR_BTLBW_MIN_S, max(1.0, float(window_rtprop)) * rtprop)
+    cutoff = float(now_s) - window_s
+    out = [(t, r) for t, r in out if t >= cutoff]
+    if len(out) > keep:
+        out = out[-keep:]
+    if not out:
+        return 0.0, out
+    return max(r for _, r in out), out
+
+
+def bbr_still_startup(
+    *,
+    startup: bool,
+    btlbw_bps: float,
+    round_btlbw_bps: float,
+    occupancy: int = 0,
+    inflight_gen_limit: int = 0,
+    grow: float = _BBR_STARTUP_GROW,
+) -> bool:
+    """Stay in STARTUP while the pipe is still filling or BtlBw is climbing.
+
+    A quiet pipeline (client keeping up) is spare capacity, not a plateau:
+    exiting there pins pace to the first app-delivery sample.
+    """
+    if not startup:
+        return False
+    cap = max(1, int(inflight_gen_limit))
+    if int(occupancy) < cap // 2:
+        return True
+    if round_btlbw_bps <= 1.0:
+        return True
+    return btlbw_bps >= round_btlbw_bps * max(1.0, float(grow))
+
+
+def update_delivery_rate_pace_bps(
+    *,
+    btlbw_bps: float,
+    max_bps: float,
+    min_bps: float,
+    gain: float,
+) -> float:
+    """Pace = BtlBw × gain. Drain slows sending; it must not rewrite BtlBw."""
+    floor = max(1.0, min_bps)
+    bw = max(float(btlbw_bps), floor)
+    target = bw * max(0.50, float(gain))
+    return min(max_bps, max(floor, target))
 
 
 def update_delay_pace_bps(
@@ -1029,6 +1138,7 @@ def run_gen_server(
         f"{'(fountain redundancy) ' if fountain_mode else ''}"
         f"cc=off "
         f"rate_mbit={rate_mbit} inflight_gens={inflight_gen_limit} "
+        f"inflight_mib={max_inflight_bytes() / (1024 * 1024):.0f} "
         f"adapt_pace={'on' if adapt_pace else 'off'} "
         f"delay_cc={'on' if delay_cc else 'off'} "
         f"adapt_oh={'on' if adapt_overhead else 'off'} "
@@ -1109,6 +1219,17 @@ def run_gen_server(
         "clean_streak": 0,
         "congestion_streak": 0,
         "hold_until": 0.0,
+        "deliv_ewma": 0.0,
+        "btlbw": 0.0,
+        "btlbw_samples": [],
+        "btlbw_round": 0.0,
+        "bbr_startup": True,
+        "startup_check_ts": t_ramp0,
+        "startup_flat": 0,
+        "guard_completed": -1,
+        "guard_ts": t_ramp0,
+        "floor_since": 0.0,
+        "bbr_t0": t_ramp0,
     }
     oh_clean = {"since": t_ramp0, "clean": True}
     pace_lock = threading.Lock()
@@ -1119,7 +1240,7 @@ def run_gen_server(
             f"{start_bps * 8 / 1_000_000:.0f}→{rate_mbit:.0f} Mbit "
             f"min={delay_min_mbit:.0f} "
             f"(fec base {overhead_pct}%, floor {_OH_FLOOR_PCT}%, "
-            f"up={delay_up_probe:.2f} clean={delay_clean_n})"
+            f"up={delay_up_probe:.2f} clean={delay_clean_n} bbr=on)"
         )
     elif effective_ramp_s > 0:
         print(
@@ -1260,8 +1381,131 @@ def run_gen_server(
                                         occupancy, inflight_gen_limit
                                     )
                                 )
-                                if (
+                                used_bbr = False
+                                last_c = int(pace_state["last_completed"])
+                                last_ts = float(pace_state["last_ts"])
+                                floor = max_bps * pace_min_frac
+                                cur_bps = float(pace_state["bps"])
+                                at_floor = cur_bps <= floor * 1.05
+                                if at_floor:
+                                    if float(pace_state["floor_since"]) <= 0.0:
+                                        pace_state["floor_since"] = now
+                                else:
+                                    pace_state["floor_since"] = 0.0
+                                underutilized = (
+                                    occupancy < inflight_gen_limit // 2
+                                    and cur_bps <= floor * 1.25
+                                    and (not congested)
+                                    and now >= pace_state["hold_until"]
+                                )
+                                floor_stuck = (
+                                    at_floor
+                                    and float(pace_state["floor_since"]) > 0.0
+                                    and (now - float(pace_state["floor_since"])) >= 1.0
+                                )
+                                if underutilized or floor_stuck:
+                                    pace_state["bbr_startup"] = True
+                                    pace_state["btlbw_round"] = 0.0
+                                    pace_state["startup_flat"] = 0
+                                    if floor_stuck:
+                                        pace_state["hold_until"] = 0.0
+                                if last_c < 0:
+                                    pace_state["last_completed"] = completed
+                                    pace_state["last_ts"] = now
+                                elif (
                                     not stalled
+                                    and completed > last_c
+                                    and (now - last_ts) >= _DELAY_CC_UPDATE_S
+                                ):
+                                    delivery_bps = (
+                                        (completed - last_c)
+                                        * block_bytes
+                                        / max(now - last_ts, 1e-6)
+                                    )
+                                    rtprop = float(pace_state["min_rtt_s"])
+                                    btlbw, samples = update_btlbw_bps(
+                                        delivery_bps=delivery_bps,
+                                        samples=list(pace_state["btlbw_samples"]),
+                                        now_s=now,
+                                        rtprop_s=rtprop,
+                                    )
+                                    pace_state["btlbw_samples"] = samples
+                                    pace_state["btlbw"] = btlbw
+                                    pace_state["deliv_ewma"] = delivery_bps
+                                    check_dt = max(0.020, rtprop if rtprop > 0.0 else 0.080)
+                                    if (
+                                        bool(pace_state["bbr_startup"])
+                                        and now - float(pace_state["startup_check_ts"])
+                                        >= check_dt
+                                    ):
+                                        still = bbr_still_startup(
+                                            startup=bool(pace_state["bbr_startup"]),
+                                            btlbw_bps=btlbw,
+                                            round_btlbw_bps=float(
+                                                pace_state["btlbw_round"]
+                                            ),
+                                            occupancy=occupancy,
+                                            inflight_gen_limit=inflight_gen_limit,
+                                        )
+                                        pipe_full = (
+                                            occupancy >= inflight_gen_limit // 2
+                                        )
+                                        near_cap = btlbw >= max_bps * 0.85
+                                        # Occupancy on an 8 MiB window is not
+                                        # proof of BtlBw. Leave STARTUP only
+                                        # when delay agrees or we hit --rate.
+                                        if still or not (
+                                            pipe_full and (congested or near_cap)
+                                        ):
+                                            pace_state["btlbw_round"] = btlbw
+                                            pace_state["bbr_startup"] = True
+                                            pace_state["startup_flat"] = 0
+                                        else:
+                                            flat = int(pace_state["startup_flat"]) + 1
+                                            pace_state["startup_flat"] = flat
+                                            pace_state["bbr_startup"] = (
+                                                flat < _BBR_STARTUP_FLAT
+                                            )
+                                        pace_state["startup_check_ts"] = now
+                                    startup = bool(pace_state["bbr_startup"])
+                                    if startup:
+                                        gain = _BBR_STARTUP_GAIN
+                                    elif congested:
+                                        gain = _BBR_DRAIN_GAIN
+                                    else:
+                                        gain = bbr_pacing_gain(
+                                            now,
+                                            rtprop,
+                                            float(pace_state["bbr_t0"]),
+                                        )
+                                        if (
+                                            not delay_cc_may_probe(
+                                                occupancy, inflight_gen_limit
+                                            )
+                                            and gain > 1.0
+                                        ):
+                                            gain = _BBR_CRUISE_GAIN
+                                    cur = update_delivery_rate_pace_bps(
+                                        btlbw_bps=btlbw,
+                                        max_bps=max_bps,
+                                        min_bps=floor,
+                                        gain=gain,
+                                    )
+                                    pace_state["bps"] = cur
+                                    pace_state["last_completed"] = completed
+                                    pace_state["last_ts"] = now
+                                    pace_state["last_cc_ts"] = now
+                                    if congested:
+                                        pace_state["clean_streak"] = 0
+                                        pace_state["hold_until"] = (
+                                            now + _DELAY_CC_BACKOFF_HOLD_S
+                                        )
+                                    limiter.set_rate(cur)
+                                    used_bbr = True
+                                if (
+                                    not used_bbr
+                                    and not stalled
+                                    and congested
                                     and window_full
                                     and (now - pace_state["last_cc_ts"])
                                     >= _DELAY_CC_UPDATE_S
@@ -1279,7 +1523,8 @@ def run_gen_server(
                                     )
                                     limiter.set_rate(cur)
                                 elif (
-                                    not stalled
+                                    not used_bbr
+                                    and not stalled
                                     and (congested or probe_ready)
                                     and (now - pace_state["last_cc_ts"])
                                     >= _DELAY_CC_UPDATE_S
@@ -1803,7 +2048,16 @@ def run_gen_server(
                         if extra:
                             last_full_ts[next_needed] = now
                             wires.extend(extra)
-                    if server_synth_nack and not nacks and 0 <= next_needed < gid:
+                    if (
+                        server_synth_nack
+                        and not nacks
+                        and 0 <= next_needed < gid
+                        and (
+                            at_cap
+                            or stuck
+                            or incomplete >= max(1, inflight_gen_limit // 8)
+                        )
+                    ):
                         nacks = [next_needed]
                     frontier_lag = max(0, gid - next_needed)
                     repair_limit = repair_thread_limit(
@@ -2031,10 +2285,15 @@ def run_gen_server(
                         deliv_mib = 0.0
                         if delay_cc and (now - t_ramp0) >= _DELAY_CC_DELIVERY_WARMUP_S:
                             with pace_lock:
-                                last_c = int(pace_state["last_completed"])
-                                if last_c >= 0 and dt >= 0.8:
+                                last_c = int(pace_state["guard_completed"])
+                                last_gts = float(pace_state["guard_ts"])
+                                gdt = now - last_gts
+                                if last_c < 0:
+                                    pace_state["guard_completed"] = int(done_g)
+                                    pace_state["guard_ts"] = now
+                                elif gdt >= 0.8:
                                     delivery_bps = (
-                                        max(0, int(done_g) - last_c) * block_bytes / dt
+                                        max(0, int(done_g) - last_c) * block_bytes / gdt
                                     )
                                     deliv_mib = delivery_bps / (1024 * 1024)
                                     wire_bps = wire_bytes / max(dt, 1e-6)
@@ -2044,7 +2303,8 @@ def run_gen_server(
                                         0,
                                         inflight_gen_limit=inflight_gen_limit,
                                     )
-                                    if filling or window_full:
+                                    startup = bool(pace_state["bbr_startup"])
+                                    if (filling or window_full) and not startup:
                                         new_bps, why = update_delivery_guard_bps(
                                             delivery_bps=delivery_bps,
                                             cur_bps=pace_state["bps"],
@@ -2063,8 +2323,8 @@ def run_gen_server(
                                                 limiter.set_rate(new_bps)
                                         else:
                                             pace_state["bad_streak"] = 0
-                                pace_state["last_completed"] = int(done_g)
-                                pace_state["last_ts"] = now
+                                    pace_state["guard_completed"] = int(done_g)
+                                    pace_state["guard_ts"] = now
                         with fountain_lock:
                             fount_n = len(fountain_gens)
                         # Repair traffic alone is not congestion. Reorder/HOL can
@@ -2074,12 +2334,13 @@ def run_gen_server(
                             storm_state["until"] = now + _REPAIR_STORM_BACKOFF_S
                             if delay_cc or adapt_pace:
                                 with pace_lock:
-                                    floor = limiter.min_rate
-                                    pace_state["bps"] = max(
-                                        floor, pace_state["bps"] * 0.70
-                                    )
-                                    pace_state["good_streak"] = 0
-                                    limiter.set_rate(pace_state["bps"])
+                                    if not pace_state["bbr_startup"]:
+                                        floor = limiter.min_rate
+                                        pace_state["bps"] = max(
+                                            floor, pace_state["bps"] * 0.70
+                                        )
+                                        pace_state["good_streak"] = 0
+                                        limiter.set_rate(pace_state["bps"])
                         storm_flag = "storm" if now < storm_state["until"] else (
                             "fountain" if fountain_mode else (
                                 "stress" if stressed else "clean"
@@ -2089,11 +2350,15 @@ def run_gen_server(
                             rtt_ms = pace_state["rtt_s"] * 1000.0
                             q_ms = pace_state["queue_s"] * 1000.0
                             oh_pct = int(overhead_state["pct"])
+                            btlbw_mbit = float(pace_state["btlbw"]) * 8.0 / 1_000_000.0
+                            startup_flag = "start" if pace_state["bbr_startup"] else "bw"
                         print(
                             f"progress {gen_id}/{total_gens} "
                             f"client_done={done_g} "
                             f"fec={oh_pct}% "
                             f"pace={pace_mbit:.0f}/{cap_mbit:.0f}Mbit "
+                            f"btlbw={btlbw_mbit:.0f}Mbit "
+                            f"bbr={startup_flag} "
                             f"lag={gen_id - nn} "
                             f"incomplete={max(0, gen_id - int(done_g))}/"
                             f"{inflight_gen_limit} "

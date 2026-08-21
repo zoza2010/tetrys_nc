@@ -40,7 +40,7 @@ def _hol_freeze(samples: list[tuple[int, int]], min_ticks: int = 2) -> bool:
     return False
 
 
-def test_hol_stall_profile_freezes_baseline_fountain(tmp_path: Path) -> None:
+def test_hol_stall_profile_does_not_freeze_blast(tmp_path: Path) -> None:
     pytest.importorskip("raptorq")
     blob = tmp_path / "blob_32m.bin"
     subprocess.check_call(
@@ -139,10 +139,10 @@ def test_hol_stall_profile_freezes_baseline_fountain(tmp_path: Path) -> None:
     samples = _progress_done(text)
     froze = _hol_freeze(samples)
     ok = "OK:" in cli_out and cli_rc == 0
-    # Baseline fountain on this path should show the WAN HOL signature
-    # (stuck client_done while blast continues) and typically not finish.
+    # Occupancy-only pause + 8 MiB window: HOL lag must not freeze blast.
     assert samples, f"no progress in server log:\n{text[-1500:]}"
-    assert froze or not ok, (
-        f"expected HOL freeze like WAN; completed={ok} froze={froze} "
-        f"last={samples[-3:] if samples else None}\n{cli_out[-500:]}"
+    assert ok and not froze, (
+        f"HOL stall profile must finish without freeze; "
+        f"completed={ok} froze={froze} last={samples[-3:] if samples else None}\n"
+        f"{cli_out[-500:]}"
     )

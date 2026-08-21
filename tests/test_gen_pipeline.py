@@ -21,6 +21,8 @@ from tetrys_nc.gen_xfer import (
     _REPAIR_META_KEEP,
     _encode_gen_worker,
     adaptive_blast_overhead_pct,
+    bbr_pacing_gain,
+    bbr_still_startup,
     build_feedback_miss_bitmap,
     cap_fountain_gens,
     cap_fountain_send,
@@ -51,14 +53,18 @@ from tetrys_nc.gen_xfer import (
     update_adaptive_pace_bps,
     update_delay_pace_bps,
     update_delivery_guard_bps,
+    update_delivery_rate_pace_bps,
+    update_btlbw_bps,
 )
 from tetrys_nc.packets import miss_bitmap_to_nacks
 from tetrys_nc.packets import GenPacket
 
 
 def test_compute_inflight_and_feedback_horizon():
+    # Default 64 MiB WAN window (not the ATP 8 MiB experiment).
     assert compute_inflight_gen_limit(48, 1350) == 1035
     assert compute_inflight_gen_limit(192, 1350) == 258
+    assert compute_inflight_gen_limit(96, 1350) == 517
     assert client_feedback_horizon(1035) >= 1035
 
 
@@ -130,6 +136,15 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         clean_s=_OH_CLEAN_HOLD_S,
         floor_pct=8,
     ) == 8
+    # Clean path pays no FEC tax after the hold (ATP source-stream).
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=0,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+        clean_s=_OH_CLEAN_HOLD_S,
+    ) == 0
     # Steady ~100-gen pipeline on a 1k window stays at base (pressure ~0.1).
     assert adaptive_blast_overhead_pct(
         base_pct=10,
@@ -157,6 +172,8 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         max_pct=20,
     ) == 10
+    # 20% of a large window used to trip mid-FEC; with 8 MiB/64 gens that
+    # same fraction is a healthy pipeline, so keep base until half-full.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=200,
@@ -164,13 +181,38 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=200,
         inflight_gen_limit=cap,
         max_pct=20,
-    ) == 15
+    ) == 10
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=500,
         nack_count=20,
         incomplete=500,
         inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 15
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=800,
+        nack_count=20,
+        incomplete=800,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 20
+    # 8 MiB WAN window: ~30/64 gens is BDP, not a loss signal.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=30,
+        nack_count=0,
+        incomplete=30,
+        inflight_gen_limit=64,
+        max_pct=20,
+    ) == 10
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=48,
+        nack_count=0,
+        incomplete=48,
+        inflight_gen_limit=64,
         max_pct=20,
     ) == 20
     assert adaptive_blast_overhead_pct(
@@ -336,9 +378,98 @@ def test_delivery_guard_cuts_overload_not_below_floor():
 def test_delay_cc_blocks_probe_on_full_pipeline():
     cap = 517
     assert delay_cc_may_probe(70, cap)
-    assert delay_cc_may_probe(cap // 4 - 1, cap)
-    assert not delay_cc_may_probe(cap // 4, cap)
+    pause = (cap * 3) // 4
+    assert delay_cc_may_probe(pause - 1, cap)
+    assert not delay_cc_may_probe(pause, cap)
     assert not delay_cc_may_probe(387, cap)
+
+
+def test_bbr_gain_and_delivery_rate_pace():
+    t0 = 1000.0
+    rt = 0.080
+    assert bbr_pacing_gain(t0, rt, t0) == pytest.approx(1.25)
+    assert bbr_pacing_gain(t0 + rt + 0.001, rt, t0) == pytest.approx(0.75)
+    assert bbr_pacing_gain(t0 + 2.5 * rt, rt, t0) == pytest.approx(1.00)
+    floor = 25_000_000.0
+    cap = 112_500_000.0
+    samples: list[tuple[float, float]] = []
+    btlbw, samples = update_btlbw_bps(
+        delivery_bps=40.0 * 1024 * 1024,
+        samples=samples,
+        now_s=t0,
+        rtprop_s=rt,
+    )
+    assert btlbw == pytest.approx(40.0 * 1024 * 1024)
+    paced = update_delivery_rate_pace_bps(
+        btlbw_bps=btlbw, max_bps=cap, min_bps=floor, gain=1.25
+    )
+    assert paced == pytest.approx(min(cap, btlbw * 1.25))
+    drained = update_delivery_rate_pace_bps(
+        btlbw_bps=btlbw, max_bps=cap, min_bps=floor, gain=0.75
+    )
+    assert drained < paced
+    # Drain must not rewrite BtlBw: cruise returns to the high watermark.
+    cruise = update_delivery_rate_pace_bps(
+        btlbw_bps=btlbw, max_bps=cap, min_bps=floor, gain=1.00
+    )
+    assert cruise == pytest.approx(btlbw)
+    # STARTUP climbs off the 200 Mbit floor even if first samples were slow.
+    climb = update_delivery_rate_pace_bps(
+        btlbw_bps=20.0 * 1024 * 1024, max_bps=cap, min_bps=floor, gain=2.00
+    )
+    assert climb >= floor * 1.90
+
+
+def test_btlbw_max_filter_forgets_a_bad_start():
+    rt = 0.080
+    samples: list[tuple[float, float]] = []
+    slow = 20.0 * 1024 * 1024
+    fast = 80.0 * 1024 * 1024
+    btlbw, samples = update_btlbw_bps(
+        delivery_bps=slow, samples=samples, now_s=0.0, rtprop_s=rt
+    )
+    assert btlbw == pytest.approx(slow)
+    btlbw, samples = update_btlbw_bps(
+        delivery_bps=fast, samples=samples, now_s=0.20, rtprop_s=rt
+    )
+    assert btlbw == pytest.approx(fast)
+    # 10 RTprop is only 0.8s here; the WAN floor is 3s so a delay bump
+    # cannot expire a good probe. After that floor the slow start is gone.
+    btlbw, samples = update_btlbw_bps(
+        delivery_bps=fast, samples=samples, now_s=3.20, rtprop_s=rt
+    )
+    assert btlbw == pytest.approx(fast)
+    assert all(r >= fast * 0.99 for _, r in samples)
+
+
+def test_bbr_startup_needs_sustained_growth():
+    assert bbr_still_startup(
+        startup=True, btlbw_bps=40e6, round_btlbw_bps=0.0
+    )
+    assert bbr_still_startup(
+        startup=True, btlbw_bps=40e6, round_btlbw_bps=25e6
+    )
+    assert not bbr_still_startup(
+        startup=True, btlbw_bps=26e6, round_btlbw_bps=25e6
+    )
+    assert not bbr_still_startup(
+        startup=False, btlbw_bps=80e6, round_btlbw_bps=25e6
+    )
+    # Empty pipeline: keep STARTUP even if BtlBw looks flat.
+    assert bbr_still_startup(
+        startup=True,
+        btlbw_bps=26e6,
+        round_btlbw_bps=25e6,
+        occupancy=10,
+        inflight_gen_limit=64,
+    )
+    assert not bbr_still_startup(
+        startup=True,
+        btlbw_bps=26e6,
+        round_btlbw_bps=25e6,
+        occupancy=40,
+        inflight_gen_limit=64,
+    )
 
 
 def test_client_feedback_interval_is_fast_while_open():
