@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes up from 150 Mbit",
+        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes 220→900 with a 200 Mbit floor",
     )
     p.add_argument(
         "--ramp-s",

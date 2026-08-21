@@ -67,9 +67,9 @@ _REORDER_HOLDOFF_S = 0.005
 # Start frontier repair when client lags this many gens behind send cursor.
 _REPAIR_LAG = 48
 # If next_needed is unchanged this long, send deficit-sized fountain repair.
-_STUCK_S = 0.40
+_STUCK_S = 0.20
 # Min gap between deficit repair rounds of the same generation.
-_STUCK_REPAIR_COOLDOWN_S = 0.25
+_STUCK_REPAIR_COOLDOWN_S = 0.12
 # RaptorQ normally decodes near K; add a small rank margin and enough surplus
 # for loss of the repair packets themselves.
 _DECODE_MARGIN = 2
@@ -84,10 +84,11 @@ _MIN_INFLIGHT_GENS = 64
 # for the whole native encode (measured: a sendto in the send thread waits up
 # to ~12ms behind 3 encoding threads). Worker processes have their own GIL,
 # so the send loop keeps the socket busy while children encode.
+# Leave one core for the send/repair loop; override with TETRYS_ENCODE_WORKERS.
+# WAN 6-core A/B: 6 workers starved send (2G 59 vs 76 MiB/s at 4).
 _ENCODE_WORKERS = 4
 _ENCODE_PREFETCH = 16
-# Hybrid pipeline: fountain only when client lags or inflight is high.
-_PIPELINE_LAG_GENS = 64
+# Hybrid pipeline: fountain only when unrecovered occupancy is high.
 _PIPELINE_INFLIGHT_FRAC = 3 / 4
 # Fountain mode (overhead=0): per-gen repair in encode worker; cap top-up at inflight limit.
 _FOUNTAIN_TARGET_OVERHEAD_PCT = 8
@@ -131,10 +132,12 @@ _ADAPT_PACE_WARMUP_S = 6.0  # ignore bursty early decode after ramp
 _ADAPT_PACE_BAD_SNAP = 3  # consecutive lagging samples before backoff
 # Delay-based pacing from echoed send timestamps (same clock → RTT).
 # Start well below the --rate ceiling and climb only on confirmed clean RTT.
-# 150 Mbit is high enough that 1–2 GiB transfers are not dominated by the
-# probe, and still 6× below the WAN 900 Mbit cap.
-_DELAY_CC_START_MBIT = 150.0
-_DELAY_CC_MIN_FRAC = 0.005
+# Floor stays high: a policer shows no standing queue, so the old 0.5% floor
+# collapsed to ~8 Mbit when 900 Mbit was dropped (~33% loss). 200 Mbit is
+# still under today's clean 400 Mbit knee and above the 300 Mbit goal.
+_DELAY_CC_START_MBIT = 220.0
+_DELAY_CC_MIN_MBIT = 200.0
+_DELAY_CC_MIN_FRAC = 0.20
 _DELAY_CC_TARGET_QUEUE_MIN_S = 0.006
 _DELAY_CC_TARGET_QUEUE_RTT_FRAC = 0.25
 _DELAY_CC_HIGH_QUEUE_MIN_S = 0.020
@@ -142,12 +145,19 @@ _DELAY_CC_HIGH_QUEUE_RTT_FRAC = 0.50
 _DELAY_CC_DOWN = 0.92
 _DELAY_CC_DOWN_HARD = 0.82
 _DELAY_CC_UP = 1.08
-_DELAY_CC_UP_PROBE = 1.40
+_DELAY_CC_UP_PROBE = 1.25
+_DELAY_CC_UP_PROBE_BELOW_FRAC = 0.50
 _DELAY_CC_WARMUP_S = 0.5
 _DELAY_CC_UPDATE_S = 0.10
 _DELAY_CC_CLEAN_SAMPLES = 2
 _DELAY_CC_CONGESTION_SAMPLES = 3
 _DELAY_CC_BACKOFF_HOLD_S = 0.8
+# Delivery vs expected app: policers drop without inflating RTT.
+_DELAY_CC_DELIVERY_WARMUP_S = 2.0
+_DELAY_CC_DELIVERY_BAD = 0.50
+_DELAY_CC_DELIVERY_OK = 0.78
+_DELAY_CC_DELIVERY_CUT = 0.70
+_DELAY_CC_DELIVERY_CUT_HARD = 0.55
 # Two seconds supports long-distance links but rejects old feedback after stalls.
 _DELAY_CC_MAX_RTT_S = 2.0
 # Slowly forget optimistic min_rtt so a lucky early sample cannot stick forever.
@@ -200,17 +210,26 @@ def build_feedback_miss_bitmap(
     return bytes(buf)
 
 
+def hol_hole_gens(incomplete: int, frontier_lag: int) -> int:
+    """Gens already done past next_needed. Large value is a HOL hole, not BDP."""
+    return max(0, int(frontier_lag) - int(incomplete))
+
+
 def should_pause_blast(
     incomplete: int,
     frontier_lag: int,
     *,
     inflight_gen_limit: int,
 ) -> bool:
-    """Pause new data when occupancy or frontier lag hits the window."""
-    if incomplete >= inflight_gen_limit or frontier_lag >= inflight_gen_limit:
+    """Pause new data when unrecovered occupancy fills the window.
+
+    Frontier lag alone is a HOL hole (later gens already decoded). Stopping
+    blast there freezes the rest of the file instead of repairing the hole.
+    """
+    del frontier_lag
+    if incomplete >= inflight_gen_limit:
         return True
-    soft = (inflight_gen_limit * 3) // 4
-    return incomplete >= soft and frontier_lag >= soft // 2
+    return incomplete >= (inflight_gen_limit * 3) // 4
 
 
 def repair_pressure(
@@ -219,9 +238,10 @@ def repair_pressure(
     *,
     inflight_gen_limit: int,
 ) -> float:
-    """0..1 pressure from occupancy and frontier lag (size-independent)."""
+    """0..1 occupancy pressure. Lag-only HOL must not look like congestion."""
+    del frontier_lag
     cap = max(1, inflight_gen_limit)
-    return min(1.0, max(incomplete / cap, frontier_lag / cap))
+    return min(1.0, incomplete / cap)
 
 
 def adaptive_blast_overhead_pct(
@@ -236,18 +256,23 @@ def adaptive_blast_overhead_pct(
     max_pct: int | None = None,
     clean_hold_s: float = _OH_CLEAN_HOLD_S,
 ) -> int:
-    """Raise FEC under pressure; ease toward floor only after sustained clean path."""
+    """Raise FEC under unrecovered occupancy; ease after sustained clean path.
+
+    Reorder NACKs and HOL lag are not loss. On a clean WAN they are always
+    present (BDP ≫ 12 gens) and used to pin overhead at 20%, which caps a
+    900 Mbit blast around ~75 MiB/s app.
+    """
     if base_pct <= 0:
         return 0
     hi = max(base_pct, max_pct if max_pct is not None else _OH_CEIL_PCT)
     floor = max(1, min(floor_pct, base_pct))
-    # Lag is folded into pressure vs inflight window — no absolute gen thresholds.
     pressure = repair_pressure(
         incomplete, frontier_lag, inflight_gen_limit=inflight_gen_limit
     )
-    if pressure >= 0.45 or nack_count >= 12:
+    del nack_count
+    if pressure >= 0.45:
         return hi
-    if pressure >= 0.15 or nack_count >= 2:
+    if pressure >= 0.15:
         return max(base_pct, (base_pct + hi) // 2)
     if clean_s >= clean_hold_s and floor < base_pct:
         return floor
@@ -308,9 +333,50 @@ def update_delay_pace_bps(
     if queue_s >= target_queue_s:
         return max(floor, cur_bps * down), min_rtt_s, queue_s
     if queue_s <= target_queue_s * 0.70:
-        step = up_probe if cur_bps < max_bps * 0.55 else up
+        # Fast probe only while far below the cap. 1.40× from mid-range
+        # overshoots a ~400 Mbit policer that still looks RTT-clean.
+        step = (
+            up_probe if cur_bps < max_bps * _DELAY_CC_UP_PROBE_BELOW_FRAC else up
+        )
         return min(max_bps, max(cur_bps, floor) * step), min_rtt_s, queue_s
     return cur_bps, min_rtt_s, queue_s
+
+
+def update_delivery_guard_bps(
+    *,
+    delivery_bps: float,
+    cur_bps: float,
+    overhead_pct: int,
+    min_bps: float,
+    wire_bps: float = 0.0,
+    fill_frac: float = 0.80,
+    bad_frac: float = _DELAY_CC_DELIVERY_BAD,
+    ok_frac: float = _DELAY_CC_DELIVERY_OK,
+    cut: float = _DELAY_CC_DELIVERY_CUT,
+    cut_hard: float = _DELAY_CC_DELIVERY_CUT_HARD,
+) -> tuple[float, str]:
+    """Cut pace when goodput lags bytes actually put on the wire.
+
+    Compare to send volume, not the limiter target: a 900 Mbit ceiling with
+    80 MiB/s wire is encode/pacer limited, not a policer. Only back off when
+    the limiter is filling and the receiver still gets a small fraction.
+    """
+    if wire_bps > 0.0 and wire_bps < cur_bps * fill_frac:
+        return cur_bps, "hold"
+    offer = wire_bps if wire_bps > 0.0 else cur_bps
+    oh = max(0, int(overhead_pct)) / 100.0
+    expected_app = offer / (1.0 + oh)
+    if expected_app < 1.0 or delivery_bps <= 0.0:
+        return cur_bps, "hold"
+    ratio = delivery_bps / expected_app
+    floor = max(1.0, min_bps)
+    if ratio < 0.35:
+        return max(floor, cur_bps * cut_hard), "cut_hard"
+    if ratio < bad_frac:
+        return max(floor, cur_bps * cut), "cut"
+    if ratio >= ok_frac:
+        return cur_bps, "ok"
+    return cur_bps, "hold"
 
 
 def should_yield_blast_to_repair(
@@ -318,8 +384,11 @@ def should_yield_blast_to_repair(
     *,
     repair_pending: bool,
     nack_count: int,
+    hol_hole: int = 0,
 ) -> bool:
-    """Dual-queue: under pressure, prefer draining repair over new blast."""
+    """Dual-queue: under occupancy or a HOL hole, drain repair before blast."""
+    if hol_hole >= 64:
+        return True
     if pressure >= 0.85:
         return True
     if pressure >= 0.45 and (repair_pending or nack_count > 12):
@@ -453,10 +522,13 @@ def pipeline_stressed(
     *,
     inflight_gen_limit: int,
 ) -> bool:
-    """Hybrid mode: fountain pipeline only when client/path is under pressure."""
-    return incomplete >= int(inflight_gen_limit * _PIPELINE_INFLIGHT_FRAC) or (
-        lag > _PIPELINE_LAG_GENS
-    )
+    """Fountain pipeline when unrecovered occupancy is high.
+
+    Frontier lag alone is BDP/HOL on a long-delay path (~70 gens at 900 Mbit
+    / 80 ms). Treating that as stress pins FEC high on an otherwise clean WAN.
+    """
+    del lag
+    return incomplete >= int(inflight_gen_limit * _PIPELINE_INFLIGHT_FRAC)
 
 
 def update_adaptive_pace_bps(
@@ -851,6 +923,16 @@ def run_gen_server(
         delay_start_mbit = _DELAY_CC_START_MBIT
     delay_start_mbit = min(rate_mbit, max(1.0, delay_start_mbit))
     try:
+        delay_min_mbit = float(
+            os.environ.get("TETRYS_DELAY_MIN_MBIT", str(_DELAY_CC_MIN_MBIT))
+            or str(_DELAY_CC_MIN_MBIT)
+        )
+    except ValueError:
+        delay_min_mbit = _DELAY_CC_MIN_MBIT
+    delay_min_mbit = min(rate_mbit, max(1.0, delay_min_mbit))
+    if delay_start_mbit < delay_min_mbit:
+        delay_start_mbit = delay_min_mbit
+    try:
         delay_up_probe = float(
             os.environ.get("TETRYS_DELAY_UP", str(_DELAY_CC_UP_PROBE))
             or str(_DELAY_CC_UP_PROBE)
@@ -866,6 +948,15 @@ def run_gen_server(
     except ValueError:
         delay_clean_n = _DELAY_CC_CLEAN_SAMPLES
     delay_clean_n = min(8, max(1, delay_clean_n))
+    try:
+        encode_workers = int(
+            os.environ.get("TETRYS_ENCODE_WORKERS", str(_ENCODE_WORKERS))
+            or str(_ENCODE_WORKERS)
+        )
+    except ValueError:
+        encode_workers = _ENCODE_WORKERS
+    encode_workers = min(16, max(1, encode_workers))
+    encode_prefetch = max(_ENCODE_PREFETCH, encode_workers * 4)
     digest = "" if skip_hash else _file_sha256(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -889,6 +980,7 @@ def run_gen_server(
         f"delay_cc={'on' if delay_cc else 'off'} "
         f"adapt_oh={'on' if adapt_overhead else 'off'} "
         f"synth_nack={'on' if server_synth_nack else 'off'} "
+        f"enc_workers={encode_workers} "
         f"mode={'fountain' if fountain_mode else 'hybrid+async_fountain'} "
     )
     print(f"Gen RaptorQ server listening on udp://{host}:{port}")
@@ -928,9 +1020,10 @@ def run_gen_server(
         sock.sendto(meta, client_addr)
 
     max_bps = max(rate_mbit, 1.0) * 1_000_000 / 8
+    delay_min_bps = delay_min_mbit * 1_000_000 / 8
     if delay_cc:
         start_bps = min(max_bps, delay_start_mbit * 1_000_000 / 8)
-        pace_min_frac = _DELAY_CC_MIN_FRAC
+        pace_min_frac = max(_DELAY_CC_MIN_FRAC, delay_min_bps / max_bps)
         # Probe owns the climb — skip the time-based ease-in to --rate.
         effective_ramp_s = 0.0
     elif adapt_pace:
@@ -969,6 +1062,7 @@ def run_gen_server(
         print(
             f"delay probe "
             f"{start_bps * 8 / 1_000_000:.0f}→{rate_mbit:.0f} Mbit "
+            f"min={delay_min_mbit:.0f} "
             f"(fec base {overhead_pct}%, floor {_OH_FLOOR_PCT}%, "
             f"up={delay_up_probe:.2f} clean={delay_clean_n})"
         )
@@ -1076,11 +1170,8 @@ def run_gen_server(
                                     pace_state["clean_streak"] = 0
                                     pace_state["congestion_streak"] = 0
                                 congestion_pressure = (
-                                    frontier_lag >= inflight_gen_limit // 5
-                                    or (
-                                        send_frontier["gen_id"] - completed
-                                        >= inflight_gen_limit // 5
-                                    )
+                                    send_frontier["gen_id"] - completed
+                                    >= inflight_gen_limit // 5
                                 )
                                 congested = (
                                     congestion_pressure
@@ -1103,6 +1194,7 @@ def run_gen_server(
                                         min_rtt_s=pace_state["min_rtt_s"],
                                         cur_bps=pace_state["bps"],
                                         max_bps=max_bps,
+                                        min_frac=pace_min_frac,
                                         up_probe=delay_up_probe,
                                     )
                                     pace_state["bps"] = cur
@@ -1366,7 +1458,7 @@ def run_gen_server(
             # spawn: safe with the already-running feedback thread, and worker
             # processes encode without contending for this process's GIL.
             encode_pool = ProcessPoolExecutor(
-                max_workers=_ENCODE_WORKERS,
+                max_workers=encode_workers,
                 mp_context=multiprocessing.get_context("spawn"),
             )
             encode_futures: dict[
@@ -1560,7 +1652,7 @@ def run_gen_server(
                 return queued
 
             def fill_encode_queue(start: int) -> None:
-                stop = min(total_gens, start + _ENCODE_PREFETCH)
+                stop = min(total_gens, start + encode_prefetch)
                 pct = int(overhead_state["pct"])
                 for gid in range(start, stop):
                     if gid in encode_futures:
@@ -1694,7 +1786,7 @@ def run_gen_server(
                         pressure_oh = repair_pressure(
                             incomplete, lag, inflight_gen_limit=inflight_gen_limit
                         )
-                        is_clean = pressure_oh < 0.15 and len(nacks_oh) < 2
+                        is_clean = pressure_oh < 0.15
                         if is_clean:
                             if not oh_clean["clean"]:
                                 oh_clean["since"] = now
@@ -1759,6 +1851,7 @@ def run_gen_server(
                         pressure,
                         repair_pending=repair_pending,
                         nack_count=len(nacks),
+                        hol_hole=hol_hole_gens(incomplete, lag),
                     ):
                         if stressed and not storm_active:
                             fountain_send_tick(
@@ -1836,6 +1929,37 @@ def run_gen_server(
                         bottleneck = max(parts, key=parts.get)
                         wire_mib = wire_bytes / dt / (1024 * 1024)
                         repair_rate = repair_pkts_w / max(dt, 1e-6)
+                        deliv_mib = 0.0
+                        if delay_cc and (now - t_ramp0) >= _DELAY_CC_DELIVERY_WARMUP_S:
+                            with pace_lock:
+                                last_c = int(pace_state["last_completed"])
+                                if last_c >= 0 and dt >= 0.8:
+                                    delivery_bps = (
+                                        max(0, int(done_g) - last_c) * block_bytes / dt
+                                    )
+                                    deliv_mib = delivery_bps / (1024 * 1024)
+                                    wire_bps = wire_bytes / max(dt, 1e-6)
+                                    filling = wire_bps >= pace_state["bps"] * 0.80
+                                    if filling:
+                                        new_bps, why = update_delivery_guard_bps(
+                                            delivery_bps=delivery_bps,
+                                            cur_bps=pace_state["bps"],
+                                            overhead_pct=int(overhead_state["pct"]),
+                                            min_bps=limiter.min_rate,
+                                            wire_bps=wire_bps,
+                                        )
+                                        if why.startswith("cut"):
+                                            bad = int(pace_state["bad_streak"]) + 1
+                                            pace_state["bad_streak"] = bad
+                                            if bad >= 2:
+                                                pace_state["bps"] = new_bps
+                                                pace_state["hold_until"] = now + 1.2
+                                                pace_state["clean_streak"] = 0
+                                                limiter.set_rate(new_bps)
+                                        else:
+                                            pace_state["bad_streak"] = 0
+                                pace_state["last_completed"] = int(done_g)
+                                pace_state["last_ts"] = now
                         with fountain_lock:
                             fount_n = len(fountain_gens)
                         # Repair traffic alone is not congestion. Reorder/HOL can
@@ -1845,11 +1969,7 @@ def run_gen_server(
                             storm_state["until"] = now + _REPAIR_STORM_BACKOFF_S
                             if delay_cc or adapt_pace:
                                 with pace_lock:
-                                    floor = max_bps * (
-                                        _DELAY_CC_MIN_FRAC
-                                        if delay_cc
-                                        else _ADAPT_PACE_MIN_FRAC
-                                    )
+                                    floor = limiter.min_rate
                                     pace_state["bps"] = max(
                                         floor, pace_state["bps"] * 0.70
                                     )
@@ -1876,6 +1996,7 @@ def run_gen_server(
                             f"pipe={storm_flag} "
                             f"rtt={rtt_ms:.0f}/{q_ms:.0f}ms "
                             f"repair_extra={repair_sent} "
+                            f"deliv={deliv_mib:.1f} "
                             f"app={rate:.1f} MiB/s"
                         )
                         print(

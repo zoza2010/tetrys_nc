@@ -30,6 +30,7 @@ from tetrys_nc.gen_xfer import (
     compute_inflight_gen_limit,
     echo_rtt_s,
     fountain_redundancy,
+    hol_hole_gens,
     hol_repair_cooldown_s,
     note_gen_deficit,
     pipeline_stressed,
@@ -47,6 +48,7 @@ from tetrys_nc.gen_xfer import (
     track_fountain_gen,
     update_adaptive_pace_bps,
     update_delay_pace_bps,
+    update_delivery_guard_bps,
 )
 from tetrys_nc.packets import miss_bitmap_to_nacks
 from tetrys_nc.packets import GenPacket
@@ -62,15 +64,19 @@ def test_should_pause_blast_occupancy_and_lag():
     cap = 1035
     assert not should_pause_blast(100, 200, inflight_gen_limit=cap)
     assert should_pause_blast(cap, 10, inflight_gen_limit=cap)
-    assert should_pause_blast(10, cap, inflight_gen_limit=cap)
+    # HOL hole: lag at the window with almost nothing unrecovered — keep blasting.
+    assert not should_pause_blast(10, cap, inflight_gen_limit=cap)
     soft = (cap * 3) // 4
-    assert should_pause_blast(soft, soft // 2, inflight_gen_limit=cap)
+    assert should_pause_blast(soft, 0, inflight_gen_limit=cap)
+    assert not should_pause_blast(soft - 1, cap, inflight_gen_limit=cap)
 
 
 def test_repair_pressure_and_yield():
     cap = 1000
     assert repair_pressure(100, 50, inflight_gen_limit=cap) == 0.1
     assert repair_pressure(900, 200, inflight_gen_limit=cap) == 0.9
+    # Lag-only HOL is not occupancy pressure.
+    assert repair_pressure(2, 500, inflight_gen_limit=cap) == 0.002
     assert should_yield_blast_to_repair(0.9, repair_pending=False, nack_count=0)
     assert not should_yield_blast_to_repair(
         0.1, repair_pending=False, nack_count=0
@@ -78,6 +84,11 @@ def test_repair_pressure_and_yield():
     assert should_yield_blast_to_repair(
         0.5, repair_pending=True, nack_count=20
     )
+    assert should_yield_blast_to_repair(
+        0.0, repair_pending=False, nack_count=0, hol_hole=64
+    )
+    assert hol_hole_gens(2, 497) == 495
+    assert hol_hole_gens(80, 80) == 0
 
 
 def test_hol_repair_uses_short_cooldown():
@@ -123,6 +134,24 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         frontier_lag=100,
         nack_count=0,
         incomplete=100,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 10
+    # HOL hole must not raise FEC: lag is large, occupancy is not.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=500,
+        nack_count=0,
+        incomplete=2,
+        inflight_gen_limit=cap,
+        max_pct=20,
+    ) == 10
+    # Reorder NACK bitmap on a clean WAN is not loss.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=40,
+        incomplete=40,
         inflight_gen_limit=cap,
         max_pct=20,
     ) == 10
@@ -209,6 +238,63 @@ def test_echo_rtt_and_delay_pace():
     assert short_bps < 80_000_000.0
 
 
+def test_delivery_guard_cuts_overload_not_below_floor():
+    floor = 25_000_000.0  # 200 Mbit
+    # 900 Mbit pace, ~13 MiB/s goodput (today's 33% loss collapse).
+    cur = 112_500_000.0
+    new, why = update_delivery_guard_bps(
+        delivery_bps=13.4 * 1024 * 1024,
+        cur_bps=cur,
+        overhead_pct=10,
+        min_bps=floor,
+    )
+    assert why == "cut_hard"
+    assert new == pytest.approx(cur * 0.55)
+    assert new > floor
+    # After two hard cuts we sit near 300 Mbit, not 8 Mbit.
+    new2, _ = update_delivery_guard_bps(
+        delivery_bps=13.4 * 1024 * 1024,
+        cur_bps=new,
+        overhead_pct=10,
+        min_bps=floor,
+    )
+    new3, _ = update_delivery_guard_bps(
+        delivery_bps=13.4 * 1024 * 1024,
+        cur_bps=new2,
+        overhead_pct=10,
+        min_bps=floor,
+    )
+    mbit = new3 * 8 / 1_000_000
+    assert 200 <= mbit <= 400
+    # Healthy 400 Mbit slice: delivery matches expected app → hold.
+    ok, why_ok = update_delivery_guard_bps(
+        delivery_bps=43.0 * 1024 * 1024,
+        cur_bps=50_000_000.0,
+        overhead_pct=10,
+        min_bps=floor,
+    )
+    assert why_ok == "ok"
+    assert ok == 50_000_000.0
+    # Clean path: limiter at 900 Mbit but wire/app already match → do not cut.
+    hold, why_hold = update_delivery_guard_bps(
+        delivery_bps=75.0 * 1024 * 1024,
+        cur_bps=112_500_000.0,
+        overhead_pct=10,
+        min_bps=floor,
+        wire_bps=82.0 * 1024 * 1024,
+    )
+    assert why_hold == "hold"
+    assert hold == 112_500_000.0
+    # Same 75 MiB/s vs the 900 Mbit *target* would look like a miss without wire.
+    cut_pace, why_pace = update_delivery_guard_bps(
+        delivery_bps=75.0 * 1024 * 1024,
+        cur_bps=112_500_000.0,
+        overhead_pct=10,
+        min_bps=floor,
+    )
+    assert why_pace == "hold" or why_pace == "ok"
+
+
 def test_client_feedback_interval_is_fast_while_open():
     assert client_feedback_interval(
         fin_seen=False,
@@ -280,9 +366,9 @@ def test_pipeline_stressed_clean_vs_pressure():
     assert not pipeline_stressed(40, 35, inflight_gen_limit=cap)
     assert not pipeline_stressed(threshold - 1, 45, inflight_gen_limit=cap)
     assert pipeline_stressed(threshold, 10, inflight_gen_limit=cap)
-    # Client lag without full inflight.
-    assert pipeline_stressed(100, 65, inflight_gen_limit=cap)
-    assert not pipeline_stressed(100, 64, inflight_gen_limit=cap)
+    # Client lag / BDP without high unrecovered occupancy is not stress.
+    assert not pipeline_stressed(100, 65, inflight_gen_limit=cap)
+    assert not pipeline_stressed(100, 200, inflight_gen_limit=cap)
 
 
 def test_should_fountain_tick_skips_clean_path():

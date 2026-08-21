@@ -42,6 +42,10 @@ class RateLimiter:
         self.tokens = self.burst
         self.updated = time.monotonic()
         self.oversleep_credit = _oversleep_credit()
+        # Seconds already waited beyond the intended sleep. Applied to the
+        # *next* sleep (shorter wait) instead of extra tokens, so catch-up
+        # does not enlarge the burst into a policer.
+        self._sleep_debt = 0.0
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
@@ -54,25 +58,43 @@ class RateLimiter:
     def consume(self, nbytes: int) -> float:
         """Spend tokens. Returns seconds slept waiting for the bucket."""
         now = time.monotonic()
-        elapsed = now - self.updated
+        elapsed = max(0.0, now - self.updated)
         self.updated = now
         self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
         self.tokens -= nbytes
-        if self.tokens < 0:
-            sleep_s = (-self.tokens) / self.rate
-            # Cap single sleep — prefer short yields over multi-second stalls.
-            if sleep_s > 0.05:
-                sleep_s = 0.05
-            t_sleep = time.monotonic()
-            time.sleep(sleep_s)
-            now2 = time.monotonic()
-            self.updated = now2
-            overslept = now2 - t_sleep - sleep_s
-            if overslept > 0 and self.oversleep_credit > 0:
-                self.tokens = min(
-                    self.burst, overslept * self.rate * self.oversleep_credit
-                )
-            else:
+        if self.tokens >= 0:
+            return 0.0
+
+        need_s = (-self.tokens) / self.rate
+        if need_s > 0.05:
+            need_s = 0.05
+
+        debt = self._sleep_debt
+        if debt > 0.0:
+            if debt >= need_s:
+                self._sleep_debt = min(self._burst_s, debt - need_s)
                 self.tokens = 0.0
-            return sleep_s
-        return 0.0
+                return 0.0
+            need_s -= debt
+            self._sleep_debt = 0.0
+
+        t0 = time.monotonic()
+        deadline = t0 + need_s
+        # Sleep the full wait when it is above timer granularity; spin only
+        # sub-ms remainders. Bound the spin so a frozen test clock cannot hang.
+        if need_s >= 0.0004:
+            time.sleep(need_s)
+        spins = 0
+        while time.monotonic() < deadline and spins < 2_000_000:
+            spins += 1
+        now2 = time.monotonic()
+        self.updated = now2
+        overslept = now2 - deadline
+        if overslept > 0.0:
+            self._sleep_debt = min(self._burst_s, self._sleep_debt + overslept)
+        self.tokens = 0.0
+        if overslept > 0.0 and self.oversleep_credit > 0:
+            self.tokens = min(
+                self.burst, overslept * self.rate * self.oversleep_credit
+            )
+        return need_s

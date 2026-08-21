@@ -54,6 +54,11 @@ class PathSpec:
     phase2_start_s: float = 0.0
     phase2_loss: float | None = None
     phase2_rate_mbit: float | None = None
+    # Sender-style underfill: idle gaps on the data path (token-bucket sleep /
+    # encode wait). Packets are delayed until the next on-window, not dropped.
+    duty_on_s: float = 0.0
+    duty_off_s: float = 0.0
+    duty_down: bool = True
 
 
 PROFILES: dict[str, PathSpec] = {
@@ -128,6 +133,42 @@ PROFILES: dict[str, PathSpec] = {
         loss=0.010,
         rate_mbit=1000.0,
         seed=5,
+    ),
+    # 2026-08-21 WAN: --rate 900 (~107 MiB/s) but delivered wire 95–102
+    # (limit=pace), app 79–87, skip_done ≈10% from 10% FEC, lag ≈70.
+    # Path is not lossy; the ceiling is simply not filled.
+    # delay_s is one-way (~40 ms ⇒ RTT ~80 ms), not the full RTT.
+    "wan-underfill": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.004,
+        loss=0.012,
+        rate_mbit=780.0,
+        seed=25,
+    ),
+    # Same slice when encode/pacer sleeps ~40% of the wall (wenc≈60%,
+    # wire median ~75, app ~62, pace still 900/900).
+    "wan-underfill-wenc": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.004,
+        loss=0.012,
+        rate_mbit=850.0,
+        duty_on_s=0.012,
+        duty_off_s=0.008,
+        duty_down=True,
+        seed=26,
+    ),
+    # Underfill + a HOL hole: later gens complete, next_needed freezes.
+    "wan-underfill-hol": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.005,
+        loss=0.015,
+        rate_mbit=780.0,
+        blackout_start_s=1.40,
+        blackout_dur_s=0.60,
+        blackout_down=True,
+        blackout_up=False,
+        loss_after=0.04,
+        seed=27,
     ),
     # Long WAN: ~35s good (1G @ ~30 MiB/s mostly clean), then loss+rate dip.
     # 8–64 MiB finish before phase2; 256M–2G accumulate repair in phase2.
@@ -331,6 +372,21 @@ class Direction:
             base = spec.phase2_loss
         return base
 
+    def _duty_extra_s(self, now: float) -> float:
+        """Delay until the next on-window; 0 if currently sending."""
+        spec = self.spec
+        if spec.duty_on_s <= 0.0 or spec.duty_off_s <= 0.0:
+            return 0.0
+        if spec.duty_down and not self.is_down:
+            return 0.0
+        if (not spec.duty_down) and self.is_down:
+            return 0.0
+        period = spec.duty_on_s + spec.duty_off_s
+        pos = max(0.0, now - self.t0) % period
+        if pos < spec.duty_on_s:
+            return 0.0
+        return period - pos
+
     def decide(self, now: float, nbytes: int) -> float | None:
         """Return delivery deadline, or None to drop (model)."""
         if self.rng.random() < self._loss_p(now):
@@ -354,6 +410,7 @@ class Direction:
                 self._tokens = 0.0
             else:
                 self._tokens -= need
+        delay += self._duty_extra_s(now)
         return now + delay
 
 
@@ -488,6 +545,9 @@ def spec_from_args(args: argparse.Namespace) -> PathSpec:
         phase2_start_s=base.phase2_start_s,
         phase2_loss=base.phase2_loss,
         phase2_rate_mbit=base.phase2_rate_mbit,
+        duty_on_s=base.duty_on_s,
+        duty_off_s=base.duty_off_s,
+        duty_down=base.duty_down,
     )
 
 
@@ -507,9 +567,13 @@ def main(argv: list[str] | None = None) -> int:
     forward = parse_hostport(args.forward)
     spec = spec_from_args(args)
     emu = UdpNetem(listen, forward, spec, queue_max=args.queue_max)
+    duty = ""
+    if spec.duty_on_s > 0 and spec.duty_off_s > 0:
+        duty = f" duty={spec.duty_on_s*1e3:.0f}/{spec.duty_off_s*1e3:.0f}ms"
     print(
         f"netem {listen} -> {forward} profile={args.profile} "
         f"delay={spec.delay_s*1e3:.0f}ms loss={spec.loss} "
+        f"rate={spec.rate_mbit:.0f}mbit{duty} "
         f"ge={spec.ge_p_gb} seed={spec.seed}  (TETRYS_GSO=0 on sender)"
     )
     last = time.monotonic()
