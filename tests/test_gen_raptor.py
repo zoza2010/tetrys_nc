@@ -206,6 +206,34 @@ def test_gen_feedback_miss_bitmap_wire():
     assert miss_bitmap_to_nacks(10, bitmap) == [10, 12, 22]
 
 
+def test_gen_feedback_drain_epoch_wire():
+    bitmap = bytes([0b00000011])
+    fb = GenFeedbackPacket(
+        16270,
+        [16270],
+        echo_ts_us=99,
+        completed_gens=16270,
+        nack_rx_counts=[12],
+        miss_bitmap=bitmap,
+        drain_epoch=7,
+        never_seen=16280,
+    )
+    packed = fb.pack()
+    assert packed[3] & 0x08  # FLAG_FB_EPOCH
+    got = GenFeedbackPacket.unpack(packed)
+    assert got.drain_epoch == 7
+    assert got.never_seen == 16280
+    assert got.echo_ts_us == 99
+    assert got.miss_bitmap == bitmap
+    assert got.next_needed_gen == 16270
+    # Legacy packets without the epoch flag still decode.
+    legacy = GenFeedbackPacket(2, [2, 5], echo_ts_us=1, completed_gens=1)
+    got_legacy = GenFeedbackPacket.unpack(legacy.pack())
+    assert got_legacy.drain_epoch == 0
+    assert got_legacy.never_seen is None
+    assert got_legacy.echo_ts_us == 1
+
+
 def test_decoder_missing_source_esi():
     T = 64
     K = 8

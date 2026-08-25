@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import mmap
+import os
+import queue
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -19,8 +23,26 @@ from tetrys_nc.gen_xfer import (
     _REORDER_HOLDOFF_S,
     _REPAIR_COOLDOWN_S,
     _REPAIR_META_KEEP,
+    encode_batch_start,
+    encode_read_gens_from_env,
+    disk_queue_adapt_bytes,
+    disk_queue_adapt_from_env,
+    disk_queue_drop_consumed,
+    disk_direct_from_env,
+    disk_queue_mib_from_env,
+    disk_queue_max_mib_from_env,
+    disk_queue_note_read,
+    disk_queue_pop_blob,
+    disk_queue_pread,
+    open_disk_queue_fd,
+    disk_feed_cap_bps,
+    drain_encode_out_queue,
+    _encode_blob_worker_stream,
     _encode_gen_worker,
+    _encode_gens_worker,
+    _encode_gens_worker_stream,
     adaptive_blast_overhead_pct,
+    blast_fec_miss_frac,
     adaptive_inflight_mib,
     bbr_pacing_gain,
     bbr_still_startup,
@@ -33,6 +55,13 @@ from tetrys_nc.gen_xfer import (
     client_feedback_interval,
     compute_inflight_gen_limit,
     delay_cc_may_probe,
+    drain_empty_round_max,
+    hol_pause_should_hold,
+    hol_should_pause_blast,
+    drain_epoch_is_stale,
+    drain_never_seen_frontier,
+    drain_repair_send_n,
+    drain_scoreboard_targets,
     echo_rtt_s,
     even_spread,
     fountain_redundancy,
@@ -50,7 +79,12 @@ from tetrys_nc.gen_xfer import (
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
+    readahead_bytes_from_env,
+    readahead_next_slice,
+    run_file_disk_queue,
+    run_file_readahead,
     repair_holdoff_ready,
+    repair_extra_n,
     repair_round_size,
     repair_overhead_pct,
     repair_pressure,
@@ -82,6 +116,386 @@ def test_compute_inflight_and_feedback_horizon():
     assert client_feedback_horizon(1035) >= 1035
     assert compute_inflight_gen_limit(96, 1350, inflight_mib=8) == 64
     assert compute_inflight_gen_limit(96, 1350, inflight_mib=16) == 129
+
+
+def test_readahead_next_slice_skips_consumed_and_caps_eof():
+    block = 1000
+    size = 50_000
+    ahead = 8_000
+    assert readahead_next_slice(
+        gen_id=0,
+        block_bytes=block,
+        file_size=size,
+        primed=0,
+        ahead_bytes=ahead,
+        chunk_bytes=4096,
+    ) == (0, 4096)
+    assert (
+        readahead_next_slice(
+            gen_id=0,
+            block_bytes=block,
+            file_size=size,
+            primed=8_000,
+            ahead_bytes=ahead,
+            chunk_bytes=4096,
+        )
+        is None
+    )
+    # Blast already past primed: skip consumed prefix.
+    assert readahead_next_slice(
+        gen_id=10,
+        block_bytes=block,
+        file_size=size,
+        primed=0,
+        ahead_bytes=ahead,
+        chunk_bytes=4096,
+    ) == (10_000, 4096)
+    assert readahead_next_slice(
+        gen_id=49,
+        block_bytes=block,
+        file_size=size,
+        primed=49_000,
+        ahead_bytes=ahead,
+        chunk_bytes=8192,
+    ) == (49_000, 1_000)
+    assert (
+        readahead_next_slice(
+            gen_id=0,
+            block_bytes=block,
+            file_size=size,
+            primed=0,
+            ahead_bytes=0,
+        )
+        is None
+    )
+
+
+def test_readahead_bytes_from_env(monkeypatch):
+    monkeypatch.delenv("TETRYS_READAHEAD_MIB", raising=False)
+    assert readahead_bytes_from_env() == 0
+    monkeypatch.setenv("TETRYS_READAHEAD_MIB", "128")
+    assert readahead_bytes_from_env() == 128 * 1024 * 1024
+    monkeypatch.setenv("TETRYS_READAHEAD_MIB", "0")
+    assert readahead_bytes_from_env() == 0
+    monkeypatch.setenv("TETRYS_READAHEAD_MIB", "nope")
+    assert readahead_bytes_from_env() == 0 * 1024 * 1024
+
+
+def test_encode_read_gens_from_env(monkeypatch):
+    monkeypatch.delenv("TETRYS_ENCODE_READ_GENS", raising=False)
+    assert encode_read_gens_from_env() == 16
+    monkeypatch.setenv("TETRYS_ENCODE_READ_GENS", "32")
+    assert encode_read_gens_from_env() == 32
+    monkeypatch.setenv("TETRYS_ENCODE_READ_GENS", "0")
+    assert encode_read_gens_from_env() == 1
+    monkeypatch.setenv("TETRYS_ENCODE_READ_GENS", "nope")
+    assert encode_read_gens_from_env() == 16
+    assert encode_batch_start(0, 16) == 0
+    assert encode_batch_start(16, 16) == 16
+    assert encode_batch_start(17, 16) == 16
+    assert encode_batch_start(31, 16) == 16
+    assert encode_batch_start(32, 16) == 32
+
+
+def test_disk_queue_mib_from_env(monkeypatch):
+    monkeypatch.delenv("TETRYS_DISK_QUEUE_MIB", raising=False)
+    assert disk_queue_mib_from_env() == 64 * 1024 * 1024
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MIB", "32")
+    assert disk_queue_mib_from_env() == 32 * 1024 * 1024
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MIB", "0")
+    assert disk_queue_mib_from_env() == 0
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MIB", "nope")
+    assert disk_queue_mib_from_env() == 64 * 1024 * 1024
+
+
+def test_disk_queue_max_mib_from_env(monkeypatch):
+    lo = 64 * 1024 * 1024
+    monkeypatch.delenv("TETRYS_DISK_QUEUE_MAX_MIB", raising=False)
+    assert disk_queue_max_mib_from_env(lo) == 64 * 1024 * 1024
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MAX_MIB", "96")
+    assert disk_queue_max_mib_from_env(lo) == 96 * 1024 * 1024
+    # Never shrink the floor the user asked for.
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MAX_MIB", "16")
+    assert disk_queue_max_mib_from_env(lo) == lo
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_MAX_MIB", "nope")
+    assert disk_queue_max_mib_from_env(lo) == 64 * 1024 * 1024
+
+
+def test_disk_queue_adapt_from_env(monkeypatch):
+    monkeypatch.delenv("TETRYS_DISK_QUEUE_ADAPT", raising=False)
+    assert disk_queue_adapt_from_env() is False
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_ADAPT", "0")
+    assert disk_queue_adapt_from_env() is False
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_ADAPT", "false")
+    assert disk_queue_adapt_from_env() is False
+    monkeypatch.setenv("TETRYS_DISK_QUEUE_ADAPT", "1")
+    assert disk_queue_adapt_from_env() is True
+
+
+def test_disk_queue_adapt_grows_when_disk_is_fast_and_hungry():
+    lo = 32 * 1024 * 1024
+    hi = 64 * 1024 * 1024
+    step = 16 * 1024 * 1024
+    send = 90 * 1024 * 1024
+    # Fast pread + empty queue → grow one step.
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=lo,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.10,
+            disk_bps=120 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=4000 * 1024 * 1024,
+        )
+        == lo + step
+    )
+    # Slow disk that cannot keep up: stay at the floor even if hungry.
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=lo,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.05,
+            disk_bps=20 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=4000 * 1024 * 1024,
+        )
+        == lo
+    )
+    # Fast but already half-full: do not keep inflating.
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=lo + step,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.40,
+            disk_bps=120 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=4000 * 1024 * 1024,
+        )
+        == lo + step
+    )
+    # Slow after a grow: step back so RAM returns to page cache.
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=hi,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.80,
+            disk_bps=20 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=4000 * 1024 * 1024,
+        )
+        == hi - step
+    )
+    # Ballooned VM: collapse to the floor.
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=hi,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.05,
+            disk_bps=200 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=500 * 1024 * 1024,
+        )
+        == lo
+    )
+    # Unknown MemAvailable still allows a grow (non-Linux / test hosts).
+    assert (
+        disk_queue_adapt_bytes(
+            current_bytes=lo,
+            min_bytes=lo,
+            max_bytes=hi,
+            queued_frac=0.10,
+            disk_bps=120 * 1024 * 1024,
+            send_bps=send,
+            available_bytes=None,
+        )
+        == lo + step
+    )
+
+
+def test_disk_feed_cap_hysteresis_and_ewma():
+    max_bps = 100_000_000.0
+    disk = 20_000_000.0
+    # Full queue: network CC owns pace even if we know disk is slower.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.90,
+        disk_bps=disk,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+    )
+    assert not capping
+    assert cap == max_bps
+    # Empty queue: cap at disk × headroom.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.10,
+        disk_bps=disk,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+    )
+    assert capping
+    assert 20_000_000.0 < cap < 22_000_000.0
+    # Mid-queue without latch: do not cap yet.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.40,
+        disk_bps=disk,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+        capping=False,
+    )
+    assert not capping
+    assert cap == max_bps
+    # Latch holds until the queue is mostly full again.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.40,
+        disk_bps=disk,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+        capping=True,
+    )
+    assert capping
+    assert cap < 22_000_000.0
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.60,
+        disk_bps=disk,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+        capping=True,
+    )
+    assert not capping
+    assert cap == max_bps
+    # Fast disk / warm cache: never cap.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.05,
+        disk_bps=90_000_000.0,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+    )
+    assert not capping
+    assert cap == max_bps
+    # No sample yet → do not clamp to zero.
+    cap, capping = disk_feed_cap_bps(
+        queued_frac=0.0,
+        disk_bps=0.0,
+        max_bps=max_bps,
+        min_bps=1_000_000.0,
+    )
+    assert not capping
+    assert cap == max_bps
+
+    st: dict = {}
+    disk_queue_note_read(st, 4_000_000, 1.0, elapsed=0.10)
+    assert st["rate_bps"] == pytest.approx(40_000_000.0, rel=0.01)
+    # Idle pause after queue-full wait must not smear into MiB/s.
+    before = st["rate_bps"]
+    disk_queue_note_read(st, 4_000_000, 4.0, elapsed=2.0)
+    assert st["rate_bps"] == before
+    disk_queue_note_read(st, 4_000_000, 4.1, elapsed=0.20)
+    assert st["rate_bps"] > 25_000_000.0
+
+    wall: dict = {}
+    disk_queue_note_read(wall, 4_000_000, 1.0)
+    assert wall.get("rate_bps", 0.0) == 0.0
+    disk_queue_note_read(wall, 4_000_000, 1.02)
+    assert wall.get("rate_bps", 0.0) == 0.0
+    disk_queue_note_read(wall, 4_000_000, 1.20)
+    assert wall["rate_bps"] == pytest.approx(8_000_000.0 / 0.20, rel=0.01)
+    # Multi-second gap is idle, not a 2 MiB/s disk.
+    prev = wall["rate_bps"]
+    disk_queue_note_read(wall, 4_000_000, 4.0)
+    assert wall["rate_bps"] == prev
+
+
+def test_run_file_disk_queue_fills_sequential_batches(tmp_path: Path):
+    block = 1000
+    batch_n = 4
+    n_gens = 12
+    data = os.urandom(block * n_gens)
+    p = tmp_path / "diskq.bin"
+    p.write_bytes(data)
+    cond = threading.Condition()
+    state: dict = {"blobs": {}, "queued": 0, "off": 0, "err": None}
+    cursor = {"gen_id": 0}
+    stop = threading.Event()
+    t = threading.Thread(
+        target=run_file_disk_queue,
+        kwargs={
+            "path": str(p),
+            "file_size": len(data),
+            "block_bytes": block,
+            "batch_n": batch_n,
+            "cursor": cursor,
+            "stop": stop,
+            "cond": cond,
+            "state": state,
+            "max_bytes": len(data),
+            "chunk_bytes": 8 * block,
+        },
+        daemon=True,
+    )
+    t.start()
+    with cond:
+        ready = cond.wait_for(lambda: len(state["blobs"]) >= 3, timeout=2.0)
+    assert ready
+    b0 = disk_queue_pop_blob(state, cond, 0)
+    assert b0 == data[0 : 4 * block]
+    b1 = disk_queue_pop_blob(state, cond, 4)
+    assert b1 == data[4 * block : 8 * block]
+    stop.set()
+    with cond:
+        cond.notify_all()
+    t.join(timeout=2.0)
+    assert state["err"] is None
+
+
+def test_disk_direct_from_env(monkeypatch):
+    monkeypatch.delenv("TETRYS_DISK_DIRECT", raising=False)
+    assert disk_direct_from_env() is True
+    monkeypatch.setenv("TETRYS_DISK_DIRECT", "0")
+    assert disk_direct_from_env() is False
+    monkeypatch.setenv("TETRYS_DISK_DIRECT", "1")
+    assert disk_direct_from_env() is True
+
+
+def test_disk_queue_pread_roundtrip(tmp_path: Path):
+    data = os.urandom(12_000)
+    p = tmp_path / "pread.bin"
+    p.write_bytes(data)
+    fd, direct = open_disk_queue_fd(str(p))
+    try:
+        scratch = None
+        if direct:
+            scratch = mmap.mmap(-1, 16 * 1024)
+        try:
+            got = disk_queue_pread(
+                fd, 4000, 8000, scratch=scratch, direct=direct
+            )
+        finally:
+            if scratch is not None:
+                scratch.close()
+    finally:
+        os.close(fd)
+    assert got == data[8000:12000]
+
+
+def test_run_file_readahead_reads_ahead(tmp_path):
+    path = tmp_path / "blob.bin"
+    data = os.urandom(64 * 1024)
+    path.write_bytes(data)
+    cursor = {"gen_id": 0}
+    stop = threading.Event()
+    run_file_readahead(
+        str(path),
+        file_size=len(data),
+        block_bytes=4096,
+        cursor=cursor,
+        stop=stop,
+        ahead_bytes=len(data),
+    )
+    assert path.read_bytes() == data
 
 
 def test_adaptive_inflight_tracks_bdp():
@@ -164,6 +578,15 @@ def test_repair_pressure_and_yield():
     )
     assert hol_hole_gens(2, 497) == 495
     assert hol_hole_gens(80, 80) == 0
+    # Occupancy pause still ignores lag; HOL pause is a separate brake.
+    assert not hol_should_pause_blast(63)
+    assert hol_should_pause_blast(64)
+    assert hol_should_pause_blast(13000)
+    # Enter only when stuck; stay until the hole shrinks (hysteresis).
+    assert not hol_pause_should_hold(active=False, hol_hole=200, stuck=False)
+    assert hol_pause_should_hold(active=False, hol_hole=200, stuck=True)
+    assert hol_pause_should_hold(active=True, hol_hole=40, stuck=False)
+    assert not hol_pause_should_hold(active=True, hol_hole=31, stuck=False)
 
 
 def test_hol_repair_uses_short_cooldown():
@@ -186,6 +609,7 @@ def test_reorder_holdoff_gates_repair_feedback():
 
 def test_adaptive_blast_overhead_scales_with_pressure():
     cap = 1000
+    # Occupancy / HOL / clean-hold must not move FEC: those are BDP, not loss.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=0,
@@ -202,8 +626,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         clean_s=_OH_CLEAN_HOLD_S,
         floor_pct=8,
-    ) == 8
-    # Clean path pays no FEC tax after the hold (ATP source-stream).
+    ) == 10
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=0,
@@ -211,84 +634,97 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=10,
         inflight_gen_limit=cap,
         clean_s=_OH_CLEAN_HOLD_S,
-    ) == 0
-    # Steady ~100-gen pipeline on a 1k window stays at base (pressure ~0.1).
+    ) == 10
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=100,
         nack_count=0,
         incomplete=100,
         inflight_gen_limit=cap,
-        max_pct=20,
+        max_pct=32,
     ) == 10
-    # HOL hole must not raise FEC: lag is large, occupancy is not.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=500,
         nack_count=0,
         incomplete=2,
         inflight_gen_limit=cap,
-        max_pct=20,
+        max_pct=32,
     ) == 10
-    # Reorder NACK bitmap on a clean WAN is not loss.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=80,
         nack_count=40,
         incomplete=40,
         inflight_gen_limit=cap,
-        max_pct=20,
+        max_pct=32,
+        miss_frac=0.0,
     ) == 10
-    # 20% of a large window used to trip mid-FEC; with 8 MiB/64 gens that
-    # same fraction is a healthy pipeline, so keep base until half-full.
-    assert adaptive_blast_overhead_pct(
-        base_pct=10,
-        frontier_lag=200,
-        nack_count=3,
-        incomplete=200,
-        inflight_gen_limit=cap,
-        max_pct=20,
-    ) == 10
-    assert adaptive_blast_overhead_pct(
-        base_pct=10,
-        frontier_lag=500,
-        nack_count=20,
-        incomplete=500,
-        inflight_gen_limit=cap,
-        max_pct=20,
-    ) == 15
-    assert adaptive_blast_overhead_pct(
-        base_pct=10,
-        frontier_lag=800,
-        nack_count=20,
-        incomplete=800,
-        inflight_gen_limit=cap,
-        max_pct=20,
-    ) == 20
-    # 8 MiB WAN window: ~30/64 gens is BDP, not a loss signal.
-    assert adaptive_blast_overhead_pct(
-        base_pct=10,
-        frontier_lag=30,
-        nack_count=0,
-        incomplete=30,
-        inflight_gen_limit=64,
-        max_pct=20,
-    ) == 10
+    # Full window without rank misses stays at base (was wrongly 20%).
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=48,
         nack_count=0,
         incomplete=48,
         inflight_gen_limit=64,
-        max_pct=20,
-    ) == 20
+        max_pct=32,
+    ) == 10
+    # Manual 30% is a floor: adapt must not cut it after a 'clean' window.
+    assert adaptive_blast_overhead_pct(
+        base_pct=30,
+        frontier_lag=10,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+        clean_s=_OH_CLEAN_HOLD_S,
+        max_pct=32,
+    ) == 30
+    # Rank-deficient aged NACKs raise toward ceil. A short HOL NACK list is
+    # the usual feedback shape, so miss_frac alone is the signal.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=5,
+        incomplete=80,
+        inflight_gen_limit=cap,
+        max_pct=32,
+        miss_frac=0.12,
+    ) == 21
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=12,
+        incomplete=80,
+        inflight_gen_limit=cap,
+        max_pct=32,
+        miss_frac=0.40,
+    ) == 32
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=1,
+        incomplete=80,
+        inflight_gen_limit=cap,
+        max_pct=32,
+        miss_frac=1.0,
+    ) == 32
     assert adaptive_blast_overhead_pct(
         base_pct=0,
         frontier_lag=100,
         nack_count=50,
         incomplete=500,
         inflight_gen_limit=cap,
+        miss_frac=1.0,
     ) == 0
+
+
+def test_blast_fec_miss_frac_uses_rank_not_occupancy():
+    k = 96
+    rx = {0: 40, 1: 50, 2: 90, 3: 98}
+    assert blast_fec_miss_frac(rx, [0, 1, 2, 3], gen_k=k) == 0.75
+    assert blast_fec_miss_frac(rx, [], gen_k=k) == 0.0
+    assert blast_fec_miss_frac({}, [7, 8], gen_k=k) == 1.0
+    assert blast_fec_miss_frac({7: 98, 8: 99}, [7, 8], gen_k=k) == 0.0
 
 
 def test_echo_rtt_and_delay_pace():
@@ -554,6 +990,13 @@ def test_client_feedback_interval_is_fast_while_open():
         open_gens=0,
         nack_count=0,
     ) == 0.05
+    assert client_feedback_interval(
+        fin_seen=True,
+        next_needed=90,
+        total_gens=100,
+        open_gens=3,
+        nack_count=3,
+    ) == 0.02
 
 
 def test_repair_thread_limit_stays_thin():
@@ -602,22 +1045,27 @@ def test_even_spread_covers_window():
 
 def test_repair_send_n_deficit_and_probe():
     k = 96
-    assert repair_send_n(None, k, hol=True) == 2
+    # Unknown rank: absolute pad + probe, not 2 fountain tokens.
+    assert repair_send_n(None, k, hol=True) == 6
     assert repair_send_n(k + 2, k) == 0
-    # near-complete: deficit 4 (enough=98, rx=94)
-    assert repair_send_n(94, k, hol=False) == 4
-    assert repair_send_n(94, k, hol=True) == 5
-    # Live FEC pad: 10% → 5 packets (not clipped by tail cap=4).
-    assert repair_send_n(94, k, hol=False, overhead_pct=10) == 5
-    assert repair_send_n(94, k, hol=True, overhead_pct=10) == 5
-    assert repair_send_n(97, k, hol=False, overhead_pct=10) == 2
-    assert repair_send_n(94, k, hol=False, overhead_pct=20) == 5
+    # deficit 4 (enough=98, rx=94) + abs pad 4 → 8, not 10% of 4.
+    assert repair_extra_n(4, overhead_pct=10) == 4
+    assert repair_extra_n(4, overhead_pct=20) == 4
+    assert repair_extra_n(40, overhead_pct=20) == 8
+    assert repair_send_n(94, k, hol=False) == 8
+    assert repair_send_n(94, k, hol=True) == 8
+    assert repair_send_n(94, k, hol=False, overhead_pct=10) == 8
+    assert repair_send_n(94, k, hol=True, overhead_pct=10) == 8
+    assert repair_send_n(97, k, hol=False, overhead_pct=10) == 5
+    assert repair_send_n(94, k, hol=False, overhead_pct=20) == 8
+    assert repair_send_n(94, k, hol=True, close=True, overhead_pct=10) == 8
     assert repair_overhead_pct(10) == 10
     assert repair_overhead_pct(0) == 8
     assert hol_resend_pad_n(0, 10) == 0
-    assert hol_resend_pad_n(1, 10) == 1
-    assert hol_resend_pad_n(4, 10) == 1
-    assert hol_resend_pad_n(10, 20) == 2
+    assert hol_resend_pad_n(1, 10) == 4
+    assert hol_resend_pad_n(4, 10) == 4
+    assert hol_resend_pad_n(10, 20) == 4
+    assert hol_resend_pad_n(40, 20) == 8
     hist = [0, 0, 0, 0, 0]
     note_close_round(hist, 0)
     note_close_round(hist, 1)
@@ -716,6 +1164,88 @@ def test_build_feedback_miss_bitmap_gap_aware():
     assert 5 in missing  # partial decoder
     assert 6 in missing  # gap before max_gid_seen
     assert 8 not in missing  # beyond max_gid_seen, still in flight
+
+
+def test_build_feedback_miss_bitmap_include_unseen_after_fin():
+    done = {0, 1, 3}
+    decoders = {5: object()}
+
+    def bit_get(i: int) -> bool:
+        return i in done
+
+    bitmap = build_feedback_miss_bitmap(
+        next_needed=0,
+        total_gens=20,
+        horizon=16,
+        bit_get=bit_get,
+        decoders=decoders,
+        max_gid_seen=7,
+        include_unseen=True,
+    )
+    missing = miss_bitmap_to_nacks(0, bitmap)
+    assert 2 in missing
+    assert 8 in missing  # never-seen tail after FIN
+    assert 15 in missing
+    assert 0 not in missing
+    assert 1 not in missing
+    assert 3 not in missing
+
+
+def test_drain_scoreboard_targets_bitmap_and_never_seen():
+    # HOL + bitmap holes in window; never-seen fills the rest of the window.
+    targets = drain_scoreboard_targets(
+        next_needed=100,
+        total_gens=200,
+        miss_nacks=[100, 103, 180],
+        never_seen=110,
+        window=16,
+    )
+    assert targets[0] == 100
+    assert 103 in targets
+    assert 180 not in targets  # outside window
+    assert 110 in targets
+    assert 115 in targets
+    assert max(targets) == 115
+    # Complete file: nothing to drain.
+    assert drain_scoreboard_targets(
+        next_needed=200,
+        total_gens=200,
+        miss_nacks=[199],
+        never_seen=200,
+    ) == []
+    # Legacy FB without never_seen still repairs HOL + nacks.
+    legacy = drain_scoreboard_targets(
+        next_needed=50,
+        total_gens=80,
+        miss_nacks=[50, 52],
+        never_seen=None,
+        window=8,
+    )
+    assert legacy == [50, 52]
+
+
+def test_drain_epoch_is_stale_and_never_seen_frontier():
+    assert not drain_epoch_is_stale(0, 4)
+    assert not drain_epoch_is_stale(5, 0)
+    assert not drain_epoch_is_stale(5, 5)
+    assert drain_epoch_is_stale(3, 5)
+    assert not drain_epoch_is_stale(6, 5)
+    assert drain_epoch_is_stale(0xFFFF, 1)
+    assert not drain_epoch_is_stale(1, 0xFFFF)
+    assert drain_never_seen_frontier(10, 9, 100) == 10
+    assert drain_never_seen_frontier(10, 40, 100) == 41
+    assert drain_never_seen_frontier(99, 200, 100) == 100
+
+
+def test_drain_repair_send_n_closes_empty_gen_in_one_round():
+    cap = drain_empty_round_max(96)
+    assert cap == 96 + 2 + 4
+    assert drain_repair_send_n(None, 96, empty=True) == cap
+    assert drain_repair_send_n(0, 96, empty=False) == cap
+    # Partial hole stays a patch, not a full reblast.
+    n = drain_repair_send_n(90, 96, empty=False)
+    assert 1 <= n < cap
+    assert n >= (96 - 90)
 
 
 def test_pipeline_stressed_clean_vs_pressure():
@@ -1000,6 +1530,94 @@ def test_encode_worker_bootstrap_in_initial_blast(tmp_path: Path):
     esis = {p.esi for p in parsed}
     assert len(esis) == len(wires)
     assert max(esis) >= K + bootstrap - 1
+
+
+def test_encode_gens_worker_reads_consecutive_blocks(tmp_path: Path):
+    """One worker task should mmap a multi-gen slice, not one gen per submit."""
+    require_raptorq()
+    T = 1350
+    K = 48
+    block = K * T
+    n = 3
+    path = tmp_path / "blocks.bin"
+    path.write_bytes(bytes((i * 5) & 0xFF for i in range(block * n)))
+
+    out = _encode_gens_worker(str(path), 0, n, block, block * n, T, 8, False)
+    assert len(out) == n
+    for i, (enc_cpu_s, src_bytes, wires, bootstrap) in enumerate(out):
+        assert src_bytes == block
+        assert enc_cpu_s >= 0.0
+        assert bootstrap == blast_repair_budget(K, 8)
+        assert len(wires) >= K + bootstrap
+        parsed = [GenPacket.unpack(w) for w in wires]
+        assert all(p.gen_id == i for p in parsed)
+
+
+def test_drain_encode_out_queue_moves_inflight_to_ready():
+    src: queue.Queue = queue.Queue()
+    ready: dict = {}
+    inflight = {0, 1, 2}
+    src.put((1, (0.1, 10, [b"a"], 0)))
+    src.put((2, (0.2, 20, [b"b"], 1)))
+    n = drain_encode_out_queue(src, ready, inflight)
+    assert n == 2
+    assert set(ready) == {1, 2}
+    assert inflight == {0}
+
+
+def test_encode_gens_worker_stream_puts_each_gen(tmp_path: Path):
+    """Batch read must publish gen 0 before the remaining gens are encoded."""
+    import tetrys_nc.gen_xfer as gx
+
+    require_raptorq()
+    T = 1350
+    K = 48
+    block = K * T
+    n = 3
+    path = tmp_path / "stream.bin"
+    path.write_bytes(bytes((i * 9) & 0xFF for i in range(block * n)))
+    q: queue.Queue = queue.Queue()
+    old = gx._encode_out_q
+    gx._encode_out_q = q
+    try:
+        got = _encode_gens_worker_stream(
+            str(path), 0, n, block, block * n, T, 8, False
+        )
+    finally:
+        gx._encode_out_q = old
+    assert got == n
+    gids = []
+    while not q.empty():
+        gid, item = q.get_nowait()
+        gids.append(gid)
+        enc_cpu_s, src_bytes, wires, bootstrap = item
+        assert src_bytes == block
+        assert enc_cpu_s >= 0.0
+        assert bootstrap == blast_repair_budget(K, 8)
+        assert len(wires) >= K + bootstrap
+        parsed = [GenPacket.unpack(w) for w in wires]
+        assert all(p.gen_id == gid for p in parsed)
+    assert gids == [0, 1, 2]
+
+
+def test_encode_blob_worker_stream_does_not_need_path(tmp_path: Path):
+    import tetrys_nc.gen_xfer as gx
+
+    require_raptorq()
+    T = 1350
+    K = 48
+    block = K * T
+    n = 3
+    blob = bytes((i * 13) & 0xFF for i in range(block * n))
+    q: queue.Queue = queue.Queue()
+    old = gx._encode_out_q
+    gx._encode_out_q = q
+    try:
+        got = _encode_blob_worker_stream(blob, 0, n, block, block * n, T, 8, False)
+    finally:
+        gx._encode_out_q = old
+    assert got == n
+    assert [q.get_nowait()[0] for _ in range(n)] == [0, 1, 2]
 
 
 def test_encode_worker_fountain_mode_bootstrap(tmp_path: Path):

@@ -21,8 +21,11 @@ FLAG_META_XFER = 0x08  # META always carries gen params trailer
 FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
 FLAG_FB_HOL_MISS = 0x02  # trailing uint8 + uint16 source ESIs for next_needed
 FLAG_FB_BITMAP = 0x04  # uint16 len + miss bitmap anchored at next_needed_gen
+FLAG_FB_EPOCH = 0x08  # uint16 drain epoch + uint32 first never-seen gen
 # Max miss bitmap bytes (1088 bits; covers K=48 inflight window + slack).
 FEEDBACK_BITMAP_MAX_BYTES = 136
+# never_seen wire value when the client omits a never-seen frontier.
+FB_NEVER_SEEN_NONE = 0xFFFFFFFF
 XFER_GEN = 1
 
 _HDR = struct.Struct("!BBBB")
@@ -79,6 +82,10 @@ class GenFeedbackPacket:
     hol_miss_esi: list[int] | None = None
     # Bit i set => gen (next_needed_gen + i) needs repair (gap/partial).
     miss_bitmap: bytes | None = None
+    # Drain scoreboard: drop stale repair if a newer epoch arrives.
+    drain_epoch: int = 0
+    # First generation the client has never received (max_gid_seen + 1).
+    never_seen: int | None = None
 
     def pack(self) -> bytes:
         nacks = self.nack_gens[:64]
@@ -105,10 +112,18 @@ class GenFeedbackPacket:
         if bitmap:
             body += struct.pack("!H", len(bitmap))
             body += bitmap
+        epoch = int(self.drain_epoch) & 0xFFFF
+        ns = self.never_seen
+        with_epoch = epoch > 0 or ns is not None
+        if with_epoch:
+            ns_wire = FB_NEVER_SEEN_NONE if ns is None else (int(ns) & 0xFFFFFFFF)
+            body += struct.pack("!HI", epoch, ns_wire)
         body += struct.pack("!I", self.echo_ts_us & 0xFFFFFFFF)
         flags = (FLAG_FB_RX_COUNTS if with_counts else 0) | (
             FLAG_FB_HOL_MISS if hol else 0
-        ) | (FLAG_FB_BITMAP if bitmap else 0)
+        ) | (FLAG_FB_BITMAP if bitmap else 0) | (
+            FLAG_FB_EPOCH if with_epoch else 0
+        )
         return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, flags) + body
 
     @classmethod
@@ -122,6 +137,7 @@ class GenFeedbackPacket:
         with_counts = bool(data[3] & FLAG_FB_RX_COUNTS)
         with_hol = bool(data[3] & FLAG_FB_HOL_MISS)
         with_bitmap = bool(data[3] & FLAG_FB_BITMAP)
+        with_epoch = bool(data[3] & FLAG_FB_EPOCH)
         item_size = 6 if with_counts else 4
         if len(data) < off + n * item_size:
             raise ValueError("gen feedback NACK list truncated")
@@ -154,6 +170,15 @@ class GenFeedbackPacket:
                 raise ValueError("gen feedback bitmap payload truncated")
             bitmap = bytes(data[off : off + blen])
             off += blen
+        drain_epoch = 0
+        never_seen: int | None = None
+        if with_epoch:
+            if len(data) < off + 6:
+                raise ValueError("gen feedback epoch truncated")
+            drain_epoch, ns_wire = struct.unpack_from("!HI", data, off)
+            off += 6
+            if ns_wire != FB_NEVER_SEEN_NONE:
+                never_seen = ns_wire
         echo = struct.unpack_from("!I", data, off)[0] if len(data) >= off + 4 else 0
         return cls(
             next_needed,
@@ -163,6 +188,8 @@ class GenFeedbackPacket:
             counts if with_counts else None,
             hol if hol else None,
             bitmap if bitmap else None,
+            drain_epoch,
+            never_seen,
         )
 
 
