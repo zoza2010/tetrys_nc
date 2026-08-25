@@ -187,12 +187,16 @@ _FB_EVERY_FIN_S = 0.05
 _DRAIN_WINDOW = 48
 _DRAIN_TURN_GENS = 12
 _DRAIN_COOLDOWN_S = 0.08
-# Mid-blast HOL pause also requires next_needed stuck >= _STUCK_S.
+# Mid-blast HOL share also requires next_needed stuck >= _STUCK_S.
 # Size alone is WAN reorder inside the 64 MiB window.
 _HOL_PAUSE_GENS = 64
-# Stay paused until the hole shrinks; otherwise a 3-gen HOL crawl resets
-# stuck_nn and blast resumes into a bigger hole (1G fell to 72–75 MiB/s).
+# Stay in HOL-share until the hole shrinks; otherwise a 3-gen HOL crawl
+# resets stuck_nn and blast resumes into a bigger hole.
 _HOL_RESUME_GENS = 32
+# Keep blasting while repairing HOL. 32 pkts is ~25% of one K=96+30% gen
+# (~125 wire packets). A full pause starved the client at wait_rx=99%.
+_HOL_SHARE_TURN_PKTS = 32
+_HOL_SHARE_TURN_GENS = 4
 # Delivery-rate pacing: only back off when client goodput lags wire pace.
 _ADAPT_PACE_MIN_FRAC = 0.10
 _ADAPT_PACE_BACKOFF_FRAC = 0.82  # delivery < pace×this → slow down
@@ -476,6 +480,15 @@ def hol_pause_should_hold(
         floor = _HOL_RESUME_GENS if resume_gens is None else max(0, int(resume_gens))
         return int(hol_hole) >= floor
     return bool(stuck) and hol_should_pause_blast(hol_hole, pause_gens=pause_gens)
+
+
+def hol_share_cap_n(
+    n: int,
+    *,
+    max_pkts: int = _HOL_SHARE_TURN_PKTS,
+) -> int:
+    """Bound HOL repair so it cannot eat the whole send turn."""
+    return max(0, min(int(n), max(0, int(max_pkts))))
 
 
 def should_pause_blast(
@@ -3235,6 +3248,8 @@ def run_gen_server(
         miss_bm: bytes,
         hol_miss: list[int] | None,
         sent_before: int,
+        max_pkts: int = _HOL_SHARE_TURN_PKTS,
+        turn_gens: int = _HOL_SHARE_TURN_GENS,
     ) -> list[bytes]:
         """Close the HOL window from bitmap+NACKs; do not spray the decoded tail."""
         if next_needed < 0 or next_needed >= sent_before:
@@ -3249,30 +3264,36 @@ def run_gen_server(
             never_seen=None,
         )
         drain_cap = drain_empty_round_max(gen_k)
+        room = hol_share_cap_n(max_pkts)
         wires: list[bytes] = []
-        turn = targets[:_DRAIN_TURN_GENS]
+        turn = targets[: max(1, int(turn_gens))]
+        used: list[int] = []
         for gid in turn:
+            if room <= 0:
+                break
             rx = nack_rx.get(gid)
             empty = rx is None or int(rx) <= 0
-            send_n = drain_repair_send_n(rx, gen_k, empty=empty)
+            send_n = min(drain_repair_send_n(rx, gen_k, empty=empty), room)
             is_hol = gid == next_needed
-            wires.extend(
-                repair_one(
-                    mm,
-                    gid,
-                    now=now,
-                    symbols_rx=rx,
-                    send_n=send_n,
-                    source_esis=hol_miss if is_hol else None,
-                    cooldown_s=_DRAIN_COOLDOWN_S,
-                    hol=is_hol,
-                    close=True,
-                    round_max=drain_cap,
-                )
+            chunk = repair_one(
+                mm,
+                gid,
+                now=now,
+                symbols_rx=rx,
+                send_n=send_n,
+                source_esis=hol_miss if is_hol else None,
+                cooldown_s=_DRAIN_COOLDOWN_S,
+                hol=is_hol,
+                close=True,
+                round_max=min(drain_cap, room),
             )
-        if turn:
-            prune_encoders(set(turn))
-        return wires
+            if chunk:
+                wires.extend(chunk)
+                room -= len(chunk)
+                used.append(gid)
+        if used:
+            prune_encoders(set(used))
+        return wires[: hol_share_cap_n(max_pkts)]
 
     t0 = time.monotonic()
     bytes_sent_payload = 0
@@ -3881,15 +3902,13 @@ def run_gen_server(
                         if now_p - last_progress >= 1.0:
                             last_progress = now_p
                             print(
-                                f"hol-pause next={next_needed} hole={hol_hole} "
+                                f"hol-share next={next_needed} hole={hol_hole} "
                                 f"done={completed}/{total_gens} sent={gen_id} "
                                 f"repair={hol_pause_repair_acc}",
                                 flush=True,
                             )
                             hol_pause_repair_acc = 0
-                        time.sleep(0.002)
-                        continue
-                    if should_fountain_tick(
+                    if (not hol_pause_active) and should_fountain_tick(
                         stressed=stressed,
                         at_cap=at_cap,
                         tick_n=fountain_tick_n,
@@ -3913,7 +3932,7 @@ def run_gen_server(
                     repair_pending = (
                         not repair_q.empty() or repair_pending_count() > 0
                     )
-                    if should_yield_blast_to_repair(
+                    if (not hol_pause_active) and should_yield_blast_to_repair(
                         pressure,
                         repair_pending=repair_pending,
                         nack_count=len(nacks),

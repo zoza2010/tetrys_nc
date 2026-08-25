@@ -19,6 +19,7 @@ from tetrys_nc.gen_xfer import (
     _FOUNTAIN_TRACK_MAX,
     _FOUNTAIN_WINDOW,
     _HOL_REPAIR_COOLDOWN_S,
+    _HOL_SHARE_TURN_PKTS,
     _OH_CLEAN_HOLD_S,
     _REORDER_HOLDOFF_S,
     _REPAIR_COOLDOWN_S,
@@ -57,6 +58,7 @@ from tetrys_nc.gen_xfer import (
     delay_cc_may_probe,
     drain_empty_round_max,
     hol_pause_should_hold,
+    hol_share_cap_n,
     hol_should_pause_blast,
     drain_epoch_is_stale,
     drain_never_seen_frontier,
@@ -587,6 +589,12 @@ def test_repair_pressure_and_yield():
     assert hol_pause_should_hold(active=False, hol_hole=200, stuck=True)
     assert hol_pause_should_hold(active=True, hol_hole=40, stuck=False)
     assert not hol_pause_should_hold(active=True, hol_hole=31, stuck=False)
+    # HOL share keeps blast going; repair is a slice of the send turn.
+    assert hol_share_cap_n(400) == _HOL_SHARE_TURN_PKTS
+    assert hol_share_cap_n(8) == 8
+    assert hol_share_cap_n(0) == 0
+    assert hol_share_cap_n(-3) == 0
+    assert _HOL_SHARE_TURN_PKTS == 32
 
 
 def test_hol_repair_uses_short_cooldown():
