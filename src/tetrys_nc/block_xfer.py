@@ -183,8 +183,10 @@ def _pace_limits(rate_mbit: float) -> tuple[float, float, float]:
     max_bps = cap_mbit * 1_000_000 / 8
     start_mbit = _env_float("TETRYS_START_MBIT", WAN_START_MBIT)
     start_bps = min(max_bps, start_mbit * 1_000_000 / 8)
-    # Do not let a stretched first ACK sample collapse the blast to tens of Mbit.
-    min_bps = max(1_000_000.0, min(max_bps, start_bps * 0.85))
+    # Floor at start. 0.85×start (595 Mbit) was the lock that made 2 GiB
+    # runs drop to ~60 MiB/s after a few noisy ACK samples.
+    min_frac = min(1.0, max(0.50, _env_float("TETRYS_PACE_MIN_FRAC", 1.0)))
+    min_bps = max(1_000_000.0, min(max_bps, start_bps * min_frac))
     return min_bps, max_bps, start_bps
 
 
@@ -238,7 +240,8 @@ def run_block_server(
         f"v2 server udp://{host}:{port} file={file_path.name} size={file_size} "
         f"blocks={total_blocks} K={block_k} T={symbol_size} "
         f"block={geometry.block_bytes / 1048576:.2f}MiB active={geometry.active_blocks} "
-        f"start={start_bps * 8 / 1e6:.0f}Mbit cap={max_bps * 8 / 1e6:.0f}Mbit "
+        f"start={start_bps * 8 / 1e6:.0f}Mbit min={min_bps * 8 / 1e6:.0f}Mbit "
+        f"cap={max_bps * 8 / 1e6:.0f}Mbit "
         f"fec={initial_repair_pct}% enc_workers={workers} prefetch={prefetch_depth}",
         flush=True,
     )
@@ -508,6 +511,15 @@ def run_block_server(
                     if tail and tail_started is None:
                         tail_started = now
                     reap_completed(completed, tail=tail)
+                    pacer.repair_busy = bool(
+                        select_repair_candidates(
+                            active,
+                            opened,
+                            now,
+                            block_k=block_k,
+                            tail=tail,
+                        )
+                    )
                     submit_ahead()
 
                     admitted = False
@@ -562,6 +574,9 @@ def run_block_server(
                             f"open={len(opened)} fec={repair_ctl.current}% "
                             f"close={close_pct:.0f}% "
                             f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
+                            f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
+                            f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
+                            f"dt={pacer.last_dt:.2f}s "
                             f"ack={unique_rx / elapsed / 1048576:.1f} "
                             f"inst={inst_unique / 1048576:.1f} "
                             f"app={decoded / elapsed / 1048576:.1f}MiB/s "
@@ -623,7 +638,11 @@ def run_block_server(
         f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
         f"first_close={close_pct:.0f}% extra_blocks={extra_blocks} "
         f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
-        f"weak={pacer.weak_events} {pace_txt}",
+        f"weak={pacer.weak_events} cuts={pacer.cut_events} "
+        f"held_repair={pacer.held_repair_events} "
+        f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
+        f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
+        f"dt={pacer.last_dt:.2f}s {pace_txt}",
         flush=True,
     )
     return 0

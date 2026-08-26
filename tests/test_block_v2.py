@@ -38,6 +38,7 @@ from tetrys_nc.block_state import (
     select_repair_candidates,
 )
 from tetrys_nc.block_xfer import (
+    _pace_limits,
     encode_block_job,
     rebuild_block_encoder,
     run_block_client,
@@ -216,6 +217,45 @@ def test_ack_pacer_holds_through_one_weak_sample():
     for _ in range(5):
         pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
     assert pacer.min_bps <= pacer.offer_bps < held
+
+
+def test_ack_pacer_holds_while_repair_busy():
+    start = 87_500_000
+    pacer = AckPacer(start, 115_000_000, start)
+    pacer.update(1_000_000, 1.00)
+    pacer.update(1_000_000 + 14_000_000, 1.15)
+    pacer.startup = False
+    held = pacer.offer_bps
+    for _ in range(8):
+        got = pacer.update(
+            pacer.last_unique + 2_000_000,
+            pacer.last_ts + 0.15,
+            repair_busy=True,
+        )
+    assert got >= held * 0.99
+    assert pacer.held_repair_events >= 3
+    assert pacer.cut_events == 0
+
+
+def test_ack_pacer_floor_is_start():
+    start = 87_500_000
+    pacer = AckPacer(start, 115_000_000, start)
+    pacer.update(1_000_000, 1.00)
+    pacer.update(1_000_000 + 14_000_000, 1.15)
+    pacer.startup = False
+    for _ in range(12):
+        pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
+    assert pacer.offer_bps >= start
+
+
+def test_pace_limits_floor_equals_start(monkeypatch):
+    monkeypatch.delenv("TETRYS_START_MBIT", raising=False)
+    monkeypatch.delenv("TETRYS_PACE_CAP_MBIT", raising=False)
+    monkeypatch.delenv("TETRYS_PACE_MIN_FRAC", raising=False)
+    min_bps, max_bps, start_bps = _pace_limits(2500.0)
+    assert start_bps == pytest.approx(700_000_000 / 8)
+    assert min_bps == pytest.approx(start_bps)
+    assert max_bps == pytest.approx(920_000_000 / 8)
 
 
 def test_repair_debt_controller_ignores_packet_order():

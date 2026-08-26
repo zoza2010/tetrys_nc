@@ -162,17 +162,26 @@ class AckPacer:
     ewma_bps: float = 0.0
     last_unique: int = 0
     last_ts: float = 0.0
+    last_dt: float = 0.0
+    last_sample_bps: float = 0.0
     startup: bool = True
     plateau_n: int = 0
     weak_n: int = 0
     weak_events: int = 0
+    cut_events: int = 0
+    held_repair_events: int = 0
+    repair_busy: bool = False
 
     def _slew(self, target: float) -> float:
         hi = self.offer_bps * 1.10
         lo = self.offer_bps * 0.90
         return min(self.max_bps, max(self.min_bps, min(hi, max(lo, target))))
 
-    def update(self, unique_bytes: int, now: float) -> float:
+    def update(
+        self, unique_bytes: int, now: float, repair_busy: bool | None = None
+    ) -> float:
+        if repair_busy is None:
+            repair_busy = self.repair_busy
         # Unique=0 feedback only arms the clock after the first delivered byte.
         if unique_bytes <= 0:
             return self.offer_bps
@@ -187,6 +196,8 @@ class AckPacer:
             return self.offer_bps
         sample = delta / dt
         self.delivery_bps = sample
+        self.last_dt = dt
+        self.last_sample_bps = sample
         if self.ewma_bps <= 0.0:
             self.ewma_bps = sample
         else:
@@ -198,6 +209,7 @@ class AckPacer:
             self.last_unique = unique_bytes
             return self.offer_bps
         cruise = min(self.max_bps, max(self.min_bps, self.ewma_bps * 1.05))
+        prev = self.offer_bps
         if self.startup:
             if sample >= self.offer_bps * 0.85:
                 self.weak_n = 0
@@ -215,7 +227,11 @@ class AckPacer:
                 target = self.offer_bps
                 if self.weak_n >= 3:
                     self.startup = False
-                    target = cruise
+                    if repair_busy:
+                        self.held_repair_events += 1
+                        target = self.offer_bps
+                    else:
+                        target = cruise
             self.offer_bps = max(self._slew(target), self.min_bps)
             if self.offer_bps >= self.max_bps * 0.995:
                 self.startup = False
@@ -226,12 +242,17 @@ class AckPacer:
                 self.weak_n += 1
             else:
                 self.weak_n = 0
-            # One or two weak intervals hold; three confirmed weak allow a cut.
-            if cruise < self.offer_bps and self.weak_n < 3:
+            # Extra-repair makes unique ACK look weak; cutting then locks the floor.
+            if repair_busy and cruise < self.offer_bps:
+                self.held_repair_events += 1
+                target = self.offer_bps
+            elif cruise < self.offer_bps and self.weak_n < 3:
                 target = self.offer_bps
             else:
                 target = cruise
             self.offer_bps = self._slew(target)
+        if self.offer_bps < prev * 0.995:
+            self.cut_events += 1
         self.last_ts = now
         self.last_unique = unique_bytes
         return self.offer_bps
