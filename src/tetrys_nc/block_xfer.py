@@ -409,6 +409,7 @@ def run_block_server(
             # Tail repair storms must not train primary FEC for later blocks.
             if not tail:
                 repair_ctl.observe(extra, block_k)
+                pacer.fec_frac = repair_ctl.current / 100.0
                 extra_win.observe(extra > 0)
                 extra_frac_samples.append(extra / max(1, block_k))
                 if extra == 0:

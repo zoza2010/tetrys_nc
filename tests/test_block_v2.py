@@ -404,7 +404,7 @@ def test_geometry_locks_wan_block_size():
     assert geometry.active_bytes == WAN_ACTIVE_BYTES
     assert geometry.block_bytes == 768 * 1350
     assert geometry.active_blocks >= 64
-    assert WAN_INITIAL_REPAIR_PCT == 20
+    assert WAN_INITIAL_REPAIR_PCT == 24
     assert 0 < TAIL_REPAIR_COOLDOWN_S < REPAIR_COOLDOWN_S
     assert REPAIR_AGE_S <= 0.12
 

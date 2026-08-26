@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .block_state import WAN_INITIAL_REPAIR_PCT
 from .block_xfer import run_block_server
 
 
@@ -49,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         "--gen-overhead",
         type=int,
         default=None,
-        help="initial RaptorQ repair percent (WAN default 20)",
+        help="initial RaptorQ repair percent (WAN default 24)",
     )
     args = p.parse_args(argv)
 
@@ -62,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.gen_overhead is not None:
         overhead_pct = args.gen_overhead
     elif args.wan:
-        overhead_pct = 20
+        overhead_pct = WAN_INITIAL_REPAIR_PCT
     else:
         overhead_pct = 0
     gen_k = args.gen_k if args.gen_k is not None else 768

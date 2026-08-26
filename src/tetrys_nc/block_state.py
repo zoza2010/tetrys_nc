@@ -14,7 +14,8 @@ from .block_packets import BlockFeedbackV2, OpenBlock
 WAN_SYMBOL_SIZE = 1350
 WAN_BLOCK_K = 768
 WAN_ACTIVE_BYTES = 64 * 1024 * 1024
-WAN_INITIAL_REPAIR_PCT = 20
+# 20% left dirty-run p90 loss uncovered (p/(1-p) ≈ 23% at 18% path loss).
+WAN_INITIAL_REPAIR_PCT = 24
 # Fixed 850 Mbit beat 880/920 on this path: extra-repair stays in check.
 WAN_START_MBIT = 850.0
 WAN_PACE_CAP_MBIT = 850.0
@@ -233,7 +234,7 @@ class AckPacer:
     max_bps: float
     offer_bps: float
     # Unique ACK bytes omit repair; compare samples to offer×(1−fec).
-    fec_frac: float = 0.20
+    fec_frac: float = 0.24
     confirmed_bps: float = 0.0
     delivery_bps: float = 0.0
     ewma_bps: float = 0.0
