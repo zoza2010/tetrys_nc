@@ -26,6 +26,10 @@ BACKOFF_FRAC = 0.95
 PROBE_PERIOD = 16
 PROBE_SAMPLES = 2
 BACKOFF_NEED = 3
+# Sliding extra-repair fraction over recent non-tail completions.
+EXTRA_FRAC_WINDOW = 32
+EXTRA_FRAC_MIN_SAMPLES = 8
+EXTRA_FRAC_BUSY = 0.12
 # ~3 RTprop on the current Russia↔Spain path (~80 ms).
 REPAIR_AGE_S = 0.24
 REPAIR_COOLDOWN_S = 0.06
@@ -156,6 +160,37 @@ def select_repair_candidates(
             candidates.append((need, -int(age * 1000), block_id))
     candidates.sort()
     return candidates
+
+
+@dataclass(slots=True)
+class ExtraRepairWindow:
+    """Recent extra vs first-close completions. Mixes do not reset the signal."""
+
+    extra_n: int = 0
+    _pos: int = 0
+    _ring: list[int] = field(default_factory=list)
+
+    def observe(self, extra: bool) -> None:
+        bit = 1 if extra else 0
+        ring = self._ring
+        if len(ring) < EXTRA_FRAC_WINDOW:
+            ring.append(bit)
+            self.extra_n += bit
+            return
+        old = ring[self._pos]
+        ring[self._pos] = bit
+        self.extra_n += bit - old
+        self._pos = (self._pos + 1) % EXTRA_FRAC_WINDOW
+
+    @property
+    def frac(self) -> float:
+        n = len(self._ring)
+        if n < EXTRA_FRAC_MIN_SAMPLES:
+            return 0.0
+        return self.extra_n / n
+
+    def pressure(self, tail: bool = False) -> bool:
+        return (not tail) and self.frac >= EXTRA_FRAC_BUSY
 
 
 @dataclass(slots=True)

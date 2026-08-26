@@ -48,6 +48,7 @@ from .block_state import (
     WAN_PACE_CAP_MBIT,
     WAN_START_MBIT,
     WAN_SYMBOL_SIZE,
+    ExtraRepairWindow,
     select_repair_candidates,
 )
 from .gen_raptor import GenEncoder, GenReceiveSlot
@@ -344,6 +345,7 @@ def run_block_server(
     first_close = 0
     first_close_seen = 0
     extra_blocks = 0
+    extra_win = ExtraRepairWindow()
     last_unique = 0
     source_wire_total = 0
     repair_wire_total = 0
@@ -412,6 +414,8 @@ def run_block_server(
                 first_close += 1
             else:
                 extra_blocks += 1
+            if not tail:
+                extra_win.observe(extra > 0)
             enc_cache.pop(block_id, None)
             if block_id in enc_order:
                 enc_order.remove(block_id)
@@ -516,15 +520,7 @@ def run_block_server(
                     if tail and tail_started is None:
                         tail_started = now
                     reap_completed(completed, tail=tail)
-                    pacer.repair_busy = (not tail) and bool(
-                        select_repair_candidates(
-                            active,
-                            opened,
-                            now,
-                            block_k=block_k,
-                            tail=tail,
-                        )
-                    )
+                    pacer.repair_busy = extra_win.pressure(tail)
                     submit_ahead()
 
                     admitted = False
@@ -581,6 +577,7 @@ def run_block_server(
                             f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
                             f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} "
                             f"cc={pacer.mode} "
+                            f"xfrac={extra_win.frac * 100:.0f}% "
                             f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
                             f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
                             f"dt={pacer.last_dt:.2f}s "
@@ -644,6 +641,7 @@ def run_block_server(
         f"source_wire={source_wire_total / 1048576:.1f}MiB "
         f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
         f"first_close={close_pct:.0f}% extra_blocks={extra_blocks} "
+        f"xfrac={extra_win.frac * 100:.0f}% "
         f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
         f"weak={pacer.weak_events} cuts={pacer.cut_events} "
         f"held_repair={pacer.held_repair_events} "

@@ -35,6 +35,7 @@ from tetrys_nc.block_state import (
     WAN_BLOCK_K,
     WAN_INITIAL_REPAIR_PCT,
     WAN_SYMBOL_SIZE,
+    ExtraRepairWindow,
     select_repair_candidates,
 )
 from tetrys_nc.block_xfer import (
@@ -255,6 +256,27 @@ def test_ack_pacer_backoff_on_sustained_repair():
     assert pacer.backoff_events >= 1
     assert pacer.offer_bps < held
     assert pacer.offer_bps >= start
+
+
+def test_extra_repair_window_busy_on_sliding_fraction():
+    win = ExtraRepairWindow()
+    for _ in range(32):
+        win.observe(False)
+    assert win.pressure() is False
+    assert win.frac == 0.0
+    for _ in range(2):
+        win.observe(True)
+    assert win.frac < 0.12
+    assert win.pressure() is False
+    for _ in range(6):
+        win.observe(True)
+    assert win.frac >= 0.12
+    assert win.pressure() is True
+    assert win.pressure(tail=True) is False
+    early = ExtraRepairWindow()
+    for _ in range(4):
+        early.observe(True)
+    assert early.pressure() is False
 
 
 def test_ack_pacer_cruises_near_btlbw_not_hard_cap():
