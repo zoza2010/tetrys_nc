@@ -26,6 +26,8 @@ BACKOFF_FRAC = 0.95
 PROBE_PERIOD = 16
 PROBE_SAMPLES = 2
 BACKOFF_NEED = 3
+BACKOFF_COOLDOWN = 16
+CRUISE_SLEW = 0.03
 # Sliding extra-repair fraction over recent non-tail completions.
 EXTRA_FRAC_WINDOW = 32
 EXTRA_FRAC_MIN_SAMPLES = 8
@@ -222,6 +224,7 @@ class AckPacer:
     repair_busy: bool = False
     repair_streak: int = 0
     cruise_n: int = 0
+    probe_cool_n: int = 0
     _btlbw_hist: list[float] = field(default_factory=list)
 
     def _payload_frac(self) -> float:
@@ -298,7 +301,8 @@ class AckPacer:
             if not app_limited:
                 self._push_btlbw(send_equiv)
         prev = self.offer_bps
-        if self.repair_streak >= BACKOFF_NEED:
+        cooling = self.probe_cool_n > 0
+        if self.repair_streak >= BACKOFF_NEED and not cooling:
             self.mode = "backoff"
             self.startup = False
             self.backoff_events += 1
@@ -307,11 +311,13 @@ class AckPacer:
                 target = self._cruise_target()
             else:
                 target = max(self.min_bps, self.offer_bps * BACKOFF_FRAC)
-            self.offer_bps = self._slew(target, 0.05)
+            self.offer_bps = self._slew(target, CRUISE_SLEW)
+            self.probe_cool_n = BACKOFF_COOLDOWN
         elif self.repair_streak > 0:
             self.held_repair_events += 1
-            target = self.offer_bps
-            self.offer_bps = self._slew(target)
+            self.mode = "hold"
+            # Hold the post-backoff offer; do not cruise toward a falling BtlBw.
+            self.offer_bps = self._slew(self.offer_bps, CRUISE_SLEW)
         elif self.startup:
             self.mode = "startup"
             if sample >= payload_offer * 0.90:
@@ -348,15 +354,21 @@ class AckPacer:
             else:
                 self.weak_n = 0
             self.cruise_n += 1
-            if self.btlbw_bps > 0.0 and self.cruise_n % PROBE_PERIOD < PROBE_SAMPLES:
+            can_probe = (
+                self.btlbw_bps > 0.0
+                and not cooling
+                and self.cruise_n % PROBE_PERIOD < PROBE_SAMPLES
+            )
+            if can_probe:
                 self.mode = "probe"
                 self.probe_events += 1
-                target = min(self.max_bps, max(self.min_bps, self.btlbw_bps * PROBE_GAIN))
-                self.offer_bps = self._slew(target, 0.05)
+                target = min(
+                    self.max_bps, max(self.min_bps, self.btlbw_bps * PROBE_GAIN)
+                )
+                self.offer_bps = self._slew(target, CRUISE_SLEW)
             elif self.btlbw_bps > 0.0:
                 self.mode = "cruise"
-                target = self._cruise_target()
-                self.offer_bps = self._slew(target, 0.05)
+                self.offer_bps = self._slew(self._cruise_target(), CRUISE_SLEW)
             else:
                 self.mode = "cruise"
                 cruise = self._cruise_target()
@@ -364,7 +376,9 @@ class AckPacer:
                     target = self.offer_bps
                 else:
                     target = cruise
-                self.offer_bps = self._slew(target)
+                self.offer_bps = self._slew(target, CRUISE_SLEW)
+        if self.probe_cool_n > 0:
+            self.probe_cool_n -= 1
         if self.offer_bps < prev * 0.995:
             self.cut_events += 1
         self.last_ts = now

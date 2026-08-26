@@ -258,6 +258,28 @@ def test_ack_pacer_backoff_on_sustained_repair():
     assert pacer.offer_bps >= start
 
 
+def test_ack_pacer_backoff_cools_without_flooring():
+    start = 87_500_000
+    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
+    pacer.update(1_000_000, 1.00)
+    for _ in range(12):
+        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
+        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
+    held = pacer.offer_bps
+    for _ in range(40):
+        pacer.update(
+            pacer.last_unique + 2_000_000,
+            pacer.last_ts + 0.15,
+            repair_busy=True,
+        )
+    assert pacer.backoff_events >= 1
+    assert pacer.backoff_events <= 4
+    assert pacer.offer_bps < held
+    assert pacer.offer_bps > start * 1.05
+    pacer.update(pacer.last_unique + 12_000_000, pacer.last_ts + 0.15)
+    assert pacer.mode != "probe"
+
+
 def test_extra_repair_window_busy_on_sliding_fraction():
     win = ExtraRepairWindow()
     for _ in range(32):
