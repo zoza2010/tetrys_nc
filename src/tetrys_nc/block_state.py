@@ -18,6 +18,14 @@ WAN_INITIAL_REPAIR_PCT = 20
 # Path carries ~900 Mbit at ~0.12% loss (iperf); 1 Gbit already drops ~13%.
 WAN_START_MBIT = 700.0
 WAN_PACE_CAP_MBIT = 920.0
+# Delivery-rate cap: max-filter of send-equivalent unique over ~1–2 s.
+BTLBW_WINDOW = 10
+CRUISE_GAIN = 0.97
+PROBE_GAIN = 1.03
+BACKOFF_FRAC = 0.95
+PROBE_PERIOD = 16
+PROBE_SAMPLES = 2
+BACKOFF_NEED = 3
 # ~3 RTprop on the current Russia↔Spain path (~80 ms).
 REPAIR_AGE_S = 0.24
 REPAIR_COOLDOWN_S = 0.06
@@ -152,7 +160,7 @@ def select_repair_candidates(
 
 @dataclass(slots=True)
 class AckPacer:
-    """ACK-clock paced only by short-interval unique receive bytes."""
+    """ACK-clock with a BBR-like max-filter cap from unique delivery."""
 
     min_bps: float
     max_bps: float
@@ -162,17 +170,24 @@ class AckPacer:
     confirmed_bps: float = 0.0
     delivery_bps: float = 0.0
     ewma_bps: float = 0.0
+    btlbw_bps: float = 0.0
     last_unique: int = 0
     last_ts: float = 0.0
     last_dt: float = 0.0
     last_sample_bps: float = 0.0
     startup: bool = True
+    mode: str = "startup"
     plateau_n: int = 0
     weak_n: int = 0
     weak_events: int = 0
     cut_events: int = 0
     held_repair_events: int = 0
+    backoff_events: int = 0
+    probe_events: int = 0
     repair_busy: bool = False
+    repair_streak: int = 0
+    cruise_n: int = 0
+    _btlbw_hist: list[float] = field(default_factory=list)
 
     def _payload_frac(self) -> float:
         return max(0.50, min(1.0, 1.0 - max(0.0, self.fec_frac)))
@@ -180,10 +195,32 @@ class AckPacer:
     def _send_equiv(self, unique_bps: float) -> float:
         return unique_bps / self._payload_frac()
 
-    def _slew(self, target: float) -> float:
-        hi = self.offer_bps * 1.10
-        lo = self.offer_bps * 0.90
+    def _slew(self, target: float, frac: float = 0.10) -> float:
+        hi = self.offer_bps * (1.0 + frac)
+        lo = self.offer_bps * (1.0 - frac)
         return min(self.max_bps, max(self.min_bps, min(hi, max(lo, target))))
+
+    def _push_btlbw(self, send_equiv: float) -> None:
+        hist = self._btlbw_hist
+        hist.append(send_equiv)
+        if len(hist) > BTLBW_WINDOW:
+            del hist[0]
+        self.btlbw_bps = max(hist)
+
+    def _trim_btlbw(self, cap: float) -> None:
+        cap = max(self.min_bps, cap)
+        if not self._btlbw_hist:
+            self.btlbw_bps = cap
+            return
+        self._btlbw_hist = [min(sample, cap) for sample in self._btlbw_hist]
+        self.btlbw_bps = max(self._btlbw_hist)
+
+    def _cruise_target(self) -> float:
+        if self.btlbw_bps <= 0.0:
+            return min(
+                self.max_bps, max(self.min_bps, self._send_equiv(self.ewma_bps) * 1.05)
+            )
+        return min(self.max_bps, max(self.min_bps, self.btlbw_bps * CRUISE_GAIN))
 
     def update(
         self, unique_bytes: int, now: float, repair_busy: bool | None = None
@@ -217,11 +254,31 @@ class AckPacer:
             self.last_unique = unique_bytes
             return self.offer_bps
         payload_offer = self.offer_bps * self._payload_frac()
-        cruise = min(
-            self.max_bps, max(self.min_bps, self._send_equiv(self.ewma_bps) * 1.05)
-        )
+        send_equiv = self._send_equiv(sample)
+        app_limited = sample < payload_offer * 0.75
+        if repair_busy:
+            self.repair_streak += 1
+        else:
+            self.repair_streak = 0
+            if not app_limited:
+                self._push_btlbw(send_equiv)
         prev = self.offer_bps
-        if self.startup:
+        if self.repair_streak >= BACKOFF_NEED:
+            self.mode = "backoff"
+            self.startup = False
+            self.backoff_events += 1
+            if self.btlbw_bps > 0.0:
+                self._trim_btlbw(min(self.btlbw_bps, self.offer_bps * BACKOFF_FRAC))
+                target = self._cruise_target()
+            else:
+                target = max(self.min_bps, self.offer_bps * BACKOFF_FRAC)
+            self.offer_bps = self._slew(target, 0.05)
+        elif self.repair_streak > 0:
+            self.held_repair_events += 1
+            target = self.offer_bps
+            self.offer_bps = self._slew(target)
+        elif self.startup:
+            self.mode = "startup"
             if sample >= payload_offer * 0.90:
                 self.weak_n = 0
                 self.plateau_n = 0
@@ -232,20 +289,22 @@ class AckPacer:
                 target = self.offer_bps
                 if self.plateau_n >= 4:
                     self.startup = False
+                    self.mode = "cruise"
             else:
                 self.weak_n += 1
                 self.plateau_n += 1
                 target = self.offer_bps
                 if self.weak_n >= 3:
                     self.startup = False
-                    if repair_busy:
-                        self.held_repair_events += 1
-                        target = self.offer_bps
-                    else:
-                        target = cruise
+                    self.mode = "cruise"
+                    target = self._cruise_target()
             self.offer_bps = max(self._slew(target), self.min_bps)
             if self.offer_bps >= self.max_bps * 0.995:
                 self.startup = False
+                self.mode = "cruise"
+            elif len(self._btlbw_hist) >= 4 and self.plateau_n >= 4:
+                self.startup = False
+                self.mode = "cruise"
         else:
             if sample < payload_offer * 0.85:
                 if self.weak_n == 0:
@@ -253,15 +312,24 @@ class AckPacer:
                 self.weak_n += 1
             else:
                 self.weak_n = 0
-            # Extra-repair makes unique ACK look weak; cutting then locks the floor.
-            if repair_busy and cruise < self.offer_bps:
-                self.held_repair_events += 1
-                target = self.offer_bps
-            elif cruise < self.offer_bps and self.weak_n < 3:
-                target = self.offer_bps
+            self.cruise_n += 1
+            if self.btlbw_bps > 0.0 and self.cruise_n % PROBE_PERIOD < PROBE_SAMPLES:
+                self.mode = "probe"
+                self.probe_events += 1
+                target = min(self.max_bps, max(self.min_bps, self.btlbw_bps * PROBE_GAIN))
+                self.offer_bps = self._slew(target, 0.05)
+            elif self.btlbw_bps > 0.0:
+                self.mode = "cruise"
+                target = self._cruise_target()
+                self.offer_bps = self._slew(target, 0.05)
             else:
-                target = cruise
-            self.offer_bps = self._slew(target)
+                self.mode = "cruise"
+                cruise = self._cruise_target()
+                if cruise < self.offer_bps and self.weak_n < 3:
+                    target = self.offer_bps
+                else:
+                    target = cruise
+                self.offer_bps = self._slew(target)
         if self.offer_bps < prev * 0.995:
             self.cut_events += 1
         self.last_ts = now

@@ -516,7 +516,7 @@ def run_block_server(
                     if tail and tail_started is None:
                         tail_started = now
                     reap_completed(completed, tail=tail)
-                    pacer.repair_busy = bool(
+                    pacer.repair_busy = (not tail) and bool(
                         select_repair_candidates(
                             active,
                             opened,
@@ -579,6 +579,8 @@ def run_block_server(
                             f"open={len(opened)} fec={repair_ctl.current}% "
                             f"close={close_pct:.0f}% "
                             f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
+                            f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} "
+                            f"cc={pacer.mode} "
                             f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
                             f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
                             f"dt={pacer.last_dt:.2f}s "
@@ -645,6 +647,8 @@ def run_block_server(
         f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
         f"weak={pacer.weak_events} cuts={pacer.cut_events} "
         f"held_repair={pacer.held_repair_events} "
+        f"backoff={pacer.backoff_events} probe={pacer.probe_events} "
+        f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} cc={pacer.mode} "
         f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
         f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
         f"dt={pacer.last_dt:.2f}s {pace_txt}",

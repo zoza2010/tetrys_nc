@@ -208,15 +208,14 @@ def test_ack_pacer_holds_through_one_weak_sample():
     pacer.update(1_000_000 + 14_000_000, 1.15)
     pacer.startup = False
     held = pacer.offer_bps
-    # Weak sample: 2 MB / 0.15s ≈ 13 MB/s. One dip must not cut.
+    # Weak unique without repair is app-limited; BtlBw max-filter holds.
     once = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
     assert once >= held * 0.99
     twice = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
     assert twice >= held * 0.99
-    # Three confirmed weak samples may slew down, but not below min.
     for _ in range(5):
         pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
-    assert pacer.min_bps <= pacer.offer_bps < held
+    assert pacer.offer_bps >= held * 0.90
 
 
 def test_ack_pacer_holds_while_repair_busy():
@@ -226,24 +225,72 @@ def test_ack_pacer_holds_while_repair_busy():
     pacer.update(1_000_000 + 14_000_000, 1.15)
     pacer.startup = False
     held = pacer.offer_bps
-    for _ in range(8):
+    for _ in range(2):
         got = pacer.update(
             pacer.last_unique + 2_000_000,
             pacer.last_ts + 0.15,
             repair_busy=True,
         )
     assert got >= held * 0.99
-    assert pacer.held_repair_events >= 3
-    assert pacer.cut_events == 0
+    assert pacer.held_repair_events >= 1
+    assert pacer.backoff_events == 0
 
 
-def test_ack_pacer_climbs_when_unique_matches_fec_payload():
+def test_ack_pacer_backoff_on_sustained_repair():
+    start = 87_500_000
+    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
+    pacer.update(1_000_000, 1.00)
+    for _ in range(12):
+        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
+        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
+    held = pacer.offer_bps
+    assert held > start
+    assert pacer.btlbw_bps > 0
+    for _ in range(8):
+        pacer.update(
+            pacer.last_unique + 2_000_000,
+            pacer.last_ts + 0.15,
+            repair_busy=True,
+        )
+    assert pacer.backoff_events >= 1
+    assert pacer.offer_bps < held
+    assert pacer.offer_bps >= start
+
+
+def test_ack_pacer_cruises_near_btlbw_not_hard_cap():
+    start = 87_500_000
+    cap = 115_000_000
+    pacer = AckPacer(start, cap, start, fec_frac=0.20)
+    pacer.update(1_000_000, 1.00)
+    for _ in range(24):
+        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
+        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
+    assert pacer.btlbw_bps > 0
+    assert pacer.mode in ("cruise", "probe")
+    # Cruise 0.97×BtlBw; probe may briefly go to 1.03×. Never need the hard cap
+    # unless BtlBw itself is the cap.
+    assert pacer.offer_bps <= max(pacer.btlbw_bps * 1.04, pacer.min_bps)
+
+
+def test_ack_pacer_climbs_when_unique_tracks_offer():
+    start = 87_500_000
+    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
+    pacer.update(1_000_000, 1.00)
+    for _ in range(12):
+        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
+        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
+    assert pacer.offer_bps > start * 1.10
+    assert pacer.btlbw_bps > start
+
+
+def test_ack_pacer_stays_near_start_when_unique_is_start_payload():
     start = 87_500_000  # 700 Mbit send; 20% FEC → ~70 MB/s unique
     pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
     pacer.update(1_000_000, 1.00)
-    for _ in range(8):
+    for _ in range(16):
         pacer.update(pacer.last_unique + 10_500_000, pacer.last_ts + 0.15)
-    assert pacer.offer_bps > start * 1.10
+    assert pacer.offer_bps <= start * 1.08
+    assert pacer.btlbw_bps <= start * 1.05
 
 
 def test_ack_pacer_floor_is_start():
