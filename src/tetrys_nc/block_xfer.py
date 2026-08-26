@@ -58,7 +58,6 @@ _FEEDBACK_S = 0.020
 _TAIL_IDLE_S = 5.0
 _ENCODER_CACHE = 64
 _SEND_CHUNK = 64
-_BURST_S = 0.016
 
 _worker_mm: mmap.mmap | None = None
 _worker_path: str | None = None
@@ -185,7 +184,7 @@ def _pace_limits(rate_mbit: float) -> tuple[float, float, float]:
     start_mbit = _env_float("TETRYS_START_MBIT", WAN_START_MBIT)
     start_bps = min(max_bps, start_mbit * 1_000_000 / 8)
     # Do not let a stretched first ACK sample collapse the blast to tens of Mbit.
-    min_bps = max(1_000_000.0, min(max_bps, start_bps * 0.50))
+    min_bps = max(1_000_000.0, min(max_bps, start_bps * 0.85))
     return min_bps, max_bps, start_bps
 
 
@@ -287,7 +286,7 @@ def run_block_server(
     limiter = RateLimiter(
         max_bps, start_bps=start_bps, min_frac=min_bps / max_bps
     )
-    limiter.set_burst_s(_BURST_S)
+    limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
     encode_pool = _make_encode_pool(workers)
 
     def feedback_loop() -> None:
@@ -329,19 +328,22 @@ def run_block_server(
     repair_ctl = RepairDebtController(
         fec_floor,
         min_pct=fec_floor,
-        max_pct=max(24.0, fec_floor + 4.0),
+        max_pct=max(22.0, fec_floor),
     )
     t0 = time.monotonic()
     last_log = t0
     tail_idle_start: float | None = None
     first_close = 0
     first_close_seen = 0
+    extra_blocks = 0
     last_unique = 0
     source_wire_total = 0
     repair_wire_total = 0
     ready: dict[int, tuple[list[bytes], int]] = {}
     inflight: dict[int, Future] = {}
     last_repair_loop = 0.0
+    tail_started: float | None = None
+    pace_samples: list[float] = []
 
     def send_wires(wires: list[bytes], *, repair: bool) -> None:
         nonlocal source_wire_total, repair_wire_total
@@ -388,7 +390,7 @@ def run_block_server(
         return encoder
 
     def reap_completed(completed: set[int], *, tail: bool) -> None:
-        nonlocal first_close, first_close_seen
+        nonlocal first_close, first_close_seen, extra_blocks
         for block_id in list(active):
             if block_id not in completed:
                 continue
@@ -400,6 +402,8 @@ def run_block_server(
             first_close_seen += 1
             if extra == 0:
                 first_close += 1
+            else:
+                extra_blocks += 1
             enc_cache.pop(block_id, None)
             if block_id in enc_order:
                 enc_order.remove(block_id)
@@ -501,6 +505,8 @@ def run_block_server(
                     completed, opened, unique_rx, decoded = feedback.snapshot()
                     now = time.monotonic()
                     tail = next_block >= total_blocks
+                    if tail and tail_started is None:
+                        tail_started = now
                     reap_completed(completed, tail=tail)
                     submit_ahead()
 
@@ -548,6 +554,7 @@ def run_block_server(
                             if first_close_seen
                             else 0.0
                         )
+                        pace_samples.append(limiter.rate * 8 / 1e6)
                         print(
                             f"v2 progress sent={next_block}/{total_blocks} "
                             f"done={len(completed)} active={len(active)} "
@@ -600,12 +607,23 @@ def run_block_server(
 
     elapsed = max(time.monotonic() - t0, 1e-6)
     close_pct = 100.0 * first_close / first_close_seen if first_close_seen else 0.0
+    tail_s = (time.monotonic() - tail_started) if tail_started else 0.0
+    pace_sorted = sorted(pace_samples)
+    if pace_sorted:
+        pace_p10 = pace_sorted[max(0, int(0.1 * (len(pace_sorted) - 1)))]
+        pace_med = pace_sorted[len(pace_sorted) // 2]
+        pace_max = pace_sorted[-1]
+        pace_txt = f"pace_p10={pace_p10:.0f} med={pace_med:.0f} max={pace_max:.0f}Mbit"
+    else:
+        pace_txt = "pace_p10=n/a"
     print(
         f"v2 done in {elapsed:.2f}s — goodput "
         f"{file_size / elapsed / 1048576:.2f} MiB/s — "
         f"source_wire={source_wire_total / 1048576:.1f}MiB "
         f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
-        f"first_close={close_pct:.0f}% fec={repair_ctl.current}%",
+        f"first_close={close_pct:.0f}% extra_blocks={extra_blocks} "
+        f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
+        f"weak={pacer.weak_events} {pace_txt}",
         flush=True,
     )
     return 0

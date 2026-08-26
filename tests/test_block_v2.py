@@ -188,7 +188,7 @@ def test_ack_pacer_uses_unique_bytes_not_decoded_bytes():
 
 def test_ack_pacer_ignores_empty_and_stretched_samples():
     start = 87_500_000  # 700 Mbit
-    pacer = AckPacer(start * 0.50, 115_000_000, start)
+    pacer = AckPacer(start * 0.85, 115_000_000, start)
     assert pacer.update(0, 1.00) == start
     assert pacer.update(1_000_000, 1.00) == start
     # dt=0.8s would look like ~10 Mbit if treated as BtlBw.
@@ -199,6 +199,25 @@ def test_ack_pacer_ignores_empty_and_stretched_samples():
     assert pacer.startup is True
 
 
+def test_ack_pacer_holds_through_one_weak_sample():
+    start = 87_500_000
+    pacer = AckPacer(start * 0.85, 115_000_000, start)
+    pacer.update(1_000_000, 1.00)
+    # Strong sample: 14 MB / 0.15s ≈ 93 MB/s > start.
+    pacer.update(1_000_000 + 14_000_000, 1.15)
+    pacer.startup = False
+    held = pacer.offer_bps
+    # Weak sample: 2 MB / 0.15s ≈ 13 MB/s. One dip must not cut.
+    once = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
+    assert once >= held * 0.99
+    twice = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
+    assert twice >= held * 0.99
+    # Three confirmed weak samples may slew down, but not below min.
+    for _ in range(5):
+        pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
+    assert pacer.min_bps <= pacer.offer_bps < held
+
+
 def test_repair_debt_controller_ignores_packet_order():
     ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=24.0)
     first = ctl.observe(30, 768)
@@ -207,16 +226,22 @@ def test_repair_debt_controller_ignores_packet_order():
 
 
 def test_repair_debt_controller_holds_floor_and_slews_up():
-    ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=24.0)
+    ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=22.0)
     for _ in range(40):
         ctl.observe(0, 768)
     assert ctl.current == 16
     jumped = ctl.observe(400, 768)
-    assert 16 <= jumped <= 18
-    ctl2 = RepairDebtController(16.0, min_pct=16.0, max_pct=24.0)
+    assert jumped == 16
+    for _ in range(3):
+        ctl.observe(400, 768)
+    assert 16 <= ctl.current <= 18
+    ctl2 = RepairDebtController(16.0, min_pct=16.0, max_pct=22.0)
     for _ in range(80):
         ctl2.observe(400, 768)
-    assert 16 < ctl2.current <= 24
+    assert 16 < ctl2.current <= 22
+    for _ in range(20):
+        ctl2.observe(0, 768)
+    assert ctl2.current <= 18
 
 
 def test_repair_need_is_rank_only():

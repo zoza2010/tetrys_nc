@@ -159,10 +159,18 @@ class AckPacer:
     offer_bps: float
     confirmed_bps: float = 0.0
     delivery_bps: float = 0.0
+    ewma_bps: float = 0.0
     last_unique: int = 0
     last_ts: float = 0.0
     startup: bool = True
     plateau_n: int = 0
+    weak_n: int = 0
+    weak_events: int = 0
+
+    def _slew(self, target: float) -> float:
+        hi = self.offer_bps * 1.10
+        lo = self.offer_bps * 0.90
+        return min(self.max_bps, max(self.min_bps, min(hi, max(lo, target))))
 
     def update(self, unique_bytes: int, now: float) -> float:
         # Unique=0 feedback only arms the clock after the first delivered byte.
@@ -179,31 +187,51 @@ class AckPacer:
             return self.offer_bps
         sample = delta / dt
         self.delivery_bps = sample
-        self.confirmed_bps = max(self.confirmed_bps, sample)
+        if self.ewma_bps <= 0.0:
+            self.ewma_bps = sample
+        else:
+            self.ewma_bps = 0.75 * self.ewma_bps + 0.25 * sample
+        self.confirmed_bps = max(self.confirmed_bps, self.ewma_bps)
         # A blocked send loop stretches dt; do not treat that as low BtlBw.
         if dt > 0.50:
             self.last_ts = now
             self.last_unique = unique_bytes
             return self.offer_bps
+        cruise = min(self.max_bps, max(self.min_bps, self.ewma_bps * 1.05))
         if self.startup:
-            if sample >= self.offer_bps * 0.80:
+            if sample >= self.offer_bps * 0.85:
+                self.weak_n = 0
                 self.plateau_n = 0
-                gain = 1.12 if self.offer_bps >= 100_000_000 else 1.20
-                self.offer_bps = min(
-                    self.max_bps, max(self.offer_bps, sample) * gain
-                )
-            elif sample >= self.offer_bps * 0.55:
+                target = min(self.max_bps, self.offer_bps * 1.06)
+            elif sample >= self.offer_bps * 0.70:
+                self.weak_n = 0
                 self.plateau_n += 1
+                target = self.offer_bps
                 if self.plateau_n >= 4:
                     self.startup = False
-            # Stay at the start offer until the pipe is sampled; never cut it.
-            self.offer_bps = max(self.offer_bps, self.min_bps)
+            else:
+                self.weak_n += 1
+                self.plateau_n += 1
+                target = self.offer_bps
+                if self.weak_n >= 3:
+                    self.startup = False
+                    target = cruise
+            self.offer_bps = max(self._slew(target), self.min_bps)
             if self.offer_bps >= self.max_bps * 0.995:
                 self.startup = False
-        if not self.startup:
-            self.offer_bps = min(
-                self.max_bps, max(self.min_bps, self.confirmed_bps * 1.05)
-            )
+        else:
+            if sample < self.offer_bps * 0.75:
+                if self.weak_n == 0:
+                    self.weak_events += 1
+                self.weak_n += 1
+            else:
+                self.weak_n = 0
+            # One or two weak intervals hold; three confirmed weak allow a cut.
+            if cruise < self.offer_bps and self.weak_n < 3:
+                target = self.offer_bps
+            else:
+                target = cruise
+            self.offer_bps = self._slew(target)
         self.last_ts = now
         self.last_unique = unique_bytes
         return self.offer_bps
@@ -218,12 +246,25 @@ class RepairDebtController:
     down_alpha: float = 0.16
     slew: float = 1.5
     min_pct: float = 12.0
-    max_pct: float = 20.0
+    max_pct: float = 22.0
+    debt_need: int = 4
+    clean_need: int = 8
+    debt_n: int = 0
+    clean_n: int = 0
 
     def observe(self, extra_symbols: int, block_k: int) -> int:
-        # Hold the configured floor. Clean first-close blocks must not pull
-        # primary FEC down (that made 16/18/20% A/B collapse to 12%).
+        # Hold the configured floor. One dirty block or a tail storm must not
+        # yank primary FEC; only a short streak of extra-repair completions.
         if extra_symbols <= 0:
+            self.debt_n = 0
+            self.clean_n += 1
+            if self.clean_n >= self.clean_need and self.pct > self.min_pct:
+                nxt = (1.0 - self.down_alpha) * self.pct + self.down_alpha * self.min_pct
+                self.pct = max(self.min_pct, min(self.pct, nxt))
+            return self.current
+        self.clean_n = 0
+        self.debt_n += 1
+        if self.debt_n < self.debt_need:
             return self.current
         debt_pct = 100.0 * max(0, extra_symbols) / max(1, block_k)
         target = min(
