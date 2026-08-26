@@ -6,6 +6,7 @@ import ctypes
 import os
 import socket
 import struct
+import sys
 import time
 from typing import Sequence
 
@@ -19,7 +20,9 @@ _UDP_SEGMENT = 103
 # TETRYS_GSO=0 disables GSO: under memory pressure (e.g. VMware balloon) the
 # kernel's high-order contiguous allocation for a 22KB super-packet can take
 # ~600us in reclaim/compaction while plain 1350B skbs stay fast.
-_GSO_MAX_SEGMENTS = int(os.environ.get("TETRYS_GSO", "16") or "0")
+# macOS/BSD accept sendmsg+UDP_SEGMENT without splitting, so default off there.
+_DEFAULT_GSO = "32" if sys.platform.startswith("linux") else "0"
+_GSO_MAX_SEGMENTS = int(os.environ.get("TETRYS_GSO", _DEFAULT_GSO) or "0")
 _UDP_MAX_PAYLOAD = 65535
 _gso_by_fd: dict[int, bool] = {}
 
@@ -199,15 +202,22 @@ def send_datagrams(
             pos = 0
             while pos < len(msgs):
                 try:
+                    t0 = time.monotonic()
                     nsent = sendmmsg(msgs[pos:])
+                    send_stats["syscall_s"] += time.monotonic() - t0
+                    send_stats["calls"] += 1
                     if nsent <= 0:
                         break
                     pos += nsent
                     sent += nsent
                 except BlockingIOError:
+                    send_stats["calls"] += 1
+                    send_stats["blocks"] += 1
                     import select
 
+                    t1 = time.monotonic()
                     select.select([], [sock], [], 0.0005)
+                    send_stats["block_s"] += time.monotonic() - t1
                 except OSError:
                     # Fall back per-datagram for this chunk
                     for buf in batch[pos:]:

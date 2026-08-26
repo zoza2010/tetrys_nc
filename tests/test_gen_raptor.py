@@ -11,6 +11,10 @@ raptorq = pytest.importorskip("raptorq")
 from tetrys_nc.gen_raptor import GenDecoder, GenEncoder, GenReceiveSlot, blast_repair_budget, repair_count
 from tetrys_nc.gen_xfer import fountain_targets
 from tetrys_nc.packets import (
+    FLAG_FB_LOSS,
+    FLAG_GEN_BLAST_SEQ,
+    GEN_BLAST_HDR_SIZE,
+    GEN_HDR_SIZE,
     XFER_GEN,
     GenFeedbackPacket,
     GenPacket,
@@ -18,6 +22,7 @@ from tetrys_nc.packets import (
     merge_feedback_nacks,
     miss_bitmap_to_nacks,
     parse_packet,
+    stamp_gen_wire,
 )
 
 
@@ -156,7 +161,20 @@ def test_gen_packet_wire():
     gp = GenPacket(7, 3, b"\x01" * 100, send_ts_us=99)
     got = GenPacket.unpack(gp.pack())
     assert got.gen_id == 7 and got.esi == 3 and got.payload == gp.payload
+    assert got.blast_seq is None
     assert isinstance(parse_packet(gp.pack()), GenPacket)
+    raw = gp.pack()
+    assert len(raw) == GEN_HDR_SIZE + 100
+    stamped = stamp_gen_wire(raw, send_ts_us=50, blast_seq=42)
+    assert stamped[3] & FLAG_GEN_BLAST_SEQ
+    assert len(stamped) == GEN_BLAST_HDR_SIZE + 100
+    blast = GenPacket.unpack(bytes(stamped))
+    assert blast.blast_seq == 42
+    assert blast.send_ts_us == 50
+    assert blast.payload == gp.payload
+    repair = stamp_gen_wire(raw, send_ts_us=7, blast_seq=None)
+    assert repair[3] & FLAG_GEN_BLAST_SEQ == 0
+    assert GenPacket.unpack(bytes(repair)).blast_seq is None
 
 
 def test_gen_feedback_wire():
@@ -232,6 +250,40 @@ def test_gen_feedback_drain_epoch_wire():
     assert got_legacy.drain_epoch == 0
     assert got_legacy.never_seen is None
     assert got_legacy.echo_ts_us == 1
+    assert got_legacy.loss_epoch == 0
+    assert got_legacy.loss_lost == 0
+
+
+def test_gen_feedback_loss_wire():
+    fb = GenFeedbackPacket(
+        4,
+        [4],
+        echo_ts_us=11,
+        completed_gens=3,
+        nack_rx_counts=[8],
+        drain_epoch=2,
+        never_seen=20,
+        loss_epoch=1,
+        loss_seq_begin=10,
+        loss_seq_end=300,
+        loss_rx_unique=250,
+        loss_lost=40,
+        loss_late=3,
+        loss_pending=7,
+    )
+    packed = fb.pack()
+    assert packed[3] & FLAG_FB_LOSS
+    got = GenFeedbackPacket.unpack(packed)
+    assert got.loss_epoch == 1
+    assert got.loss_seq_begin == 10
+    assert got.loss_seq_end == 300
+    assert got.loss_rx_unique == 250
+    assert got.loss_lost == 40
+    assert got.loss_late == 3
+    assert got.loss_pending == 7
+    assert got.echo_ts_us == 11
+    assert got.drain_epoch == 2
+    assert got.never_seen == 20
 
 
 def test_decoder_missing_source_esi():

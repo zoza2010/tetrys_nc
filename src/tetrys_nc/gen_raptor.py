@@ -195,6 +195,16 @@ class GenReceiveSlot:
         self._decoder = None
         self._decoder_ready = False
 
+    @property
+    def decode_failed(self) -> bool:
+        """Enough unique ESI to decode, but the slot is still open."""
+        if self.symbols_rx < self.gen_k + 2:
+            return False
+        full = _source_full_mask(self.gen_k)
+        if self._source_mask == full and not self._has_repair:
+            return False
+        return True
+
     def missing_source_esi(self, source_k: int, *, limit: int = 24) -> list[int]:
         if source_k <= 0:
             return []

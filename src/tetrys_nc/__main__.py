@@ -9,7 +9,7 @@ def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
             "usage:\n"
-            "  python -m tetrys_nc server --file PATH [--port 9000] [--gen-k 48]\n"
+            "  python -m tetrys_nc server --file PATH [--port 9000] [--wan] [--gen-k 768]\n"
             "  python -m tetrys_nc client --output PATH [--host HOST --port 9000]\n"
             "  python -m tetrys_nc genfile --output PATH [--size 1G]\n"
             "  python -m tetrys_nc netem --listen 127.0.0.1:7495 --forward 127.0.0.1:7494 --profile spain\n"

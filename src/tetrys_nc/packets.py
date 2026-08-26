@@ -17,11 +17,17 @@ PKT_GEN_FB = 0x21  # generation feedback / NACK
 
 # GEN: hdr4 + gen_id4 + esi4 + send_ts4 = 16
 GEN_HDR_SIZE = 16
+# First-pass blast: + blast_seq4 = 20. Repair packets omit the sequence.
+GEN_BLAST_HDR_SIZE = 20
+FLAG_GEN_BLAST_SEQ = 0x01  # GEN carries uint32 first-pass send sequence
 FLAG_META_XFER = 0x08  # META always carries gen params trailer
 FLAG_FB_RX_COUNTS = 0x01  # each NACK carries uint16 unique symbols received
 FLAG_FB_HOL_MISS = 0x02  # trailing uint8 + uint16 source ESIs for next_needed
 FLAG_FB_BITMAP = 0x04  # uint16 len + miss bitmap anchored at next_needed_gen
 FLAG_FB_EPOCH = 0x08  # uint16 drain epoch + uint32 first never-seen gen
+FLAG_FB_LOSS = 0x10  # matured first-pass loss window (seq + counts)
+_LOSS_FB = struct.Struct("!HIIIIHH")
+_LOSS_FB_SIZE = _LOSS_FB.size
 # Max miss bitmap bytes (1088 bits; covers K=48 inflight window + slack).
 FEEDBACK_BITMAP_MAX_BYTES = 136
 # never_seen wire value when the client omits a never-seen frontier.
@@ -47,25 +53,68 @@ class GenPacket:
     esi: int  # informational; rq blob is self-describing
     payload: bytes  # serialized raptorq EncodingPacket
     send_ts_us: int = 0
+    # First-pass send sequence. None = repair / not a loss sample.
+    blast_seq: int | None = None
 
     def pack(self) -> bytes:
-        return (
-            _HDR.pack(MAGIC, VERSION, PKT_GEN, 0)
+        flags = FLAG_GEN_BLAST_SEQ if self.blast_seq is not None else 0
+        body = (
+            _HDR.pack(MAGIC, VERSION, PKT_GEN, flags)
             + struct.pack(
                 "!III",
                 self.gen_id & 0xFFFFFFFF,
                 self.esi & 0xFFFFFFFF,
                 self.send_ts_us & 0xFFFFFFFF,
             )
-            + self.payload
         )
+        if self.blast_seq is not None:
+            body += struct.pack("!I", int(self.blast_seq) & 0xFFFFFFFF)
+        return body + self.payload
 
     @classmethod
     def unpack(cls, data: bytes) -> GenPacket:
         if len(data) < GEN_HDR_SIZE:
             raise ValueError("gen packet too short")
+        flags = data[3]
         gen_id, esi, ts = struct.unpack_from("!III", data, 4)
-        return cls(gen_id, esi, data[GEN_HDR_SIZE:], ts)
+        if flags & FLAG_GEN_BLAST_SEQ:
+            if len(data) < GEN_BLAST_HDR_SIZE:
+                raise ValueError("gen packet blast seq truncated")
+            seq = struct.unpack_from("!I", data, 16)[0]
+            return cls(gen_id, esi, data[GEN_BLAST_HDR_SIZE:], ts, seq)
+        return cls(gen_id, esi, data[GEN_HDR_SIZE:], ts, None)
+
+
+def stamp_gen_wire(
+    data: bytes | bytearray,
+    *,
+    send_ts_us: int,
+    blast_seq: int | None,
+) -> bytearray:
+    """Stamp send time at the socket. Blast packets also get a first-pass seq."""
+    if len(data) < GEN_HDR_SIZE:
+        return bytearray(data)
+    ts = (int(send_ts_us) & 0xFFFFFFFF).to_bytes(4, "big")
+    if blast_seq is None:
+        out = bytearray(data)
+        out[3] = out[3] & ~FLAG_GEN_BLAST_SEQ
+        out[12:16] = ts
+        return out
+    seq = (int(blast_seq) & 0xFFFFFFFF).to_bytes(4, "big")
+    has_seq = bool(data[3] & FLAG_GEN_BLAST_SEQ) and len(data) >= GEN_BLAST_HDR_SIZE
+    if has_seq:
+        out = bytearray(data)
+        out[3] = out[3] | FLAG_GEN_BLAST_SEQ
+        out[12:16] = ts
+        out[16:20] = seq
+        return out
+    out = bytearray(len(data) + 4)
+    out[0:16] = data[0:16]
+    out[3] = out[3] | FLAG_GEN_BLAST_SEQ
+    out[12:16] = ts
+    out[16:20] = seq
+    out[20:] = data[16:]
+    return out
 
 
 @dataclass(slots=True)
@@ -86,6 +135,14 @@ class GenFeedbackPacket:
     drain_epoch: int = 0
     # First generation the client has never received (max_gid_seen + 1).
     never_seen: int | None = None
+    # Matured first-pass loss window. seq_end is exclusive.
+    loss_epoch: int = 0
+    loss_seq_begin: int = 0
+    loss_seq_end: int = 0
+    loss_rx_unique: int = 0
+    loss_lost: int = 0
+    loss_late: int = 0
+    loss_pending: int = 0
 
     def pack(self) -> bytes:
         nacks = self.nack_gens[:64]
@@ -118,12 +175,28 @@ class GenFeedbackPacket:
         if with_epoch:
             ns_wire = FB_NEVER_SEEN_NONE if ns is None else (int(ns) & 0xFFFFFFFF)
             body += struct.pack("!HI", epoch, ns_wire)
+        with_loss = (
+            int(self.loss_epoch) > 0
+            or int(self.loss_seq_end) != int(self.loss_seq_begin)
+            or int(self.loss_rx_unique) > 0
+            or int(self.loss_lost) > 0
+        )
+        if with_loss:
+            body += _LOSS_FB.pack(
+                int(self.loss_epoch) & 0xFFFF,
+                int(self.loss_seq_begin) & 0xFFFFFFFF,
+                int(self.loss_seq_end) & 0xFFFFFFFF,
+                int(self.loss_rx_unique) & 0xFFFFFFFF,
+                int(self.loss_lost) & 0xFFFFFFFF,
+                min(0xFFFF, max(0, int(self.loss_late))),
+                min(0xFFFF, max(0, int(self.loss_pending))),
+            )
         body += struct.pack("!I", self.echo_ts_us & 0xFFFFFFFF)
         flags = (FLAG_FB_RX_COUNTS if with_counts else 0) | (
             FLAG_FB_HOL_MISS if hol else 0
         ) | (FLAG_FB_BITMAP if bitmap else 0) | (
             FLAG_FB_EPOCH if with_epoch else 0
-        )
+        ) | (FLAG_FB_LOSS if with_loss else 0)
         return _HDR.pack(MAGIC, VERSION, PKT_GEN_FB, flags) + body
 
     @classmethod
@@ -138,6 +211,7 @@ class GenFeedbackPacket:
         with_hol = bool(data[3] & FLAG_FB_HOL_MISS)
         with_bitmap = bool(data[3] & FLAG_FB_BITMAP)
         with_epoch = bool(data[3] & FLAG_FB_EPOCH)
+        with_loss = bool(data[3] & FLAG_FB_LOSS)
         item_size = 6 if with_counts else 4
         if len(data) < off + n * item_size:
             raise ValueError("gen feedback NACK list truncated")
@@ -179,6 +253,26 @@ class GenFeedbackPacket:
             off += 6
             if ns_wire != FB_NEVER_SEEN_NONE:
                 never_seen = ns_wire
+        loss_epoch = 0
+        loss_seq_begin = 0
+        loss_seq_end = 0
+        loss_rx_unique = 0
+        loss_lost = 0
+        loss_late = 0
+        loss_pending = 0
+        if with_loss:
+            if len(data) < off + _LOSS_FB_SIZE:
+                raise ValueError("gen feedback loss truncated")
+            (
+                loss_epoch,
+                loss_seq_begin,
+                loss_seq_end,
+                loss_rx_unique,
+                loss_lost,
+                loss_late,
+                loss_pending,
+            ) = _LOSS_FB.unpack_from(data, off)
+            off += _LOSS_FB_SIZE
         echo = struct.unpack_from("!I", data, off)[0] if len(data) >= off + 4 else 0
         return cls(
             next_needed,
@@ -190,6 +284,13 @@ class GenFeedbackPacket:
             bitmap if bitmap else None,
             drain_epoch,
             never_seen,
+            loss_epoch,
+            loss_seq_begin,
+            loss_seq_end,
+            loss_rx_unique,
+            loss_lost,
+            loss_late,
+            loss_pending,
         )
 
 
@@ -301,6 +402,13 @@ class ReadyPacket:
 def parse_packet(data: bytes):
     if len(data) < 4 or data[0] != MAGIC:
         raise ValueError("invalid packet")
+    version = data[1]
+    if version == 2:
+        from .block_packets import parse_v2_packet
+
+        return parse_v2_packet(data)
+    if version != VERSION:
+        raise ValueError(f"unsupported packet version {version}")
     ptype = data[2]
     if ptype == PKT_META:
         return MetaPacket.unpack(data)

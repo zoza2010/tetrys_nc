@@ -1,15 +1,15 @@
-"""Gen RaptorQ UDP file server entrypoint."""
+"""Reorder-insensitive RaptorQ block transfer v2 server."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from .gen_xfer import run_gen_server
+from .block_xfer import run_block_server
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Gen RaptorQ UDP file server")
+    p = argparse.ArgumentParser(description="RaptorQ block transfer v2 UDP server")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--file", type=Path, required=True)
@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--wan",
         action="store_true",
-        help="WAN: symbol size 1350; default rate 900 Mbit/s; delay probe + adaptive FEC",
+        help="WAN: symbol size 1350, 64 MiB active block window",
     )
     p.add_argument(
         "--payload-size",
@@ -31,49 +31,49 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 900; delay_cc probes 220→900 with a 200 Mbit floor",
+        help="safety-ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 2500; BBR sets pace from BtlBw with a 200 Mbit floor",
     )
     p.add_argument(
         "--ramp-s",
         type=float,
-        default=2.0,
-        help="seconds to ease-in pace from 0 to --rate (0=immediate blast)",
+        default=0.0,
+        help="seconds to ease-in pace from 0 to start rate (0=immediate blast)",
     )
     p.add_argument(
         "--gen-k",
         type=int,
         default=None,
-        help="symbols per generation (~K; WAN default 96, LAN default 192)",
+        help="symbols per independent coding block (default 768)",
     )
     p.add_argument(
         "--gen-overhead",
         type=int,
         default=None,
-        help="RaptorQ repair overhead percent in blast (0=fountain-only; WAN default 10)",
+        help="initial RaptorQ repair percent (WAN default 20)",
     )
     args = p.parse_args(argv)
 
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
     rate = args.rate_mbit
     if args.wan and rate <= 0:
-        rate = 900.0
+        rate = 2500.0
     elif rate <= 0:
         rate = 1500.0
     if args.gen_overhead is not None:
         overhead_pct = args.gen_overhead
     elif args.wan:
-        overhead_pct = 10
+        overhead_pct = 20
     else:
         overhead_pct = 0
-    gen_k = args.gen_k if args.gen_k is not None else (96 if args.wan else 192)
+    gen_k = args.gen_k if args.gen_k is not None else 768
 
-    return run_gen_server(
+    return run_block_server(
         args.host,
         args.port,
         args.file,
         symbol_size=symbol,
-        gen_k=gen_k,
-        overhead_pct=overhead_pct,
+        block_k=gen_k,
+        initial_repair_pct=overhead_pct,
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,

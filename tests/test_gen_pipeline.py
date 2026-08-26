@@ -18,9 +18,13 @@ from tetrys_nc.gen_xfer import (
     _FOUNTAIN_EVERY_N,
     _FOUNTAIN_TRACK_MAX,
     _FOUNTAIN_WINDOW,
+    _BBR_STARTUP_GAIN,
     _HOL_REPAIR_COOLDOWN_S,
     _HOL_SHARE_TURN_PKTS,
     _OH_CLEAN_HOLD_S,
+    _OH_CEIL_PCT,
+    _OH_FLOOR_PCT,
+    _OH_START_HOLD_S,
     _REORDER_HOLDOFF_S,
     _REPAIR_COOLDOWN_S,
     _REPAIR_META_KEEP,
@@ -43,9 +47,22 @@ from tetrys_nc.gen_xfer import (
     _encode_gens_worker,
     _encode_gens_worker_stream,
     adaptive_blast_overhead_pct,
+    accumulate_loss_sample,
+    apply_packet_loss_fec,
     blast_fec_miss_frac,
+    blast_fec_open_frac,
+    blast_fec_window_gens,
+    blast_loss_overhead_pct,
+    BlastLossTracker,
+    take_loss_sample,
+    update_blast_loss_ewma,
     adaptive_inflight_mib,
+    bbr_delivery_is_path_sample,
+    bbr_delivery_round,
     bbr_pacing_gain,
+    bbr_startup_advance,
+    bbr_startup_climb_bps,
+    bbr_startup_step,
     bbr_still_startup,
     bdp_bytes,
     build_feedback_miss_bitmap,
@@ -55,7 +72,10 @@ from tetrys_nc.gen_xfer import (
     client_feedback_horizon,
     client_feedback_interval,
     compute_inflight_gen_limit,
+    delay_cc_congestion_pressure,
     delay_cc_may_probe,
+    delay_cc_may_rebase_min_rtt,
+    drain_empty_round_max,
     drain_empty_round_max,
     hol_pause_should_hold,
     hol_share_cap_n,
@@ -78,6 +98,7 @@ from tetrys_nc.gen_xfer import (
     note_close_round,
     note_gen_deficit,
     order_repair_nacks,
+    pipeline_is_stalled,
     pipeline_stressed,
     prune_fountain_gens_set,
     prune_repair_meta,
@@ -575,8 +596,11 @@ def test_repair_pressure_and_yield():
     assert should_yield_blast_to_repair(
         0.5, repair_pending=True, nack_count=20
     )
-    assert should_yield_blast_to_repair(
+    assert not should_yield_blast_to_repair(
         0.0, repair_pending=False, nack_count=0, hol_hole=64
+    )
+    assert not should_yield_blast_to_repair(
+        0.1, repair_pending=False, nack_count=0, hol_hole=4000
     )
     assert hol_hole_gens(2, 497) == 495
     assert hol_hole_gens(80, 80) == 0
@@ -589,6 +613,21 @@ def test_repair_pressure_and_yield():
     assert hol_pause_should_hold(active=False, hol_hole=200, stuck=True)
     assert hol_pause_should_hold(active=True, hol_hole=40, stuck=False)
     assert not hol_pause_should_hold(active=True, hol_hole=31, stuck=False)
+    # Decode-ahead hole with a half-empty window is not a blast pause.
+    assert not hol_pause_should_hold(
+        active=False,
+        hol_hole=900,
+        stuck=True,
+        occupancy=200,
+        inflight_gen_limit=400,
+    )
+    assert hol_pause_should_hold(
+        active=False,
+        hol_hole=900,
+        stuck=True,
+        occupancy=320,
+        inflight_gen_limit=400,
+    )
     # HOL share keeps blast going; repair is a slice of the send turn.
     assert hol_share_cap_n(400) == _HOL_SHARE_TURN_PKTS
     assert hol_share_cap_n(8) == 8
@@ -618,6 +657,7 @@ def test_reorder_holdoff_gates_repair_feedback():
 def test_adaptive_blast_overhead_scales_with_pressure():
     cap = 1000
     # Occupancy / HOL / clean-hold must not move FEC: those are BDP, not loss.
+    # Low miss may cut to the 4% floor; --gen-overhead is not a live floor.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=0,
@@ -625,7 +665,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=10,
         inflight_gen_limit=cap,
         clean_s=0.0,
-    ) == 10
+    ) == 4
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=0,
@@ -634,7 +674,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         clean_s=_OH_CLEAN_HOLD_S,
         floor_pct=8,
-    ) == 10
+    ) == 8
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=0,
@@ -642,7 +682,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=10,
         inflight_gen_limit=cap,
         clean_s=_OH_CLEAN_HOLD_S,
-    ) == 10
+    ) == 4
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=100,
@@ -650,7 +690,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=100,
         inflight_gen_limit=cap,
         max_pct=32,
-    ) == 10
+    ) == 4
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=500,
@@ -658,7 +698,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=2,
         inflight_gen_limit=cap,
         max_pct=32,
-    ) == 10
+    ) == 4
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=80,
@@ -667,8 +707,8 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         max_pct=32,
         miss_frac=0.0,
-    ) == 10
-    # Full window without rank misses stays at base (was wrongly 20%).
+    ) == 4
+    # Full window without rank misses goes to the 4% floor (was 20%, then 10%, then 0).
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=48,
@@ -676,8 +716,8 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         incomplete=48,
         inflight_gen_limit=64,
         max_pct=32,
-    ) == 10
-    # Manual 30% is a floor: adapt must not cut it after a 'clean' window.
+    ) == 4
+    # Manual --gen-overhead is not a floor once miss is measured.
     assert adaptive_blast_overhead_pct(
         base_pct=30,
         frontier_lag=10,
@@ -686,9 +726,8 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         clean_s=_OH_CLEAN_HOLD_S,
         max_pct=32,
-    ) == 30
-    # Rank-deficient aged NACKs raise toward ceil. A short HOL NACK list is
-    # the usual feedback shape, so miss_frac alone is the signal.
+    ) == 4
+    # Rank-deficient window miss raises toward ceil.
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=80,
@@ -697,7 +736,7 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         max_pct=32,
         miss_frac=0.12,
-    ) == 21
+    ) == 18
     assert adaptive_blast_overhead_pct(
         base_pct=10,
         frontier_lag=80,
@@ -724,15 +763,334 @@ def test_adaptive_blast_overhead_scales_with_pressure():
         inflight_gen_limit=cap,
         miss_frac=1.0,
     ) == 0
+    # Unknown path: hold ceil until time/window elapse, then follow miss to 4%.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=0,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+        miss_frac=0.0,
+        start_pct=_OH_CEIL_PCT,
+        elapsed_s=0.2,
+        sent_gens=40,
+        start_hold_s=_OH_START_HOLD_S,
+        start_hold_gens=cap,
+    ) == 32
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=0,
+        nack_count=0,
+        incomplete=10,
+        inflight_gen_limit=cap,
+        miss_frac=0.0,
+        start_pct=_OH_CEIL_PCT,
+        elapsed_s=3.0,
+        sent_gens=2000,
+        start_hold_s=_OH_START_HOLD_S,
+        start_hold_gens=cap,
+    ) == 4
+    # After the hold, a real burst still raises.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=80,
+        nack_count=12,
+        incomplete=80,
+        inflight_gen_limit=cap,
+        miss_frac=0.40,
+        start_pct=_OH_CEIL_PCT,
+        elapsed_s=3.0,
+        sent_gens=2000,
+        start_hold_s=_OH_START_HOLD_S,
+        start_hold_gens=cap,
+        max_pct=32,
+    ) == 32
+    assert _OH_START_HOLD_S == 2.0
+    assert _OH_FLOOR_PCT == 4
 
 
 def test_blast_fec_miss_frac_uses_rank_not_occupancy():
     k = 96
+    need = k + 2
     rx = {0: 40, 1: 50, 2: 90, 3: 98}
-    assert blast_fec_miss_frac(rx, [0, 1, 2, 3], gen_k=k) == 0.75
+    # Shortfall over the NACK list (no window): not a binary 3/4.
+    shortfall = (need - 40) + (need - 50) + (need - 90) + 0
+    assert blast_fec_miss_frac(rx, [0, 1, 2, 3], gen_k=k) == pytest.approx(
+        shortfall / (need * 4)
+    )
     assert blast_fec_miss_frac(rx, [], gen_k=k) == 0.0
     assert blast_fec_miss_frac({}, [7, 8], gen_k=k) == 1.0
     assert blast_fec_miss_frac({7: 98, 8: 99}, [7, 8], gen_k=k) == 0.0
+    # Five never-seen gens in a 540-gen pipe is ~0.9%, not 100%.
+    holes = list(range(5))
+    miss = blast_fec_miss_frac({}, holes, gen_k=92, window_gens=540)
+    assert 0.0 < miss < 0.02
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=64,
+        nack_count=5,
+        incomplete=64,
+        inflight_gen_limit=540,
+        max_pct=32,
+        miss_frac=miss,
+    ) == 4
+    # A burst that empties a quarter of the window still hits the ceiling.
+    burst = blast_fec_miss_frac({}, list(range(140)), gen_k=92, window_gens=540)
+    assert burst >= 0.25
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=140,
+        nack_count=140,
+        incomplete=140,
+        inflight_gen_limit=540,
+        max_pct=32,
+        miss_frac=burst,
+    ) == 32
+    assert blast_fec_window_gens(
+        nack_count=5,
+        incomplete=64,
+        frontier_lag=64,
+        inflight_gen_limit=540,
+        sent_gens=8000,
+    ) == 540
+    assert blast_fec_window_gens(
+        nack_count=3,
+        incomplete=10,
+        frontier_lag=10,
+        inflight_gen_limit=540,
+        sent_gens=12,
+    ) == 12
+    # In-flight BDP is not loss; a stalled window of open gens is.
+    assert blast_fec_open_frac(64, 540) == 0.0
+    assert blast_fec_open_frac(int(540 * 0.30), 540) == 0.0
+    assert blast_fec_open_frac(336, 540) >= 0.25
+    # This WAN log: miss≈0.014 from 64 NACKs, but 336 incomplete → raise.
+    stuck = max(0.014, blast_fec_open_frac(336, 540))
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=6609,
+        nack_count=64,
+        incomplete=336,
+        inflight_gen_limit=540,
+        max_pct=32,
+        miss_frac=stuck,
+    ) == 32
+    # Packet miss just over 2% raises off the floor even if occupancy looks fine.
+    assert adaptive_blast_overhead_pct(
+        base_pct=10,
+        frontier_lag=64,
+        nack_count=20,
+        incomplete=80,
+        inflight_gen_limit=540,
+        max_pct=32,
+        miss_frac=0.026,
+    ) == 18
+
+
+def test_blast_loss_tracker_reorder_is_not_loss():
+    tr = BlastLossTracker(window=256)
+    tr.grace_s = 0.050
+    t = 1.0
+    for seq in (0, 2, 1, 3, 4):
+        tr.on_packet(seq, t)
+        t += 0.001
+    pending = tr.mature(t, right_margin=2)
+    assert tr.lost == 0
+    assert tr.rx_unique == 5
+    assert pending == 0
+
+
+def test_blast_loss_tracker_matures_gap_once_and_late_does_not_rewrite():
+    tr = BlastLossTracker(window=256)
+    tr.grace_s = 0.010
+    t = 1.0
+    tr.on_packet(0, t)
+    for seq in range(80, 100):
+        tr.on_packet(seq, t)
+    assert tr.mature(t + 0.001, right_margin=64) > 0
+    assert tr.lost == 0
+    tr.mature(t + 0.050, right_margin=64)
+    assert tr.lost > 0
+    lost_once = tr.lost
+    tr.mature(t + 0.080, right_margin=64)
+    assert tr.lost == lost_once
+    tr.on_packet(5, t + 0.090)
+    assert tr.late >= 1
+    assert tr.lost == lost_once
+
+
+def test_blast_loss_tracker_ignores_repair_duplicates_and_skip_done():
+    tr = BlastLossTracker(window=256)
+    tr.grace_s = 0.0
+    tr.on_packet(None, 1.0)
+    tr.on_packet(0, 1.0)
+    tr.on_packet(0, 1.0)
+    tr.on_packet(1, 1.0)
+    tr.mature(2.0, right_margin=1)
+    assert tr.rx_unique == 2
+    assert tr.lost == 0
+    # Already-matured duplicate (skip_done / late copy) is late, not extra rx.
+    tr.on_packet(0, 3.0)
+    assert tr.rx_unique == 2
+    assert tr.late >= 1
+
+
+def test_blast_loss_tracker_random_and_burst_netem():
+    tr = BlastLossTracker(window=4096)
+    tr.grace_s = 0.0
+    burst = set(range(10, 40))
+    for seq in range(200):
+        if seq not in burst:
+            tr.on_packet(seq, 1.0)
+    tr.mature(2.0, right_margin=64)
+    assert tr.lost == 30
+    assert tr.rx_unique == 170
+
+
+def test_take_loss_sample_survives_lost_feedback():
+    prev: dict = {}
+    r2 = {
+        "epoch": 1,
+        "seq_begin": 0,
+        "seq_end": 200,
+        "rx": 180,
+        "lost": 20,
+        "late": 1,
+        "pending": 2,
+    }
+    sample = take_loss_sample(prev, r2)
+    assert sample is not None
+    assert sample["n"] == 200
+    assert sample["lost"] == 20
+    assert take_loss_sample(prev, r2) is None
+    r3 = {
+        "epoch": 1,
+        "seq_begin": 0,
+        "seq_end": 300,
+        "rx": 270,
+        "lost": 30,
+        "late": 1,
+        "pending": 0,
+    }
+    delta = take_loss_sample(prev, r3)
+    assert delta is not None
+    assert delta["rx"] == 90
+    assert delta["lost"] == 10
+
+
+def test_blast_loss_ewma_fast_up_slow_down():
+    fast, slow, p = update_blast_loss_ewma(0.05, 0.05, 0.40)
+    assert p >= 0.20
+    up = p
+    fast, slow, p = update_blast_loss_ewma(fast, slow, 0.0)
+    assert p < up
+    assert p > 0.02
+
+
+def test_blast_loss_overhead_uses_p_over_one_minus_p():
+    # 20% loss → 25% required + 3% pad = 28, not 20.
+    assert blast_loss_overhead_pct(0.20, pad_pct=3, sample_n=1000) == 28
+    assert blast_loss_overhead_pct(0.0, pad_pct=3, sample_n=0) == 4
+
+
+def test_apply_packet_loss_fec_rank_boost_not_occupancy():
+    pct, *_rest = apply_packet_loss_fec(
+        cur_pct=4,
+        sample={"n": 512, "p": 0.0, "late": 0, "pending": 0},
+        rank_miss=0.0,
+        elapsed_s=5.0,
+        sent_gens=5000,
+        start_hold_s=2.0,
+        start_hold_gens=10,
+    )
+    assert pct == 4
+    # Confident packet-loss sample of 0: rank miss is HOL lag, not extra FEC.
+    held, *_rest = apply_packet_loss_fec(
+        cur_pct=4,
+        sample={"n": 512, "p": 0.0, "late": 0, "pending": 0},
+        rank_miss=0.40,
+        elapsed_s=5.0,
+        sent_gens=5000,
+        start_hold_s=2.0,
+        start_hold_gens=10,
+    )
+    assert held == 4
+    raised, *_rest = apply_packet_loss_fec(
+        cur_pct=4,
+        sample=None,
+        rank_miss=0.40,
+        elapsed_s=5.0,
+        sent_gens=5000,
+        start_hold_s=2.0,
+        start_hold_gens=10,
+    )
+    assert raised >= 12
+
+
+def test_apply_packet_loss_fec_slew_and_clean_windows():
+    pct = 20
+    p_fast = 0.10
+    p_slow = 0.10
+    clean = 0
+    pct, p_fast, p_slow, _p, _base, _boost, clean = apply_packet_loss_fec(
+        cur_pct=pct,
+        sample={"n": 300, "p": 0.0, "late": 0, "pending": 0},
+        p_fast=p_fast,
+        p_slow=p_slow,
+        clean_windows=clean,
+        elapsed_s=5.0,
+        sent_gens=5000,
+        start_hold_s=0.0,
+        start_hold_gens=0,
+    )
+    # Follow target immediately; do not wait for p<2% "clean" windows.
+    assert pct == 18
+
+
+def test_apply_packet_loss_fec_not_stuck_at_ceil_on_path_loss():
+    """A 6% path must not keep 32% FEC after a burst once EWMA decays."""
+    pct = 32
+    p_fast = 0.40
+    p_slow = 0.20
+    clean = 0
+    for _ in range(16):
+        pct, p_fast, p_slow, _p, _base, _boost, clean = apply_packet_loss_fec(
+            cur_pct=pct,
+            sample={"n": 300, "p": 0.06, "late": 0, "pending": 0},
+            p_fast=p_fast,
+            p_slow=p_slow,
+            clean_windows=clean,
+            elapsed_s=5.0,
+            sent_gens=5000,
+            start_hold_s=0.0,
+            start_hold_gens=0,
+        )
+    assert pct <= 16
+
+
+def test_apply_packet_loss_fec_hold_releases_on_confident_sample():
+    pct, *_rest = apply_packet_loss_fec(
+        cur_pct=32,
+        sample={"n": 512, "p": 0.0, "late": 0, "pending": 0},
+        elapsed_s=0.2,
+        sent_gens=10,
+        start_hold_s=2.0,
+        start_hold_gens=540,
+        start_pct=32,
+    )
+    assert pct < 32
+
+
+def test_apply_packet_loss_fec_burst_raises_immediately():
+    pct, _fast, _slow, _p, _base, _boost, _clean = apply_packet_loss_fec(
+        cur_pct=4,
+        sample={"n": 128, "p": 0.40, "late": 0, "pending": 0},
+        elapsed_s=5.0,
+        sent_gens=5000,
+        start_hold_s=0.0,
+        start_hold_gens=0,
+    )
+    assert 4 < pct <= 16
 
 
 def test_echo_rtt_and_delay_pace():
@@ -893,13 +1251,44 @@ def test_delay_cc_blocks_probe_on_full_pipeline():
     assert delay_cc_may_probe(pause - 1, cap)
     assert not delay_cc_may_probe(pause, cap)
     assert not delay_cc_may_probe(387, cap)
+    # Decode-pipeline occupancy is not a standing queue.
+    assert not delay_cc_congestion_pressure(cap // 5, cap)
+    assert not delay_cc_congestion_pressure(cap // 2, cap)
+    assert delay_cc_congestion_pressure(pause, cap)
+
+
+def test_delay_cc_does_not_rebase_stall_rtt_as_min():
+    # 80→656 ms with a clean frontier is HOL/feedback stall, not RTprop.
+    assert not delay_cc_may_rebase_min_rtt(
+        is_spike=False,
+        pipeline_clean=True,
+        queue_s=0.576,
+        ewma_s=0.656,
+        min_rtt_s=0.080,
+    )
+    assert not delay_cc_may_rebase_min_rtt(
+        is_spike=True,
+        pipeline_clean=True,
+        queue_s=0.040,
+        ewma_s=0.120,
+        min_rtt_s=0.080,
+    )
+    # Small baseline drift on a healthy pipeline may rebase.
+    assert delay_cc_may_rebase_min_rtt(
+        is_spike=False,
+        pipeline_clean=True,
+        queue_s=0.020,
+        ewma_s=0.095,
+        min_rtt_s=0.080,
+    )
 
 
 def test_bbr_gain_and_delivery_rate_pace():
     t0 = 1000.0
     rt = 0.080
     assert bbr_pacing_gain(t0, rt, t0) == pytest.approx(1.25)
-    assert bbr_pacing_gain(t0 + rt + 0.001, rt, t0) == pytest.approx(0.75)
+    # Policer path: no cyclic 0.75 drain after the probe unit.
+    assert bbr_pacing_gain(t0 + rt + 0.001, rt, t0) == pytest.approx(1.00)
     assert bbr_pacing_gain(t0 + 2.5 * rt, rt, t0) == pytest.approx(1.00)
     floor = 25_000_000.0
     cap = 112_500_000.0
@@ -924,11 +1313,243 @@ def test_bbr_gain_and_delivery_rate_pace():
         btlbw_bps=btlbw, max_bps=cap, min_bps=floor, gain=1.00
     )
     assert cruise == pytest.approx(btlbw)
+    # FEC is on the wire limiter, so cruise inflates BtlBw by overhead.
+    cruise_fec = update_delivery_rate_pace_bps(
+        btlbw_bps=btlbw, max_bps=cap, min_bps=floor, gain=1.00, overhead_pct=10
+    )
+    assert cruise_fec == pytest.approx(btlbw * 1.10)
     # STARTUP climbs off the 200 Mbit floor even if first samples were slow.
     climb = update_delivery_rate_pace_bps(
         btlbw_bps=20.0 * 1024 * 1024, max_bps=cap, min_bps=floor, gain=2.00
     )
     assert climb >= floor * 1.90
+    # WAN STARTUP is 1.25×, not TCP's 2×.
+    assert _BBR_STARTUP_GAIN == pytest.approx(1.25)
+    # A high safety ceiling must not become the setpoint.
+    high_cap = 2500.0 * 1_000_000 / 8
+    min_200 = 200.0 * 1_000_000 / 8
+    path = 791.0 * 1_000_000 / 8
+    paced_path = update_delivery_rate_pace_bps(
+        btlbw_bps=path, max_bps=high_cap, min_bps=min_200, gain=1.00
+    )
+    assert paced_path == pytest.approx(path)
+    assert paced_path < high_cap * 0.50
+    start_path = update_delivery_rate_pace_bps(
+        btlbw_bps=path, max_bps=high_cap, min_bps=min_200, gain=2.00
+    )
+    assert start_path == pytest.approx(path * 2.00)
+    assert start_path < high_cap
+    # Send loop caps the BBR pad at the 4% floor; live 32% FEC must not
+    # change pace or BtlBw when delivery is unchanged.
+    pad4 = update_delivery_rate_pace_bps(
+        btlbw_bps=path, max_bps=high_cap, min_bps=min_200, gain=1.00, overhead_pct=4
+    )
+    pad4_again = update_delivery_rate_pace_bps(
+        btlbw_bps=path, max_bps=high_cap, min_bps=min_200, gain=1.00, overhead_pct=4
+    )
+    assert pad4 == pytest.approx(pad4_again)
+    assert pad4 == pytest.approx(path * 1.04)
+
+
+def test_bbr_startup_confirmed_climbs_even_if_delivery_below_offer():
+    offer = 220.0 * 1_000_000 / 8
+    sample = {
+        "valid": True,
+        "reason": "ok",
+        "delivery_bps": offer * 0.40,
+        "startup_bps": offer * 0.50,
+        "ratio": 0.88,
+    }
+    step = bbr_startup_step(
+        offer_bps=offer,
+        confirmed_bps=0.0,
+        prior_delivery_bps=offer * 0.50,
+        sample=sample,
+        max_bps=2500.0 * 1_000_000 / 8,
+        startup_max_bps=1150.0 * 1_000_000 / 8,
+    )
+    assert step["startup"]
+    assert step["reason"] == "confirmed"
+    assert step["offer_bps"] == pytest.approx(offer * 1.25)
+
+
+def test_bbr_startup_climbs_when_sender_cannot_fill_offer():
+    offer = 220.0 * 1_000_000 / 8
+    sample = bbr_delivery_round(
+        delivered_bytes=2_000_000,
+        blast_wire_bytes=2_000_000,
+        dt_s=0.25,
+        offer_bps=offer,
+    )
+    assert sample["reason"] == "sender"
+    step = bbr_startup_step(
+        offer_bps=offer,
+        confirmed_bps=0.0,
+        prior_delivery_bps=0.0,
+        sample=sample,
+        max_bps=2500.0 * 1_000_000 / 8,
+        startup_max_bps=1150.0 * 1_000_000 / 8,
+    )
+    assert step["startup"]
+    assert step["reason"] == "sender"
+    assert step["offer_bps"] == pytest.approx(offer * 1.25)
+
+
+def test_bbr_startup_does_not_climb_without_delivery():
+    sample = bbr_delivery_round(
+        delivered_bytes=0,
+        blast_wire_bytes=0,
+        dt_s=0.25,
+        offer_bps=27_500_000.0,
+    )
+    step = bbr_startup_step(
+        offer_bps=27_500_000.0,
+        confirmed_bps=0.0,
+        prior_delivery_bps=0.0,
+        sample=sample,
+        max_bps=312_500_000.0,
+        startup_max_bps=143_750_000.0,
+    )
+    assert step["startup"]
+    assert step["phase"] == "warmup"
+    assert step["offer_bps"] == pytest.approx(27_500_000.0)
+
+
+def test_bbr_startup_ack_clocked_ladder_reaches_path_not_safety_ceiling():
+    offer = 220.0 * 1_000_000 / 8
+    confirmed = 0.0
+    prior = 0.0
+    for _ in range(8):
+        dt = 0.25
+        wire = int(offer * dt)
+        sample = bbr_delivery_round(
+            delivered_bytes=wire,
+            blast_wire_bytes=wire,
+            dt_s=dt,
+            offer_bps=offer,
+        )
+        step = bbr_startup_step(
+            offer_bps=offer,
+            confirmed_bps=confirmed,
+            prior_delivery_bps=prior,
+            sample=sample,
+            max_bps=2500.0 * 1_000_000 / 8,
+            startup_max_bps=1150.0 * 1_000_000 / 8,
+        )
+        offer = float(step["offer_bps"])
+        confirmed = float(step["confirmed_bps"])
+        prior = float(step["delivery_bps"])
+    offer_mbit = offer * 8 / 1_000_000
+    assert 900.0 <= offer_mbit <= 1150.0
+    assert offer_mbit < 2500.0
+
+
+def test_bbr_startup_rolls_back_after_two_under_delivery_rounds():
+    offer = 900.0 * 1_000_000 / 8
+    confirmed = 800.0 * 1_000_000 / 8
+    prior = confirmed
+    step = None
+    for _ in range(2):
+        sample = {
+            "valid": True,
+            "reason": "ok",
+            "delivery_bps": offer * 0.50,
+            "ratio": 0.50,
+        }
+        step = bbr_startup_step(
+            offer_bps=offer,
+            confirmed_bps=confirmed,
+            prior_delivery_bps=prior,
+            sample=sample,
+            max_bps=2500.0 * 1_000_000 / 8,
+            startup_max_bps=1150.0 * 1_000_000 / 8,
+            bad_rounds=0 if step is None else int(step["bad_rounds"]),
+            flat_rounds=0 if step is None else int(step["flat_rounds"]),
+        )
+        prior = float(step["delivery_bps"])
+    assert step is not None
+    assert not step["startup"]
+    assert step["phase"] == "exit"
+    assert step["reason"] == "under"
+    assert step["offer_bps"] == pytest.approx(confirmed)
+
+
+def test_pipeline_is_stalled_uses_occupancy_not_lag():
+    cap = 400
+    assert not pipeline_is_stalled(occupancy=200, inflight_gen_limit=cap)
+    assert not pipeline_is_stalled(occupancy=299, inflight_gen_limit=cap)
+    assert pipeline_is_stalled(occupancy=300, inflight_gen_limit=cap)
+    assert pipeline_is_stalled(occupancy=400, inflight_gen_limit=cap)
+
+
+def test_bbr_startup_ignores_decode_ahead_as_stall():
+    sample = bbr_delivery_round(
+        delivered_bytes=8 * 1024 * 1024,
+        blast_wire_bytes=8 * 1024 * 1024,
+        dt_s=0.25,
+        offer_bps=27_500_000.0,
+    )
+    step = bbr_startup_step(
+        offer_bps=27_500_000.0,
+        confirmed_bps=27_500_000.0,
+        prior_delivery_bps=27_500_000.0,
+        sample=sample,
+        max_bps=312_500_000.0,
+        startup_max_bps=143_750_000.0,
+        stalled=pipeline_is_stalled(occupancy=80, inflight_gen_limit=400),
+    )
+    assert step["startup"]
+    assert step["reason"] == "confirmed"
+    assert step["offer_bps"] > 27_500_000.0
+
+
+def test_bbr_startup_hol_freezes_round_without_counting_bad():
+    step = bbr_startup_step(
+        offer_bps=100_000_000.0,
+        confirmed_bps=80_000_000.0,
+        prior_delivery_bps=75_000_000.0,
+        sample={"valid": True, "delivery_bps": 1.0, "ratio": 0.01},
+        max_bps=300_000_000.0,
+        startup_max_bps=140_000_000.0,
+        stalled=True,
+        bad_rounds=1,
+        flat_rounds=1,
+    )
+    assert step["startup"]
+    assert step["reason"] == "hol"
+    assert step["bad_rounds"] == 1
+    assert step["flat_rounds"] == 1
+
+
+def test_bbr_delivery_round_caps_decode_burst_to_wire():
+    sample = bbr_delivery_round(
+        delivered_bytes=40 * 1024 * 1024,
+        blast_wire_bytes=20 * 1024 * 1024,
+        dt_s=0.25,
+        offer_bps=80 * 1024 * 1024,
+    )
+    assert sample["valid"]
+    assert sample["reason"] == "capped"
+    assert sample["delivery_bps"] <= sample["app_offer_bps"] * 1.08
+
+
+def test_fixed_loss_windows_ignore_tiny_feedback_deltas():
+    state: dict = {}
+    for _ in range(3):
+        assert (
+            accumulate_loss_sample(
+                state,
+                {"rx": 50, "lost": 0, "n": 50, "p": 0.0, "late": 0, "pending": 0},
+            )
+            is None
+        )
+    window = accumulate_loss_sample(
+        state,
+        {"rx": 106, "lost": 0, "n": 106, "p": 0.0, "late": 0, "pending": 0},
+    )
+    assert window is not None
+    assert window["n"] == 256
+    assert window["p"] == 0.0
 
 
 def test_btlbw_max_filter_forgets_a_bad_start():
@@ -966,8 +1587,9 @@ def test_bbr_startup_needs_sustained_growth():
     assert not bbr_still_startup(
         startup=False, btlbw_bps=80e6, round_btlbw_bps=25e6
     )
-    # Empty pipeline: keep STARTUP even if BtlBw looks flat.
-    assert bbr_still_startup(
+    # Empty pipeline: BtlBw plateau is still a plateau. Occupancy is decode
+    # lag, not proof the path has spare capacity.
+    assert not bbr_still_startup(
         startup=True,
         btlbw_bps=26e6,
         round_btlbw_bps=25e6,
@@ -981,6 +1603,150 @@ def test_bbr_startup_needs_sustained_growth():
         occupancy=40,
         inflight_gen_limit=64,
     )
+    # Growing BtlBw keeps STARTUP even when the client is keeping up.
+    assert bbr_still_startup(
+        startup=True,
+        btlbw_bps=40e6,
+        round_btlbw_bps=25e6,
+        occupancy=10,
+        inflight_gen_limit=64,
+    )
+
+
+def test_bbr_delivery_skips_cold_start():
+    floor = 25_000_000.0
+    pace = 27_500_000.0
+    # Encode/send warmup is not BtlBw.
+    assert not bbr_delivery_is_path_sample(
+        delivery_bps=8.0 * 1024 * 1024,
+        cur_bps=pace,
+        min_bps=floor,
+        elapsed_s=0.5,
+        occupancy=4,
+        inflight_gen_limit=64,
+    )
+    # Still below the CC floor after warmup, empty window: sender-limited.
+    assert not bbr_delivery_is_path_sample(
+        delivery_bps=8.0 * 1024 * 1024,
+        cur_bps=pace,
+        min_bps=floor,
+        elapsed_s=2.5,
+        occupancy=4,
+        inflight_gen_limit=64,
+    )
+    # delivery << pace with an empty window is not a policer.
+    assert not bbr_delivery_is_path_sample(
+        delivery_bps=12.0 * 1024 * 1024,
+        cur_bps=90.0 * 1024 * 1024,
+        min_bps=floor,
+        elapsed_s=2.5,
+        occupancy=4,
+        inflight_gen_limit=64,
+    )
+    # Full window at low delivery is a real slow path.
+    assert bbr_delivery_is_path_sample(
+        delivery_bps=8.0 * 1024 * 1024,
+        cur_bps=pace,
+        min_bps=floor,
+        elapsed_s=2.5,
+        occupancy=50,
+        inflight_gen_limit=64,
+    )
+    # Filling the offered pace after warmup is a path sample.
+    # FEC overhead is not part of this test: 20% can still be ~80 MiB/s.
+    assert bbr_delivery_is_path_sample(
+        delivery_bps=80.0 * 1024 * 1024,
+        cur_bps=90.0 * 1024 * 1024,
+        min_bps=floor,
+        elapsed_s=2.5,
+        occupancy=10,
+        inflight_gen_limit=64,
+    )
+
+
+def test_bbr_startup_ignores_floor_plateau_until_window_fills():
+    floor = 25_000_000.0
+    # Cold start: BtlBw stuck on the 200 Mbit floor, pipeline empty.
+    assert bbr_still_startup(
+        startup=True,
+        btlbw_bps=26e6,
+        round_btlbw_bps=25e6,
+        occupancy=10,
+        inflight_gen_limit=64,
+        min_bps=floor,
+        elapsed_s=3.0,
+        warmup_s=2.0,
+        path_sample=True,
+    )
+    # Real ~200 Mbit path: window is full, plateau may exit.
+    assert not bbr_still_startup(
+        startup=True,
+        btlbw_bps=26e6,
+        round_btlbw_bps=25e6,
+        occupancy=50,
+        inflight_gen_limit=64,
+        min_bps=floor,
+        elapsed_s=3.0,
+        warmup_s=2.0,
+        path_sample=True,
+    )
+    # Warmup: never count a plateau.
+    assert bbr_still_startup(
+        startup=True,
+        btlbw_bps=80e6,
+        round_btlbw_bps=80e6,
+        occupancy=10,
+        inflight_gen_limit=64,
+        min_bps=floor,
+        elapsed_s=0.4,
+        warmup_s=2.0,
+        path_sample=False,
+    )
+    # STARTUP climb is from the current offer, not 1.25× the 200 Mbit floor.
+    climbed = bbr_startup_climb_bps(
+        cur_bps=40.0 * 1024 * 1024,
+        max_bps=312_500_000.0,
+        min_bps=floor,
+        climb=1.25,
+    )
+    assert climbed == pytest.approx(50.0 * 1024 * 1024)
+    pinned = bbr_startup_climb_bps(
+        cur_bps=floor,
+        max_bps=312_500_000.0,
+        min_bps=floor,
+        climb=1.25,
+    )
+    assert pinned == pytest.approx(floor * 1.25)
+
+
+def test_bbr_startup_exits_after_flat_rounds():
+    btlbw = 80e6
+    round_bw = 80e6
+    startup, flat, round_bw = bbr_startup_advance(
+        still_growing=True,
+        btlbw_bps=btlbw,
+        round_btlbw_bps=0.0,
+        flat_rounds=0,
+    )
+    assert startup and flat == 0 and round_bw == pytest.approx(btlbw)
+    for n in range(1, 3):
+        startup, flat, round_bw = bbr_startup_advance(
+            still_growing=False,
+            btlbw_bps=btlbw,
+            round_btlbw_bps=round_bw,
+            flat_rounds=n - 1,
+        )
+        assert startup
+        assert flat == n
+        assert round_bw == pytest.approx(btlbw)
+    startup, flat, round_bw = bbr_startup_advance(
+        still_growing=False,
+        btlbw_bps=btlbw,
+        round_btlbw_bps=round_bw,
+        flat_rounds=2,
+    )
+    assert not startup
+    assert flat == 3
 
 
 def test_client_feedback_interval_is_fast_while_open():
@@ -1465,6 +2231,20 @@ def test_prune_repair_meta_bounds_dicts():
     prune_repair_meta(extra, ts, full, next_needed=400, keep=_REPAIR_META_KEEP)
     assert all(k >= 400 for k in extra)
     assert len(extra) <= _REPAIR_META_KEEP
+    assert 400 in extra
+
+
+def test_prune_repair_meta_keeps_stuck_hol():
+    """A 6k-gen HOL hole must not evict next_needed's repair_extra."""
+    hol = 10154
+    extra = {hol + i: 800 for i in range(5000)}
+    extra[hol] = 753
+    ts: dict[int, float] = {hol + i: 1.0 for i in range(5000)}
+    full: dict[int, float] = {}
+    prune_repair_meta(extra, ts, full, next_needed=hol, keep=_REPAIR_META_KEEP)
+    assert hol in extra
+    assert extra[hol] == 753
+    assert len(extra) <= _REPAIR_META_KEEP + 1
 
 
 def test_sync_repair_in_send_loop_blocks_like_old_pipeline():

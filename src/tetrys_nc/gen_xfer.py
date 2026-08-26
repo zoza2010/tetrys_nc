@@ -1,4 +1,9 @@
-"""Generation + RaptorQ random-access file transfer."""
+"""v1 generation transfer — unused by CLI.
+
+The live server/client path is ``block_xfer`` (protocol v2). This module
+stays for unit tests of shared helpers and historical WAN diagnostics.
+Do not add new transfer logic here.
+"""
 
 from __future__ import annotations
 
@@ -54,6 +59,7 @@ from .packets import (
     merge_feedback_nacks,
     miss_bitmap_to_nacks,
     parse_packet,
+    stamp_gen_wire,
 )
 from .ratectl import RateLimiter
 
@@ -242,24 +248,75 @@ _DELAY_CC_RTT_ALPHA = 0.20
 _DELAY_CC_SPIKE_MULT = 1.75
 _DELAY_CC_SPIKE_MIN_S = 0.040
 _DELAY_CC_SPIKE_CONFIRM = 3
-# FEC eases back to --gen-overhead when aged NACKs stop missing rank.
-# Never drop below base: occupancy "clean" is BDP, not a loss-free path.
+# FEC eases back to 4% when the window miss rate is low — never strip
+# blast repair entirely. Occupancy "clean" is BDP, not a loss-free path.
+# miss is packet shortfall / (K+margin × recent window), not NACK-list share.
 _OH_CLEAN_HOLD_S = 4.0
-_OH_FLOOR_PCT = 0
+_OH_FLOOR_PCT = 4
 _OH_CEIL_PCT = 32
-_OH_MISS_MID = 0.08
+# Leave the 4% floor on a small window miss. 8% was deaf once the floor
+# dropped (64 NACKs / 540 gens ≈ 2–3% even with 200+ open gens).
+_OH_MISS_MID = 0.02
 _OH_MISS_HI = 0.25
+# Incomplete gens inside this fraction of the blast window are in-flight BDP,
+# not loss. Extra occupancy means first-pass FEC is too thin.
+_OH_INFLIGHT_SLACK_FRAC = 0.30
+# Unknown path: blast the first window at ceil, then follow measured miss.
+_OH_START_HOLD_S = 2.0
+# First-pass packet-loss FEC. Rank deficit is only a boost; BBR ignores this.
+_LOSS_WINDOW = 4096
+_LOSS_RIGHT_MARGIN = 64
+_LOSS_GRACE_MIN_S = 0.050
+_LOSS_GRACE_RTT_S = 0.080
+_LOSS_GRACE_RTT_MULT = 3.0
+_LOSS_GRACE_MAX_S = 0.50
+_LOSS_SAMPLE_MIN = 256
+_LOSS_BURST_MIN = 128
+_LOSS_ALPHA_UP = 0.50
+_LOSS_ALPHA_DOWN = 0.15
+_LOSS_ALPHA_SLOW = 0.08
+_LOSS_PAD_PCT = 3
+_LOSS_SLEW_UP = 12
+_LOSS_SLEW_DOWN = 2
+_LOSS_CLEAN_WINDOWS = 3
+_LOSS_BURST_P = 0.15
+_LOSS_DEFICIT_BOOST_MID = 4
+_LOSS_DEFICIT_BOOST_HI = 8
 # BBR-style delivery-rate pacing (ATP PROBE_BW): don't outrun drain.
 _BBR_PROBE_GAIN = 1.25
 _BBR_DRAIN_GAIN = 0.75
 _BBR_CRUISE_GAIN = 1.00
-_BBR_STARTUP_GAIN = 2.00
+# TCP BBR STARTUP is 2×; tetrys HOL cannot survive that on WAN. Climb with
+# the same 1.25× used in PROBE_BW — BtlBw still grows, just without a
+# multi-BDP repair hole.
+_BBR_STARTUP_GAIN = 1.25
 _BBR_CYCLE_UNITS = 8  # 1 probe + 1 drain + 6 cruise, in RTprop
 _BBR_BTLBW_RTPROP = 10.0  # BBR default, but never shorter than _BBR_BTLBW_MIN_S
 _BBR_BTLBW_MIN_S = 3.0  # WAN: one delay bump must not expire a good probe
 _BBR_STARTUP_GROW = 1.25  # still filling the pipe if BtlBw grew this much
 _BBR_STARTUP_FLAT = 3  # exit STARTUP after this many ungrown RTprop rounds
 _BBR_SAMPLE_KEEP = 64
+# Encode/send warmup is not BtlBw. Skip delivery samples until this elapses.
+_BBR_SAMPLE_WARMUP_S = _DELAY_CC_DELIVERY_WARMUP_S
+# delivery << pace with an empty window is sender-limited, not a policer.
+_BBR_COLD_DELIV_FRAC = 0.45
+# A plateau on the 200 Mbit CC floor is still cold start unless the window is full.
+_BBR_STARTUP_FLOOR_MULT = 1.5
+_BBR_STARTUP_MAX_MBIT = 1150.0
+_BBR_STARTUP_ROUND_MIN_S = 0.25
+_BBR_STARTUP_CONFIRM = 0.75
+_BBR_STARTUP_BAD = 0.68
+_BBR_STARTUP_BAD_ROUNDS = 2
+_BBR_STARTUP_HOL_ROUNDS = 2
+_BBR_STARTUP_FLAT_GROW = 1.10
+_BBR_STARTUP_SLOW_MBIT = 800.0
+_BBR_STARTUP_SLOW_GAIN = 1.12
+_BBR_STARTUP_DELIVERY_HEADROOM = 1.35
+_BBR_STARTUP_MIN_BYTES = 1 * 1024 * 1024
+_BBR_DELIVERY_WIRE_SLACK = 1.08
+# Occupancy fraction that is a real decode/repair stall, not generation HOL
+# from random-access RaptorQ (later gens done, next_needed still lagging).
+_BBR_STALL_OCC_FRAC = 0.75
 
 
 def clamp_inflight_mib(mib: float, *, cap_mib: float | None = None) -> float:
@@ -474,8 +531,17 @@ def hol_pause_should_hold(
     stuck: bool,
     pause_gens: int | None = None,
     resume_gens: int | None = None,
+    occupancy: int = 0,
+    inflight_gen_limit: int = 0,
 ) -> bool:
-    """Enter on stuck+hole; stay until the hole falls under the resume floor."""
+    """Enter on stuck+hole; stay until the hole falls under the resume floor.
+
+    Occupancy below 75% of the window is reorder/random-access, not a reason
+    to stop first-pass blast.
+    """
+    cap = max(0, int(inflight_gen_limit))
+    if cap > 0 and int(occupancy) < (cap * 3) // 4:
+        return False
     if active:
         floor = _HOL_RESUME_GENS if resume_gens is None else max(0, int(resume_gens))
         return int(hol_hole) >= floor
@@ -508,9 +574,62 @@ def should_pause_blast(
     return incomplete >= (inflight_gen_limit * 3) // 4
 
 
+def pipeline_is_stalled(
+    *,
+    occupancy: int,
+    inflight_gen_limit: int,
+    occ_frac: float = _BBR_STALL_OCC_FRAC,
+) -> bool:
+    """True when unrecovered gens fill the window.
+
+    ``sent - next_needed`` is decode-ahead from random-access generations, not
+    a full pipeline. STARTUP/BBR must not treat that lag as a stall.
+    """
+    cap = max(1, int(inflight_gen_limit))
+    return int(occupancy) >= max(1, int(cap * max(0.0, float(occ_frac))))
+
+
+def delay_cc_congestion_pressure(
+    occupancy: int, inflight_gen_limit: int
+) -> bool:
+    """True when unrecovered gens fill the window, not decode-ahead BDP.
+
+    Occupancy of 20–60% is a normal WAN decode pipeline. Treating that as a
+    standing queue selected 0.75 drain and cut pace ~40% while the path was
+    still delivering.
+    """
+    cap = max(1, int(inflight_gen_limit))
+    return int(occupancy) >= (cap * 3) // 4
+
+
 def delay_cc_may_probe(occupancy: int, inflight_gen_limit: int) -> bool:
     """Climb only while blast is not paused on occupancy."""
-    return int(occupancy) < (max(1, int(inflight_gen_limit)) * 3) // 4
+    return not delay_cc_congestion_pressure(occupancy, inflight_gen_limit)
+
+
+def delay_cc_may_rebase_min_rtt(
+    *,
+    is_spike: bool,
+    pipeline_clean: bool,
+    queue_s: float,
+    ewma_s: float,
+    min_rtt_s: float,
+    max_mult: float = 2.0,
+    min_queue_s: float = _DELAY_CC_TARGET_QUEUE_MIN_S,
+) -> bool:
+    """Rebase min_rtt for small baseline drift, not a stall echo.
+
+    A 80→656 ms jump with lag=1 is HOL/feedback stall. Treating it as the
+    new RTprop zeros queue_s (rtt=656/0ms) and lets delay-CC slam pace.
+    """
+    if is_spike or not pipeline_clean:
+        return False
+    if float(queue_s) < float(min_queue_s):
+        return False
+    min_r = max(1e-6, float(min_rtt_s))
+    if float(ewma_s) > min_r * max(1.0, float(max_mult)):
+        return False
+    return True
 
 
 def repair_pressure(
@@ -525,27 +644,61 @@ def repair_pressure(
     return min(1.0, incomplete / cap)
 
 
+def blast_fec_window_gens(
+    *,
+    nack_count: int,
+    incomplete: int,
+    frontier_lag: int,
+    inflight_gen_limit: int,
+    sent_gens: int,
+) -> int:
+    """Recent gens that could have reported, capped at the blast window.
+
+    Do not use len(nacks): that list is already the failures.
+    """
+    recent = max(int(incomplete), int(frontier_lag), int(sent_gens), 1)
+    cap = max(int(inflight_gen_limit), 1)
+    return max(int(nack_count), min(cap, recent))
+
+
+def blast_fec_open_frac(
+    incomplete: int,
+    inflight_gen_limit: int,
+    *,
+    slack_frac: float = _OH_INFLIGHT_SLACK_FRAC,
+) -> float:
+    """Unrecovered gens past ~1 BDP. Clean in-flight must not look like loss."""
+    cap = max(1, int(inflight_gen_limit))
+    slack = max(0, int(cap * min(1.0, max(0.0, float(slack_frac)))))
+    extra = max(0, int(incomplete) - slack)
+    return min(1.0, extra / cap)
+
+
 def blast_fec_miss_frac(
     nack_rx: dict[int, int],
     nacks: list[int],
     *,
     gen_k: int,
     decode_margin: int = _DECODE_MARGIN,
+    window_gens: int = 0,
 ) -> float:
-    """Share of holdoff-aged NACK gens that never gathered K+margin symbols.
+    """First-pass packet miss over the recent window, not over the NACK list.
 
-    Client NACKs are already past reorder holdoff, so a short symbols_rx is a
-    first-pass miss, not in-flight. Empty nacks → 0 (keep base overhead).
+    Each NACK contributes (K+margin−rx) / (K+margin). Completed gens in the
+    window contribute 0. Empty nacks → 0 (keep base overhead).
     """
     if not nacks:
         return 0.0
     need = max(1, int(gen_k) + int(decode_margin))
-    miss = 0
+    win = max(int(window_gens), len(nacks), 1)
+    shortfall = 0
     for gid in nacks:
         rx = nack_rx.get(int(gid))
-        if rx is None or int(rx) < need:
-            miss += 1
-    return miss / max(1, len(nacks))
+        if rx is None:
+            shortfall += need
+        else:
+            shortfall += max(0, need - max(0, int(rx)))
+    return min(1.0, shortfall / (need * win))
 
 
 def adaptive_blast_overhead_pct(
@@ -560,24 +713,426 @@ def adaptive_blast_overhead_pct(
     max_pct: int | None = None,
     clean_hold_s: float = _OH_CLEAN_HOLD_S,
     miss_frac: float = 0.0,
+    start_pct: int | None = None,
+    elapsed_s: float = 0.0,
+    sent_gens: int = 0,
+    start_hold_s: float = 0.0,
+    start_hold_gens: int = 0,
 ) -> int:
-    """Raise blast FEC when aged NACKs are rank-deficient; never below base.
+    """Start at ceil, then follow window miss down to 4%.
 
-    Occupancy and HOL lag are BDP / reorder, not loss. Using them pinned WAN
-    overhead at 0% (window grew, pressure looked 'clean') or 20% (window
-    full) — both lose to a fixed 30% on a bursty path.
+    Occupancy and HOL lag are BDP / reorder, not loss. miss_frac is packet
+    shortfall over the recent window. --gen-overhead is the CLI default when
+    adapt is off, not a live floor.
     """
     del frontier_lag, incomplete, inflight_gen_limit, clean_s, clean_hold_s
-    del floor_pct, nack_count
+    del nack_count
     if base_pct <= 0:
         return 0
+    lo = max(0, int(floor_pct))
     hi = max(base_pct, max_pct if max_pct is not None else _OH_CEIL_PCT)
+    hi = max(lo, hi)
     miss = min(1.0, max(0.0, float(miss_frac)))
     if miss >= _OH_MISS_HI:
-        return hi
-    if miss >= _OH_MISS_MID:
-        return max(base_pct, (base_pct + hi) // 2)
-    return base_pct
+        measured = hi
+    elif miss >= _OH_MISS_MID:
+        measured = max(lo, (lo + hi) // 2)
+    else:
+        measured = lo
+    holding = (start_hold_s > 0 and elapsed_s < start_hold_s) or (
+        start_hold_gens > 0 and sent_gens < start_hold_gens
+    )
+    if holding:
+        prior = max(base_pct, start_pct if start_pct is not None else hi)
+        return max(measured, prior)
+    return measured
+
+
+def packet_loss_fec_from_env() -> bool:
+    raw = os.environ.get("TETRYS_PACKET_LOSS_FEC", "1")
+    return raw.lower() not in ("0", "false", "no")
+
+
+def seq_ahead(a: int, b: int) -> int:
+    """Unsigned 32-bit distance a−b."""
+    return (int(a) - int(b)) & 0xFFFFFFFF
+
+
+def seq_lt(a: int, b: int) -> bool:
+    """TCP-style sequence comparison."""
+    d = seq_ahead(b, a)
+    return 0 < d < 0x80000000
+
+
+def blast_loss_grace_s(
+    rtt_s: float = 0.0,
+    *,
+    late_frac: float = 0.0,
+    min_s: float = _LOSS_GRACE_MIN_S,
+    rtt_mult: float = _LOSS_GRACE_RTT_MULT,
+    default_rtt_s: float = _LOSS_GRACE_RTT_S,
+    max_s: float = _LOSS_GRACE_MAX_S,
+) -> float:
+    """Reorder grace: 3×RTprop, stretched if late arrivals keep arriving."""
+    rtt = float(rtt_s) if rtt_s > 0.0 else float(default_rtt_s)
+    grace = max(float(min_s), float(rtt_mult) * rtt)
+    if late_frac > 0.02:
+        grace *= 1.25
+    return min(float(max_s), grace)
+
+
+def blast_loss_sample_p(rx_unique: int, lost_matured: int) -> float | None:
+    n = max(0, int(rx_unique)) + max(0, int(lost_matured))
+    if n <= 0:
+        return None
+    return max(0, int(lost_matured)) / n
+
+
+def blast_loss_confidence_margin(sample_n: int) -> float:
+    n = max(0, int(sample_n))
+    if n <= 0:
+        return 1.0
+    return min(1.0, 1.0 / math.sqrt(n))
+
+
+def update_blast_loss_ewma(
+    p_fast: float,
+    p_slow: float,
+    sample: float,
+    *,
+    alpha_up: float = _LOSS_ALPHA_UP,
+    alpha_down: float = _LOSS_ALPHA_DOWN,
+    alpha_slow: float = _LOSS_ALPHA_SLOW,
+) -> tuple[float, float, float]:
+    """Fast-attack / slow-decay loss filter. Working p is max(fast, slow)."""
+    s = min(1.0, max(0.0, float(sample)))
+    fast = min(1.0, max(0.0, float(p_fast)))
+    slow = min(1.0, max(0.0, float(p_slow)))
+    if fast <= 0.0 and slow <= 0.0:
+        fast = slow = s
+    elif s > fast:
+        fast = (1.0 - alpha_up) * fast + alpha_up * s
+    else:
+        fast = (1.0 - alpha_down) * fast + alpha_down * s
+    slow = (1.0 - alpha_slow) * slow + alpha_slow * s
+    return fast, slow, max(fast, slow)
+
+
+def blast_loss_overhead_pct(
+    p: float,
+    *,
+    floor_pct: int = _OH_FLOOR_PCT,
+    max_pct: int = _OH_CEIL_PCT,
+    pad_pct: int = _LOSS_PAD_PCT,
+    sample_n: int = 0,
+) -> int:
+    """Map loss probability to FEC. FEC packets are also lost: p/(1-p)."""
+    lo = max(0, int(floor_pct))
+    hi = max(lo, int(max_pct))
+    prob = min(0.90, max(0.0, float(p)))
+    if int(sample_n) <= 0 and prob <= 0.0:
+        return lo
+    required = 0.0 if prob <= 0.0 else prob / max(1e-9, 1.0 - prob)
+    oh = required + max(0, int(pad_pct)) / 100.0
+    return min(hi, max(lo, int(math.ceil(oh * 100.0 - 1e-9))))
+
+
+def take_loss_sample(
+    prev: dict,
+    report: dict,
+) -> dict | None:
+    """Delta a cumulative matured-loss report. Lost/stale feedback is a no-op."""
+    seq_end = int(report.get("seq_end") or 0) & 0xFFFFFFFF
+    seq_begin = int(report.get("seq_begin") or 0) & 0xFFFFFFFF
+    rx = int(report.get("rx") or 0) & 0xFFFFFFFF
+    lost = int(report.get("lost") or 0) & 0xFFFFFFFF
+    if seq_end == seq_begin and rx == 0 and lost == 0:
+        return None
+    last_end = prev.get("seq_end")
+    if last_end is not None:
+        last_end = int(last_end) & 0xFFFFFFFF
+        if last_end == seq_end:
+            return None
+        if not seq_lt(last_end, seq_end):
+            return None
+        d_rx = (rx - int(prev.get("rx") or 0)) & 0xFFFFFFFF
+        d_lost = (lost - int(prev.get("lost") or 0)) & 0xFFFFFFFF
+    else:
+        d_rx = rx
+        d_lost = lost
+    n = d_rx + d_lost
+    if n <= 0:
+        prev["seq_end"] = seq_end
+        prev["rx"] = rx
+        prev["lost"] = lost
+        return None
+    p = d_lost / n
+    prev["seq_end"] = seq_end
+    prev["seq_begin"] = seq_begin
+    prev["rx"] = rx
+    prev["lost"] = lost
+    prev["late"] = int(report.get("late") or 0)
+    prev["pending"] = int(report.get("pending") or 0)
+    prev["epoch"] = int(report.get("epoch") or 0)
+    return {
+        "rx": d_rx,
+        "lost": d_lost,
+        "n": n,
+        "p": p,
+        "late": int(report.get("late") or 0),
+        "pending": int(report.get("pending") or 0),
+    }
+
+
+def accumulate_loss_sample(
+    state: dict,
+    sample: dict | None,
+    *,
+    window_n: int = _LOSS_SAMPLE_MIN,
+    burst_n: int = _LOSS_BURST_MIN,
+    burst_p: float = _LOSS_BURST_P,
+) -> dict | None:
+    """Emit fixed matured windows; tiny feedback deltas cannot move FEC."""
+    if sample is None:
+        return None
+    state["rx"] = int(state.get("rx") or 0) + max(0, int(sample.get("rx") or 0))
+    state["lost"] = int(state.get("lost") or 0) + max(
+        0, int(sample.get("lost") or 0)
+    )
+    state["late"] = int(sample.get("late") or 0)
+    state["pending"] = int(sample.get("pending") or 0)
+    n = int(state["rx"]) + int(state["lost"])
+    p = int(state["lost"]) / n if n > 0 else 0.0
+    burst = n >= max(1, int(burst_n)) and p >= float(burst_p)
+    if n < max(1, int(window_n)) and not burst:
+        return None
+    out = {
+        "rx": int(state["rx"]),
+        "lost": int(state["lost"]),
+        "n": n,
+        "p": p,
+        "late": int(state["late"]),
+        "pending": int(state["pending"]),
+    }
+    state["rx"] = 0
+    state["lost"] = 0
+    return out
+
+
+def apply_packet_loss_fec(
+    *,
+    cur_pct: int,
+    sample: dict | None,
+    rank_miss: float = 0.0,
+    p_fast: float = 0.0,
+    p_slow: float = 0.0,
+    clean_windows: int = 0,
+    floor_pct: int = _OH_FLOOR_PCT,
+    max_pct: int = _OH_CEIL_PCT,
+    start_pct: int | None = None,
+    elapsed_s: float = 0.0,
+    sent_gens: int = 0,
+    start_hold_s: float = 0.0,
+    start_hold_gens: int = 0,
+) -> tuple[int, float, float, float, int, int, int]:
+    """Return (pct, p_fast, p_slow, p, fec_base, deficit_boost, clean_windows)."""
+    lo = max(0, int(floor_pct))
+    hi = max(lo, int(max_pct))
+    holding = (start_hold_s > 0 and elapsed_s < start_hold_s) or (
+        start_hold_gens > 0 and sent_gens < start_hold_gens
+    )
+    p = max(float(p_fast), float(p_slow))
+    burst_boost = 0
+    n = int(sample["n"]) if sample is not None else 0
+    p_hat = float(sample["p"]) if sample is not None else 0.0
+    if sample is not None and n > 0:
+        margin = blast_loss_confidence_margin(n)
+        p_use = float(p_hat)
+        if p_hat > 0.0:
+            p_use = min(1.0, p_hat + (margin if n < _LOSS_SAMPLE_MIN else 0.25 * margin))
+        # A 128-packet reorder hole is not 40–100% path loss. Cap short
+        # windows so one burst cannot pin EWMA at the 32% FEC ceil.
+        if n < _LOSS_SAMPLE_MIN:
+            p_use = min(p_use, 0.25)
+        burst = n >= _LOSS_BURST_MIN and p_hat >= max(
+            _LOSS_BURST_P, float(p_fast) * 2.0 if p_fast > 0.0 else _LOSS_BURST_P
+        )
+        if n >= _LOSS_SAMPLE_MIN or burst:
+            p_fast, p_slow, p = update_blast_loss_ewma(p_fast, p_slow, p_use)
+        elif n >= _LOSS_BURST_MIN and p_use > p_fast:
+            p_fast, p_slow, p = update_blast_loss_ewma(p_fast, p_slow, p_use)
+        if burst:
+            burst_boost = max(0, hi - lo) // 4
+            clean_windows = 0
+        elif p_hat < 0.02 and n >= _LOSS_SAMPLE_MIN:
+            clean_windows = int(clean_windows) + 1
+        else:
+            clean_windows = 0
+    miss = min(1.0, max(0.0, float(rank_miss)))
+    confident_loss = sample is not None and n >= _LOSS_SAMPLE_MIN
+    if confident_loss:
+        # Rank deficit on a random-access client is HOL lag, not extra loss.
+        deficit_boost = 0
+    elif miss >= _OH_MISS_HI:
+        deficit_boost = _LOSS_DEFICIT_BOOST_HI
+    elif miss >= _OH_MISS_MID:
+        deficit_boost = _LOSS_DEFICIT_BOOST_MID
+    else:
+        deficit_boost = 0
+    fec_base = blast_loss_overhead_pct(
+        p, floor_pct=lo, max_pct=hi, sample_n=n if sample is not None else 0
+    )
+    target = min(hi, fec_base + deficit_boost + burst_boost)
+    cur = min(hi, max(lo, int(cur_pct)))
+    if target > cur:
+        new_pct = min(target, cur + _LOSS_SLEW_UP)
+        clean_windows = 0
+    elif target < cur:
+        # Path loss here is ~6%, so p<2% "clean" windows almost never
+        # happen. Follow target anyway; extra clean windows slew faster.
+        step = _LOSS_SLEW_DOWN
+        if int(clean_windows) >= _LOSS_CLEAN_WINDOWS:
+            step = _LOSS_SLEW_DOWN * 2
+        new_pct = max(target, cur - step)
+    else:
+        new_pct = cur
+    # Start-hold is for an unknown path. A confident sample is the path.
+    if holding and not confident_loss:
+        prior = start_pct if start_pct is not None else hi
+        new_pct = max(new_pct, int(prior))
+    new_pct = min(hi, max(lo, int(new_pct)))
+    return new_pct, p_fast, p_slow, p, fec_base, deficit_boost, int(clean_windows)
+
+
+class BlastLossTracker:
+    """Sliding first-pass sequence bitmap. Gaps start pending, then mature."""
+
+    def __init__(self, window: int = _LOSS_WINDOW) -> None:
+        self.window = max(64, int(window))
+        self.bits = bytearray((self.window + 7) // 8)
+        self.hole_ts = [0.0] * self.window
+        self.base = 0
+        self.started = False
+        self.max_seen = 0
+        self.max_seen_ts = 0.0
+        self.rx_unique = 0
+        self.lost = 0
+        self.late = 0
+        self.epoch = 1
+        self.seq_begin = 0
+        self.grace_s = blast_loss_grace_s()
+
+    def _slot(self, seq: int) -> int:
+        return int(seq) % self.window
+
+    def _get(self, seq: int) -> bool:
+        i = self._slot(seq)
+        return bool(self.bits[i >> 3] & (1 << (i & 7)))
+
+    def _set(self, seq: int) -> None:
+        i = self._slot(seq)
+        self.bits[i >> 3] |= 1 << (i & 7)
+
+    def _clear(self, seq: int) -> None:
+        i = self._slot(seq)
+        self.bits[i >> 3] &= ~(1 << (i & 7))
+        self.hole_ts[i] = 0.0
+
+    def _advance_base(self) -> None:
+        self._clear(self.base)
+        self.base = (self.base + 1) & 0xFFFFFFFF
+
+    def _force_advance(self, new_base: int) -> None:
+        new_base = int(new_base) & 0xFFFFFFFF
+        while seq_lt(self.base, new_base):
+            if self._get(self.base):
+                self.rx_unique += 1
+            else:
+                self.lost += 1
+            self._advance_base()
+
+    def on_packet(self, blast_seq: int | None, now: float) -> None:
+        if blast_seq is None:
+            return
+        seq = int(blast_seq) & 0xFFFFFFFF
+        if not self.started:
+            self.started = True
+            self.base = seq
+            self.seq_begin = seq
+            self.max_seen = seq
+            self.max_seen_ts = float(now)
+            self._set(seq)
+            return
+        if seq_lt(seq, self.base):
+            self.late += 1
+            return
+        dist = seq_ahead(seq, self.base)
+        if dist >= self.window:
+            self._force_advance((seq - self.window + 1) & 0xFFFFFFFF)
+            if seq_lt(seq, self.base):
+                self.late += 1
+                return
+        if self._get(seq):
+            return
+        self._set(seq)
+        if seq_lt(self.max_seen, seq):
+            s = (self.max_seen + 1) & 0xFFFFFFFF
+            while seq_lt(s, seq):
+                if not self._get(s):
+                    i = self._slot(s)
+                    if self.hole_ts[i] <= 0.0:
+                        self.hole_ts[i] = float(now)
+                s = (s + 1) & 0xFFFFFFFF
+            self.max_seen = seq
+            self.max_seen_ts = float(now)
+
+    def mature(self, now: float, *, right_margin: int = _LOSS_RIGHT_MARGIN) -> int:
+        """Declare received/lost up to the reorder frontier. Return pending holes."""
+        if not self.started:
+            return 0
+        margin = max(1, int(right_margin))
+        end = (self.max_seen + 1) & 0xFFFFFFFF
+        while seq_lt(self.base, end):
+            if self._get(self.base):
+                self.rx_unique += 1
+                self._advance_base()
+                continue
+            if seq_ahead(self.max_seen, self.base) < margin:
+                break
+            opened = self.hole_ts[self._slot(self.base)]
+            if opened <= 0.0:
+                opened = self.max_seen_ts
+            if float(now) - opened < self.grace_s:
+                break
+            self.lost += 1
+            self._advance_base()
+        pending = 0
+        s = self.base
+        guard = 0
+        while seq_lt(s, end):
+            if not self._get(s):
+                pending += 1
+            s = (s + 1) & 0xFFFFFFFF
+            guard += 1
+            if guard > self.window:
+                break
+        return pending
+
+    def adapt_grace(self, rtt_s: float = 0.0) -> None:
+        n = self.rx_unique + self.lost
+        late_frac = (self.late / n) if n > 0 else 0.0
+        self.grace_s = blast_loss_grace_s(rtt_s, late_frac=late_frac)
+
+    def report(self, pending: int) -> dict:
+        return {
+            "epoch": self.epoch,
+            "seq_begin": self.seq_begin,
+            "seq_end": self.base,
+            "rx": self.rx_unique,
+            "lost": self.lost,
+            "late": self.late,
+            "pending": max(0, int(pending)),
+        }
 
 
 def echo_rtt_s(echo_ts_us: int, now_s: float) -> float | None:
@@ -634,14 +1189,18 @@ def bbr_pacing_gain(
     cruise: float = _BBR_CRUISE_GAIN,
     units: int = _BBR_CYCLE_UNITS,
 ) -> float:
-    """PROBE_BW-style gain: 1.25 / 0.75 / 6× cruise, one unit = RTprop."""
+    """PROBE_BW-style gain: 1.25× then cruise. One unit = RTprop.
+
+    Cyclic 0.75 drain is for emptying a standing queue after a probe. This
+    WAN is a lossy policer: drain just yields bandwidth and never builds
+    BtlBw. RTT+occupancy still applies ``drain`` via the congested path.
+    """
+    del drain
     rtprop = max(0.020, float(rtprop_s) if rtprop_s > 0.0 else 0.080)
     period = max(1, int(units)) * rtprop
     pos = (max(0.0, now_s - cycle_t0) % period) / rtprop
     if pos < 1.0:
         return probe
-    if pos < 2.0:
-        return drain
     return cruise
 
 
@@ -669,6 +1228,247 @@ def update_btlbw_bps(
     return max(r for _, r in out), out
 
 
+def bbr_delivery_is_path_sample(
+    *,
+    delivery_bps: float,
+    cur_bps: float,
+    min_bps: float,
+    elapsed_s: float,
+    occupancy: int = 0,
+    inflight_gen_limit: int = 0,
+    warmup_s: float = _BBR_SAMPLE_WARMUP_S,
+    cold_frac: float = _BBR_COLD_DELIV_FRAC,
+) -> bool:
+    """True when delivery is a bottleneck sample, not encode/send warmup.
+
+    FEC overhead is not a speed signal: a 20% blast can still run ~80 MiB/s.
+    Occupancy here only distinguishes a full window (real slow path) from an
+    empty sender-limited start. It is not used to stay in STARTUP on a
+    fast client that keeps the decode pipeline empty.
+    """
+    if elapsed_s < max(0.0, float(warmup_s)):
+        return False
+    floor = max(1.0, float(min_bps))
+    cap = max(0, int(inflight_gen_limit))
+    window_full = cap > 0 and int(occupancy) >= (cap * 3) // 4
+    if delivery_bps < floor * 0.90:
+        return window_full
+    if cur_bps > floor * 1.15 and delivery_bps < cur_bps * max(0.05, float(cold_frac)):
+        return window_full
+    return True
+
+
+def bbr_startup_climb_bps(
+    *,
+    cur_bps: float,
+    max_bps: float,
+    min_bps: float,
+    climb: float = _BBR_STARTUP_GAIN,
+) -> float:
+    """STARTUP probe from the current offer, not from a cold 200 Mbit BtlBw."""
+    floor = max(1.0, float(min_bps))
+    return min(float(max_bps), max(float(cur_bps), floor) * max(1.0, float(climb)))
+
+
+def bbr_delivery_round(
+    *,
+    delivered_bytes: int,
+    blast_wire_bytes: int,
+    dt_s: float,
+    offer_bps: float,
+    overhead_pct: int = 0,
+    min_bytes: int = _BBR_STARTUP_MIN_BYTES,
+    wire_slack: float = _BBR_DELIVERY_WIRE_SLACK,
+) -> dict:
+    """Validate an ACK-clocked delivery round against bytes actually blasted."""
+    dt = max(1e-6, float(dt_s))
+    delivered = max(0, int(delivered_bytes))
+    wire = max(0, int(blast_wire_bytes))
+    delivery_bps = delivered / dt
+    wire_bps = wire / dt
+    oh = 1.0 + max(0, int(overhead_pct)) / 100.0
+    app_offer_bps = wire_bps / oh
+    fill = wire_bps / max(1.0, float(offer_bps))
+    ratio = delivery_bps / max(1.0, app_offer_bps)
+    enough = delivered >= max(1, int(min_bytes)) and wire >= max(1, int(min_bytes))
+    valid = enough and wire_bps > 1.0
+    capped_delivery = min(
+        delivery_bps,
+        max(app_offer_bps, float(offer_bps) / oh) * max(1.0, float(wire_slack)),
+    )
+    reason = "ok"
+    if not enough:
+        reason = "small"
+        valid = False
+    elif fill < 0.70:
+        valid = False
+        reason = "sender"
+    elif delivery_bps > app_offer_bps * max(1.0, float(wire_slack)) and wire_bps > 1.0:
+        reason = "capped"
+    return {
+        "valid": valid,
+        "reason": reason,
+        "delivery_bps": capped_delivery,
+        "startup_bps": capped_delivery * oh,
+        "raw_delivery_bps": delivery_bps,
+        "wire_bps": wire_bps,
+        "app_offer_bps": app_offer_bps,
+        "fill": fill,
+        "ratio": ratio,
+    }
+
+
+def bbr_startup_step(
+    *,
+    offer_bps: float,
+    confirmed_bps: float,
+    prior_delivery_bps: float,
+    sample: dict,
+    max_bps: float,
+    startup_max_bps: float,
+    stalled: bool = False,
+    congested: bool = False,
+    bad_rounds: int = 0,
+    flat_rounds: int = 0,
+    hol_rounds: int = 0,
+    confirm_ratio: float = _BBR_STARTUP_CONFIRM,
+    bad_ratio: float = _BBR_STARTUP_BAD,
+) -> dict:
+    """Advance STARTUP once per complete delivery round."""
+    offer = max(1.0, float(offer_bps))
+    confirmed = max(0.0, float(confirmed_bps))
+    prior = max(0.0, float(prior_delivery_bps))
+    if stalled:
+        hol = int(hol_rounds) + 1
+        if hol >= _BBR_STARTUP_HOL_ROUNDS and confirmed > 1.0:
+            return {
+                "startup": False,
+                "offer_bps": confirmed,
+                "confirmed_bps": confirmed,
+                "delivery_bps": prior,
+                "bad_rounds": int(bad_rounds),
+                "flat_rounds": int(flat_rounds),
+                "hol_rounds": hol,
+                "phase": "exit",
+                "reason": "hol",
+            }
+        return {
+            "startup": True,
+            "offer_bps": offer,
+            "confirmed_bps": confirmed,
+            "delivery_bps": prior,
+            "bad_rounds": int(bad_rounds),
+            "flat_rounds": int(flat_rounds),
+            "hol_rounds": hol,
+            "phase": "hold",
+            "reason": "hol",
+        }
+    if not bool(sample.get("valid")):
+        reason = str(sample.get("reason") or "invalid")
+        # fill<0.70 is encode/send/wenc, not a path ceiling. Freezing the
+        # offer at 220 until a full-pipe sample arrives wastes the climb
+        # after the sender recovers.
+        if reason == "sender" and not congested:
+            cap = min(
+                max(1.0, float(max_bps)), max(1.0, float(startup_max_bps))
+            )
+            slow_at = _BBR_STARTUP_SLOW_MBIT * 1_000_000 / 8
+            gain = (
+                _BBR_STARTUP_SLOW_GAIN
+                if offer >= slow_at
+                else _BBR_STARTUP_GAIN
+            )
+            return {
+                "startup": True,
+                "offer_bps": min(cap, offer * gain),
+                "confirmed_bps": confirmed,
+                "delivery_bps": prior,
+                "bad_rounds": int(bad_rounds),
+                "flat_rounds": int(flat_rounds),
+                "hol_rounds": 0,
+                "phase": "warmup",
+                "reason": "sender",
+            }
+        return {
+            "startup": True,
+            "offer_bps": offer,
+            "confirmed_bps": confirmed,
+            "delivery_bps": prior,
+            "bad_rounds": int(bad_rounds),
+            "flat_rounds": int(flat_rounds),
+            "hol_rounds": 0,
+            "phase": "warmup",
+            "reason": reason,
+        }
+    delivery = max(
+        0.0,
+        float(sample.get("startup_bps") or sample.get("delivery_bps") or 0.0),
+    )
+    ratio = max(0.0, float(sample.get("ratio") or 0.0))
+    bad = int(bad_rounds)
+    flat = int(flat_rounds)
+    if congested or ratio < float(bad_ratio):
+        bad += 1
+    else:
+        bad = 0
+    grew = prior <= 1.0 or delivery >= prior * _BBR_STARTUP_FLAT_GROW
+    confirmed_now = ratio >= float(confirm_ratio) and not congested
+    if confirmed_now:
+        confirmed = max(confirmed, offer)
+        grew = True
+    flat = 0 if grew else flat + 1
+    exit_reason = ""
+    if bad >= _BBR_STARTUP_BAD_ROUNDS:
+        exit_reason = "under"
+    elif flat >= _BBR_STARTUP_FLAT:
+        exit_reason = "flat"
+    cap = min(max(1.0, float(max_bps)), max(1.0, float(startup_max_bps)))
+    if offer >= cap * 0.995 and (not grew or confirmed_now):
+        exit_reason = "cap"
+    if exit_reason:
+        cruise = max(confirmed, delivery)
+        return {
+            "startup": False,
+            "offer_bps": min(cap, max(1.0, cruise)),
+            "confirmed_bps": max(confirmed, delivery),
+            "delivery_bps": delivery,
+            "bad_rounds": bad,
+            "flat_rounds": flat,
+            "hol_rounds": 0,
+            "phase": "exit",
+            "reason": exit_reason,
+        }
+    if not confirmed_now:
+        return {
+            "startup": True,
+            "offer_bps": offer,
+            "confirmed_bps": confirmed,
+            "delivery_bps": delivery,
+            "bad_rounds": bad,
+            "flat_rounds": flat,
+            "hol_rounds": 0,
+            "phase": "probe",
+            "reason": "unconfirmed",
+        }
+    slow_at = _BBR_STARTUP_SLOW_MBIT * 1_000_000 / 8
+    gain = _BBR_STARTUP_SLOW_GAIN if offer >= slow_at else _BBR_STARTUP_GAIN
+    next_offer = min(cap, offer * gain)
+    # Headroom only caps an oversized jump, never a confirmed 1.25× step.
+    if delivery > offer:
+        next_offer = min(next_offer, delivery * _BBR_STARTUP_DELIVERY_HEADROOM)
+    return {
+        "startup": True,
+        "offer_bps": max(offer, next_offer),
+        "confirmed_bps": confirmed,
+        "delivery_bps": delivery,
+        "bad_rounds": bad,
+        "flat_rounds": flat,
+        "hol_rounds": 0,
+        "phase": "probe",
+        "reason": "confirmed",
+    }
+
+
 def bbr_still_startup(
     *,
     startup: bool,
@@ -677,20 +1477,51 @@ def bbr_still_startup(
     occupancy: int = 0,
     inflight_gen_limit: int = 0,
     grow: float = _BBR_STARTUP_GROW,
+    min_bps: float = 0.0,
+    elapsed_s: float = 0.0,
+    warmup_s: float = 0.0,
+    path_sample: bool = True,
+    floor_mult: float = _BBR_STARTUP_FLOOR_MULT,
 ) -> bool:
-    """Stay in STARTUP while the pipe is still filling or BtlBw is climbing.
+    """Stay in STARTUP while BtlBw is still climbing.
 
-    A quiet pipeline (client keeping up) is spare capacity, not a plateau:
-    exiting there pins pace to the first app-delivery sample.
+    Occupancy is decode lag, not wire inflight: a client that keeps up looks
+    like an empty pipeline even when the path is already the bottleneck.
+    PROBE_BW (1.25×) is how we keep looking for more after a plateau.
+
+    A plateau on the CC floor with an empty window is warmup, not BtlBw.
+    A full window at that floor is a real slow path and may exit.
     """
     if not startup:
         return False
-    cap = max(1, int(inflight_gen_limit))
-    if int(occupancy) < cap // 2:
+    if elapsed_s < max(0.0, float(warmup_s)):
         return True
+    if not path_sample:
+        return True
+    floor = max(0.0, float(min_bps))
+    if floor > 0.0 and btlbw_bps < floor * max(1.0, float(floor_mult)):
+        cap = max(0, int(inflight_gen_limit))
+        window_full = cap > 0 and int(occupancy) >= (cap * 3) // 4
+        if not window_full:
+            return True
     if round_btlbw_bps <= 1.0:
         return True
     return btlbw_bps >= round_btlbw_bps * max(1.0, float(grow))
+
+
+def bbr_startup_advance(
+    *,
+    still_growing: bool,
+    btlbw_bps: float,
+    round_btlbw_bps: float,
+    flat_rounds: int,
+    flat_need: int = _BBR_STARTUP_FLAT,
+) -> tuple[bool, int, float]:
+    """One RTprop STARTUP check. Return (startup, flat_rounds, round_btlbw)."""
+    if still_growing:
+        return True, 0, float(btlbw_bps)
+    flat = int(flat_rounds) + 1
+    return flat < max(1, int(flat_need)), flat, float(round_btlbw_bps)
 
 
 def update_delivery_rate_pace_bps(
@@ -699,11 +1530,13 @@ def update_delivery_rate_pace_bps(
     max_bps: float,
     min_bps: float,
     gain: float,
+    overhead_pct: int = 0,
 ) -> float:
-    """Pace = BtlBw × gain. Drain slows sending; it must not rewrite BtlBw."""
+    """Pace = BtlBw × gain × (1+FEC). --rate is a safety cap, not the setpoint."""
     floor = max(1.0, min_bps)
     bw = max(float(btlbw_bps), floor)
-    target = bw * max(0.50, float(gain))
+    oh = 1.0 + max(0, int(overhead_pct)) / 100.0
+    target = bw * max(0.50, float(gain)) * oh
     return min(max_bps, max(floor, target))
 
 
@@ -809,9 +1642,12 @@ def should_yield_blast_to_repair(
     nack_count: int,
     hol_hole: int = 0,
 ) -> bool:
-    """Dual-queue: under occupancy or a HOL hole, drain repair before blast."""
-    if hol_hole >= 64:
-        return True
+    """Dual-queue: under occupancy, drain repair before blast.
+
+    A decode-ahead HOL hole without occupancy is reorder/random-access, not a
+    reason to starve first-pass.
+    """
+    del hol_hole
     if pressure >= 0.85:
         return True
     if pressure >= 0.45 and (repair_pending or nack_count > 12):
@@ -1082,13 +1918,22 @@ def prune_repair_meta(
     *,
     keep: int = _REPAIR_META_KEEP,
 ) -> None:
-    """Prevent repair bookkeeping dicts from growing with every touched gen."""
+    """Prevent repair bookkeeping dicts from growing with every touched gen.
+
+    Never evict next_needed: a HOL hole larger than `keep` used to drop the
+    stuck gen's repair_extra, so the worker cache looked 'already full' and
+    drain sent 0 forever.
+    """
+    hol = int(next_needed)
     for meta in (repair_extra, last_repair_ts, last_full_ts):
         for gid in list(meta):
-            if gid < next_needed:
+            if gid < hol:
                 meta.pop(gid, None)
         while len(meta) > keep:
-            meta.pop(min(meta), None)
+            candidates = [g for g in list(meta) if g != hol]
+            if not candidates:
+                break
+            meta.pop(min(candidates), None)
 
 
 def track_fountain_gen(
@@ -2248,10 +3093,22 @@ def _repair_gen_worker(
     enc = _worker_repair_encoder(gid, raw, symbol_size, overhead_pct)
     cap = _REPAIR_ROUND_MAX if round_max is None else max(1, int(round_max))
     want = max(1, min(int(send_n), cap))
-    target_budget = prior_extra + want
+    # prior_extra can lag the cached encoder (prune forgot HOL, or a
+    # fresh parent dict). Always grow past the live budget so drain
+    # cannot get ensure_repair() → [].
+    target_budget = max(int(prior_extra), int(enc.repair_budget)) + want
     new_pkts = enc.ensure_repair(target_budget)
     if not new_pkts:
-        return time.monotonic() - t_enc, 0, []
+        have = enc.packets()
+        if not have:
+            return time.monotonic() - t_enc, 0, []
+        start = int(prior_extra) % len(have)
+        wrapped = [have[(start + i) % len(have)] for i in range(want)]
+        wires = [
+            GenPacket(gid, (start + i) % len(have), blob, ts_us).pack()
+            for i, blob in enumerate(wrapped)
+        ]
+        return time.monotonic() - t_enc, 0, wires
     new_pkts = new_pkts[-want:]
     first_esi = enc.packet_count - len(new_pkts)
     wires = [
@@ -2311,6 +3168,7 @@ def run_gen_server(
         "false",
         "no",
     ) and overhead_pct > 0
+    packet_loss_fec = packet_loss_fec_from_env() and adapt_overhead
     server_synth_nack = os.environ.get("TETRYS_SERVER_SYNTH_NACK", "1").lower() not in (
         "0",
         "false",
@@ -2334,6 +3192,17 @@ def run_gen_server(
     delay_min_mbit = min(rate_mbit, max(1.0, delay_min_mbit))
     if delay_start_mbit < delay_min_mbit:
         delay_start_mbit = delay_min_mbit
+    try:
+        startup_max_mbit = float(
+            os.environ.get(
+                "TETRYS_BBR_STARTUP_MAX_MBIT", str(_BBR_STARTUP_MAX_MBIT)
+            )
+            or str(_BBR_STARTUP_MAX_MBIT)
+        )
+    except ValueError:
+        startup_max_mbit = _BBR_STARTUP_MAX_MBIT
+    startup_max_mbit = min(rate_mbit, max(delay_start_mbit, startup_max_mbit))
+    startup_max_bps = startup_max_mbit * 1_000_000 / 8
     try:
         delay_up_probe = float(
             os.environ.get("TETRYS_DELAY_UP", str(_DELAY_CC_UP_PROBE))
@@ -2407,6 +3276,7 @@ def run_gen_server(
         f"adapt_pace={'on' if adapt_pace else 'off'} "
         f"delay_cc={'on' if delay_cc else 'off'} "
         f"adapt_oh={'on' if adapt_overhead else 'off'} "
+        f"loss_fec={'on' if packet_loss_fec else 'off'} "
         f"synth_nack={'on' if server_synth_nack else 'off'} "
         f"enc_workers={encode_workers} repair_workers={repair_workers} "
         f"enc_read={encode_read_gens}gens stream=1 "
@@ -2473,7 +3343,9 @@ def run_gen_server(
     delay_min_bps = delay_min_mbit * 1_000_000 / 8
     if delay_cc:
         start_bps = min(max_bps, delay_start_mbit * 1_000_000 / 8)
-        pace_min_frac = max(_DELAY_CC_MIN_FRAC, delay_min_bps / max_bps)
+        # Floor is an absolute min (200 Mbit), not 20% of the safety ceiling.
+        # Otherwise --rate 2500 would pin the floor at 500 and block BBR.
+        pace_min_frac = max(delay_min_bps, 1_000_000.0) / max_bps
         # Probe owns the climb — skip the time-based ease-in to --rate.
         effective_ramp_s = 0.0
     elif adapt_pace:
@@ -2504,10 +3376,13 @@ def run_gen_server(
     }
     t_ramp0 = time.monotonic()
     last_meta_ts = t_ramp0
+    send_totals = {"wire": 0, "blast": 0, "repair": 0}
     pace_state = {
         "bps": start_bps if delay_cc or adapt_pace else max_bps,
         "last_completed": -1,
         "last_ts": t_ramp0,
+        "last_blast": 0,
+        "last_wire": 0,
         "good_streak": 0,
         "bad_streak": 0,
         "min_rtt_s": 0.0,
@@ -2526,13 +3401,28 @@ def run_gen_server(
         "bbr_startup": True,
         "startup_check_ts": t_ramp0,
         "startup_flat": 0,
+        "startup_bad": 0,
+        "startup_hol": 0,
+        "startup_phase": "warmup",
+        "startup_reason": "init",
+        "startup_offer": start_bps,
+        "startup_confirmed": 0.0,
+        "startup_delivery": 0.0,
+        "startup_ratio": 0.0,
+        "round_completed": 0,
+        "round_wire": 0,
+        "round_ts": t_ramp0,
+        "sample_reason": "warmup",
+        "confirmed_btlbw": 0.0,
+        "confirmed_cruise": 0.0,
+        "gain": _BBR_STARTUP_GAIN,
         "guard_completed": -1,
         "guard_ts": t_ramp0,
         "floor_since": 0.0,
         "bbr_t0": t_ramp0,
     }
     pace_lock = threading.Lock()
-    send_frontier = {"gen_id": 0}
+    send_frontier = {"gen_id": 0, "blast_seq": 0}
 
     def refresh_inflight(
         occupancy: int,
@@ -2561,9 +3451,9 @@ def run_gen_server(
     if delay_cc:
         print(
             f"delay probe "
-            f"{start_bps * 8 / 1_000_000:.0f}→{rate_mbit:.0f} Mbit "
+            f"{start_bps * 8 / 1_000_000:.0f}→{startup_max_mbit:.0f} Mbit "
             f"min={delay_min_mbit:.0f} "
-            f"(fec base {overhead_pct}%, ceil {_OH_CEIL_PCT}%, "
+            f"(fec start {_OH_CEIL_PCT}%→{_OH_FLOOR_PCT}%, ceil {_OH_CEIL_PCT}%, "
             f"up={delay_up_probe:.2f} clean={delay_clean_n} bbr=on)"
         )
     elif effective_ramp_s > 0:
@@ -2579,7 +3469,28 @@ def run_gen_server(
     last_full_ts: dict[int, float] = {}
     repair_rounds: dict[int, int] = {}
     repair_close_hist = [0, 0, 0, 0, 0]
-    overhead_state = {"pct": overhead_pct, "miss": 0.0}
+    oh_start = (
+        max(overhead_pct, _OH_CEIL_PCT)
+        if adapt_overhead and overhead_pct > 0
+        else overhead_pct
+    )
+    overhead_state = {
+        "pct": oh_start,
+        "miss": 0.0,
+        "p_fast": 0.0,
+        "p_slow": 0.0,
+        "p": 0.0,
+        "fec_base": oh_start,
+        "fec_boost": 0,
+        "clean_windows": 0,
+        "loss_rx": 0,
+        "loss_lost": 0,
+        "loss_late": 0,
+        "loss_pending": 0,
+        "loss_ingest": {},
+        "loss_accum": {},
+        "loss_window_n": 0,
+    }
     stop_fb = threading.Event()
     fb_lock = threading.Lock()
     fb_state = {
@@ -2593,6 +3504,7 @@ def run_gen_server(
         "epoch": 0,
         "echo": 0,
         "done": False,
+        "loss": {},
     }
 
     def feedback_loop() -> None:
@@ -2636,6 +3548,15 @@ def run_gen_server(
                             fb_state["hol_miss_esi"] = list(pkt.hol_miss_esi or [])
                             fb_state["miss_bitmap"] = pkt.miss_bitmap or b""
                             fb_state["never_seen"] = pkt.never_seen
+                        fb_state["loss"] = {
+                            "epoch": int(pkt.loss_epoch or 0),
+                            "seq_begin": int(pkt.loss_seq_begin or 0),
+                            "seq_end": int(pkt.loss_seq_end or 0),
+                            "rx": int(pkt.loss_rx_unique or 0),
+                            "lost": int(pkt.loss_lost or 0),
+                            "late": int(pkt.loss_late or 0),
+                            "pending": int(pkt.loss_pending or 0),
+                        }
                     if delay_cc and (now - t_ramp0) >= _DELAY_CC_WARMUP_S:
                         rtt = echo_rtt_s(pkt.echo_ts_us, now)
                         if rtt is not None:
@@ -2644,7 +3565,13 @@ def run_gen_server(
                             frontier_lag = max(
                                 0, send_frontier["gen_id"] - pkt.next_needed_gen
                             )
-                            stalled = frontier_lag >= (inflight_gen_limit * 9) // 10
+                            occupancy = max(
+                                0, send_frontier["gen_id"] - completed
+                            )
+                            stalled = pipeline_is_stalled(
+                                occupancy=occupancy,
+                                inflight_gen_limit=inflight_gen_limit,
+                            )
                             with pace_lock:
                                 ewma, is_spike, spike_n = smooth_delay_rtt_s(
                                     rtt,
@@ -2665,22 +3592,21 @@ def run_gen_server(
                                 # delay is baseline drift/jitter, not self-queueing.
                                 # Rebase gradually so the controller can recover
                                 # without teaching itself through a real backlog.
-                                pipeline_clean = (
-                                    frontier_lag
-                                    < (inflight_gen_limit * 3) // 20
-                                )
-                                if (
-                                    (not is_spike)
-                                    and pipeline_clean
-                                    and pace_state["queue_s"]
-                                    >= _DELAY_CC_TARGET_QUEUE_MIN_S
+                                pipeline_clean = occupancy < (
+                                    inflight_gen_limit * 3
+                                ) // 20
+                                if delay_cc_may_rebase_min_rtt(
+                                    is_spike=bool(is_spike),
+                                    pipeline_clean=pipeline_clean,
+                                    queue_s=float(pace_state["queue_s"]),
+                                    ewma_s=ewma,
+                                    min_rtt_s=float(pace_state["min_rtt_s"]),
                                 ):
                                     pace_state["min_rtt_s"] = min(
                                         ewma,
                                         pace_state["min_rtt_s"] * 0.85 + ewma * 0.15,
                                     )
-                                    # The frontier proves this rate is sustainable;
-                                    # allow one cautious probe despite RTT jitter.
+                                    # Small jitter, not a stall: keep probing.
                                     pace_state["queue_s"] = 0.0
                                 target_q = max(
                                     _DELAY_CC_TARGET_QUEUE_MIN_S,
@@ -2699,121 +3625,201 @@ def run_gen_server(
                                 else:
                                     pace_state["clean_streak"] = 0
                                     pace_state["congestion_streak"] = 0
-                                occupancy = max(
-                                    0, send_frontier["gen_id"] - completed
-                                )
-                                congestion_pressure = (
-                                    occupancy >= inflight_gen_limit // 5
-                                )
-                                window_full = should_pause_blast(
-                                    occupancy,
-                                    occupancy,
-                                    inflight_gen_limit=inflight_gen_limit,
+                                congestion_pressure = delay_cc_congestion_pressure(
+                                    occupancy, inflight_gen_limit
                                 )
                                 congested = (
                                     congestion_pressure
                                     and pace_state["congestion_streak"]
                                     >= _DELAY_CC_CONGESTION_SAMPLES
                                 )
-                                probe_ready = (
-                                    pace_state["clean_streak"]
-                                    >= delay_clean_n
-                                    and now >= pace_state["hold_until"]
-                                    and delay_cc_may_probe(
-                                        occupancy, inflight_gen_limit
-                                    )
-                                )
-                                used_bbr = False
                                 last_c = int(pace_state["last_completed"])
                                 last_ts = float(pace_state["last_ts"])
                                 floor = max_bps * pace_min_frac
                                 cur_bps = float(pace_state["bps"])
-                                at_floor = cur_bps <= floor * 1.05
-                                if at_floor:
-                                    if float(pace_state["floor_since"]) <= 0.0:
-                                        pace_state["floor_since"] = now
-                                else:
-                                    pace_state["floor_since"] = 0.0
-                                underutilized = (
-                                    occupancy < inflight_gen_limit // 2
-                                    and cur_bps <= floor * 1.25
-                                    and (not congested)
-                                    and now >= pace_state["hold_until"]
-                                )
-                                floor_stuck = (
-                                    at_floor
-                                    and float(pace_state["floor_since"]) > 0.0
-                                    and (now - float(pace_state["floor_since"])) >= 1.0
-                                )
-                                if underutilized or floor_stuck:
-                                    pace_state["bbr_startup"] = True
-                                    pace_state["btlbw_round"] = 0.0
-                                    pace_state["startup_flat"] = 0
-                                    if floor_stuck:
-                                        pace_state["hold_until"] = 0.0
                                 if last_c < 0:
                                     pace_state["last_completed"] = completed
                                     pace_state["last_ts"] = now
+                                    pace_state["last_blast"] = int(
+                                        send_totals["blast"]
+                                    )
+                                    pace_state["last_wire"] = int(
+                                        send_totals["wire"]
+                                    )
                                 elif (
-                                    not stalled
-                                    and completed > last_c
-                                    and (now - last_ts) >= _DELAY_CC_UPDATE_S
+                                    completed > last_c
+                                    and (now - last_ts)
+                                    >= max(
+                                        _BBR_STARTUP_ROUND_MIN_S,
+                                        float(pace_state["min_rtt_s"]),
+                                    )
                                 ):
-                                    delivery_bps = (
-                                        (completed - last_c)
-                                        * block_bytes
-                                        / max(now - last_ts, 1e-6)
+                                    round_dt = max(now - last_ts, 1e-6)
+                                    delivered_bytes = (
+                                        completed - last_c
+                                    ) * block_bytes
+                                    blast_wire_bytes = max(
+                                        0,
+                                        int(send_totals["wire"])
+                                        - int(pace_state["last_wire"]),
                                     )
+                                    sample = bbr_delivery_round(
+                                        delivered_bytes=delivered_bytes,
+                                        blast_wire_bytes=blast_wire_bytes,
+                                        dt_s=round_dt,
+                                        offer_bps=cur_bps,
+                                        overhead_pct=int(overhead_state["pct"]),
+                                    )
+                                    delivery_bps = float(sample["delivery_bps"])
                                     rtprop = float(pace_state["min_rtt_s"])
-                                    btlbw, samples = update_btlbw_bps(
-                                        delivery_bps=delivery_bps,
-                                        samples=list(pace_state["btlbw_samples"]),
-                                        now_s=now,
-                                        rtprop_s=rtprop,
-                                    )
-                                    pace_state["btlbw_samples"] = samples
-                                    pace_state["btlbw"] = btlbw
-                                    pace_state["deliv_ewma"] = delivery_bps
-                                    check_dt = max(0.020, rtprop if rtprop > 0.0 else 0.080)
-                                    if (
-                                        bool(pace_state["bbr_startup"])
-                                        and now - float(pace_state["startup_check_ts"])
-                                        >= check_dt
-                                    ):
-                                        still = bbr_still_startup(
-                                            startup=bool(pace_state["bbr_startup"]),
-                                            btlbw_bps=btlbw,
-                                            round_btlbw_bps=float(
-                                                pace_state["btlbw_round"]
-                                            ),
+                                    elapsed_s = now - t_ramp0
+                                    path_sample = (
+                                        not stalled
+                                        and bool(sample["valid"])
+                                        and bbr_delivery_is_path_sample(
+                                            delivery_bps=delivery_bps,
+                                            cur_bps=cur_bps,
+                                            min_bps=floor,
+                                            elapsed_s=elapsed_s,
                                             occupancy=occupancy,
                                             inflight_gen_limit=inflight_gen_limit,
                                         )
-                                        pipe_full = (
-                                            occupancy >= inflight_gen_limit // 2
+                                    )
+                                    if stalled:
+                                        # HOL/decode lag is not a bandwidth
+                                        # sample. Freeze BtlBw so a repair hole
+                                        # cannot expire the path estimate.
+                                        btlbw = float(pace_state["btlbw"])
+                                        pace_state["deliv_ewma"] = delivery_bps
+                                    else:
+                                        # Warmup / send-limited delivery is
+                                        # not BtlBw. Age the window only.
+                                        btlbw, samples = update_btlbw_bps(
+                                            delivery_bps=(
+                                                delivery_bps if path_sample else 0.0
+                                            ),
+                                            samples=list(pace_state["btlbw_samples"]),
+                                            now_s=now,
+                                            rtprop_s=rtprop,
                                         )
-                                        near_cap = btlbw >= max_bps * 0.85
-                                        # Occupancy on an 8 MiB window is not
-                                        # proof of BtlBw. Leave STARTUP only
-                                        # when delay agrees or we hit --rate.
-                                        if still or not (
-                                            pipe_full and (congested or near_cap)
-                                        ):
-                                            pace_state["btlbw_round"] = btlbw
-                                            pace_state["bbr_startup"] = True
-                                            pace_state["startup_flat"] = 0
-                                        else:
-                                            flat = int(pace_state["startup_flat"]) + 1
-                                            pace_state["startup_flat"] = flat
-                                            pace_state["bbr_startup"] = (
-                                                flat < _BBR_STARTUP_FLAT
+                                        pace_state["btlbw_samples"] = samples
+                                        pace_state["deliv_ewma"] = delivery_bps
+                                        if path_sample:
+                                            confirmed_bw = float(
+                                                pace_state["confirmed_btlbw"]
                                             )
-                                        pace_state["startup_check_ts"] = now
+                                            if (
+                                                confirmed_bw <= 1.0
+                                                or delivery_bps
+                                                >= confirmed_bw * 1.05
+                                            ):
+                                                confirmed_bw = max(
+                                                    confirmed_bw, delivery_bps
+                                                )
+                                                pace_state[
+                                                    "confirmed_btlbw"
+                                                ] = confirmed_bw
+                                            btlbw = max(btlbw, confirmed_bw)
+                                        pace_state["btlbw"] = btlbw
                                     startup = bool(pace_state["bbr_startup"])
+                                    if startup:
+                                        step = bbr_startup_step(
+                                            offer_bps=float(
+                                                pace_state["startup_offer"]
+                                            ),
+                                            confirmed_bps=float(
+                                                pace_state["startup_confirmed"]
+                                            ),
+                                            prior_delivery_bps=float(
+                                                pace_state["startup_delivery"]
+                                            ),
+                                            sample=sample,
+                                            max_bps=max_bps,
+                                            startup_max_bps=startup_max_bps,
+                                            stalled=stalled,
+                                            congested=congested,
+                                            bad_rounds=int(
+                                                pace_state["startup_bad"]
+                                            ),
+                                            flat_rounds=int(
+                                                pace_state["startup_flat"]
+                                            ),
+                                            hol_rounds=int(
+                                                pace_state["startup_hol"]
+                                            ),
+                                        )
+                                        pace_state["bbr_startup"] = bool(
+                                            step["startup"]
+                                        )
+                                        pace_state["startup_offer"] = float(
+                                            step["offer_bps"]
+                                        )
+                                        pace_state["startup_confirmed"] = float(
+                                            step["confirmed_bps"]
+                                        )
+                                        pace_state["startup_delivery"] = float(
+                                            step["delivery_bps"]
+                                        )
+                                        pace_state["startup_bad"] = int(
+                                            step["bad_rounds"]
+                                        )
+                                        pace_state["startup_flat"] = int(
+                                            step["flat_rounds"]
+                                        )
+                                        pace_state["startup_hol"] = int(
+                                            step["hol_rounds"]
+                                        )
+                                        pace_state["startup_phase"] = str(
+                                            step["phase"]
+                                        )
+                                        pace_state["startup_reason"] = str(
+                                            step["reason"]
+                                        )
+                                        pace_state["startup_ratio"] = float(
+                                            sample.get("ratio") or 0.0
+                                        )
+                                        pace_state["sample_reason"] = str(
+                                            sample.get("reason") or "unknown"
+                                        )
+                                        cur = float(step["offer_bps"])
+                                        if not bool(step["startup"]):
+                                            pace_state["bbr_t0"] = now
+                                            pace_state["confirmed_cruise"] = max(
+                                                float(
+                                                    pace_state[
+                                                        "confirmed_cruise"
+                                                    ]
+                                                ),
+                                                float(step["offer_bps"]),
+                                            )
+                                            pace_state[
+                                                "confirmed_btlbw"
+                                            ] = max(
+                                                float(
+                                                    pace_state[
+                                                        "confirmed_btlbw"
+                                                    ]
+                                                ),
+                                                delivery_bps,
+                                            )
+                                            pace_state["btlbw"] = max(
+                                                float(pace_state["btlbw"]),
+                                                float(
+                                                    pace_state[
+                                                        "confirmed_btlbw"
+                                                    ]
+                                                ),
+                                            )
+                                        startup = bool(step["startup"])
+                                    # Never drain on RTT during STARTUP: the
+                                    # first echo is warmup, not a standing queue.
                                     if startup:
                                         gain = _BBR_STARTUP_GAIN
                                     elif congested:
                                         gain = _BBR_DRAIN_GAIN
+                                    elif stalled:
+                                        # Don't 1.25×-probe into a HOL hole.
+                                        gain = _BBR_CRUISE_GAIN
                                     else:
                                         gain = bbr_pacing_gain(
                                             now,
@@ -2827,75 +3833,64 @@ def run_gen_server(
                                             and gain > 1.0
                                         ):
                                             gain = _BBR_CRUISE_GAIN
-                                    cur = update_delivery_rate_pace_bps(
-                                        btlbw_bps=btlbw,
-                                        max_bps=max_bps,
-                                        min_bps=floor,
-                                        gain=gain,
+                                    # BtlBw is app delivery; a 4% wire pad covers
+                                    # floor FEC. Live 32% would 1.25× AND 1.32×.
+                                    # FEC% is not a goodput signal.
+                                    oh_pct = min(
+                                        int(overhead_state["pct"]), _OH_FLOOR_PCT
                                     )
+                                    if not startup:
+                                        btlbw = max(
+                                            float(pace_state["btlbw"]),
+                                            float(
+                                                pace_state[
+                                                    "confirmed_btlbw"
+                                                ]
+                                            ),
+                                        )
+                                        cur = update_delivery_rate_pace_bps(
+                                            btlbw_bps=btlbw,
+                                            max_bps=max_bps,
+                                            min_bps=floor,
+                                            gain=gain,
+                                            overhead_pct=oh_pct,
+                                        )
+                                        if not congested:
+                                            cur = max(
+                                                cur,
+                                                float(
+                                                    pace_state[
+                                                        "confirmed_cruise"
+                                                    ]
+                                                ),
+                                            )
+                                    pace_state["gain"] = gain
                                     pace_state["bps"] = cur
                                     pace_state["last_completed"] = completed
                                     pace_state["last_ts"] = now
+                                    pace_state["last_blast"] = int(
+                                        send_totals["blast"]
+                                    )
+                                    pace_state["last_wire"] = int(
+                                        send_totals["wire"]
+                                    )
                                     pace_state["last_cc_ts"] = now
-                                    if congested:
+                                    if congested and not startup:
                                         pace_state["clean_streak"] = 0
                                         pace_state["hold_until"] = (
                                             now + _DELAY_CC_BACKOFF_HOLD_S
                                         )
                                     limiter.set_rate(cur)
-                                    used_bbr = True
                                     refresh_inflight(
                                         occupancy,
                                         btlbw=btlbw,
                                         min_rtt=rtprop,
                                     )
-                                if (
-                                    not used_bbr
-                                    and not stalled
-                                    and congested
-                                    and window_full
-                                    and (now - pace_state["last_cc_ts"])
-                                    >= _DELAY_CC_UPDATE_S
-                                ):
-                                    floor = max_bps * pace_min_frac
-                                    cur = max(
-                                        floor,
-                                        pace_state["bps"] * _DELAY_CC_DOWN_HARD,
-                                    )
-                                    pace_state["bps"] = cur
-                                    pace_state["last_cc_ts"] = now
-                                    pace_state["clean_streak"] = 0
-                                    pace_state["hold_until"] = (
-                                        now + _DELAY_CC_BACKOFF_HOLD_S
-                                    )
-                                    limiter.set_rate(cur)
-                                elif (
-                                    not used_bbr
-                                    and not stalled
-                                    and (congested or probe_ready)
-                                    and (now - pace_state["last_cc_ts"])
-                                    >= _DELAY_CC_UPDATE_S
-                                ):
-                                    cur, min_rtt, queue_s = update_delay_pace_bps(
-                                        rtt_s=ewma,
-                                        min_rtt_s=pace_state["min_rtt_s"],
-                                        cur_bps=pace_state["bps"],
-                                        max_bps=max_bps,
-                                        min_frac=pace_min_frac,
-                                        up_probe=delay_up_probe,
-                                    )
-                                    pace_state["bps"] = cur
-                                    pace_state["min_rtt_s"] = min_rtt
-                                    pace_state["queue_s"] = queue_s
-                                    pace_state["last_cc_ts"] = now
-                                    if congested:
-                                        pace_state["clean_streak"] = 0
-                                        pace_state["hold_until"] = (
-                                            now + _DELAY_CC_BACKOFF_HOLD_S
-                                        )
-                                    elif probe_ready:
-                                        pace_state["clean_streak"] = 0
-                                    limiter.set_rate(cur)
+                                # BBR owns the setpoint. Extra feedback between
+                                # delivery samples must not run delay-CC 0.82×
+                                # down to the 200 Mbit floor (pace=200 with
+                                # btlbw=368 / g=1.00). Congested RTT still
+                                # selects drain gain on the next BBR tick.
                     elif adapt_pace and (now - t_ramp0) >= effective_ramp_s + _ADAPT_PACE_WARMUP_S:
                         with pace_lock:
                             last_c = pace_state["last_completed"]
@@ -3015,15 +4010,19 @@ def run_gen_server(
             return
         pace_tick()
         # Stamp send_ts at wire time (not encode time) so delay-CC sees path queue.
-        ts_b = (int(time.monotonic() * 1_000_000) & 0xFFFFFFFF).to_bytes(4, "big")
+        # First-pass packets also get a monotonic blast_seq for loss accounting.
+        ts_us = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
         stamped: list[bytes | bytearray] = []
         for w in wires:
-            if len(w) >= GEN_HDR_SIZE:
-                b = bytearray(w)
-                b[12:16] = ts_b
-                stamped.append(b)
-            else:
-                stamped.append(w)
+            seq = None
+            if not repair and len(w) >= GEN_HDR_SIZE:
+                seq = int(send_frontier.get("blast_seq") or 0)
+                send_frontier["blast_seq"] = (seq + 1) & 0xFFFFFFFF
+            stamped.append(
+                stamp_gen_wire(w, send_ts_us=ts_us, blast_seq=seq)
+                if len(w) >= GEN_HDR_SIZE
+                else w
+            )
         total = sum(len(w) for w in stamped)
         pace_s += limiter.consume(total)
         assert client_addr is not None
@@ -3031,9 +4030,12 @@ def run_gen_server(
         send_datagrams(sock, client_addr, stamped)
         send_s += time.monotonic() - t_send
         wire_bytes += total
+        send_totals["wire"] += total
         if repair:
+            send_totals["repair"] += total
             repair_pkts_w += len(stamped)
         else:
+            send_totals["blast"] += total
             blast_pkts += len(stamped)
 
     def get_or_make_encoder(mm: mmap.mmap, gen_id: int) -> GenEncoder | None:
@@ -3437,6 +4439,10 @@ def run_gen_server(
                     return False
                 if nid in repair_pending_gids:
                     return False
+                with fb_lock:
+                    nn_now = int(fb_state["next_needed"])
+                if nid < nn_now:
+                    return False
                 if cooldown_s > 0 and (now - last_repair_ts.get(nid, 0.0)) < cooldown_s:
                     return False
                 if (
@@ -3522,6 +4528,10 @@ def run_gen_server(
                     try:
                         enc_cpu_s, sent, wires = fut.result()
                     except Exception:
+                        continue
+                    with fb_lock:
+                        nn_now = int(fb_state["next_needed"])
+                    if nid < nn_now:
                         continue
                     if not wires:
                         continue
@@ -3826,27 +4836,92 @@ def run_gen_server(
                         with fb_lock:
                             nacks_oh = list(fb_state["nacks"])
                             nack_rx_oh = dict(fb_state["nack_rx"])
-                        raw_miss = blast_fec_miss_frac(
-                            nack_rx_oh, nacks_oh, gen_k=gen_k
+                            loss_rep = dict(fb_state.get("loss") or {})
+                        rank_miss = blast_fec_miss_frac(
+                            nack_rx_oh,
+                            nacks_oh,
+                            gen_k=gen_k,
+                            window_gens=blast_fec_window_gens(
+                                nack_count=len(nacks_oh),
+                                incomplete=incomplete,
+                                frontier_lag=lag,
+                                inflight_gen_limit=inflight_gen_limit,
+                                sent_gens=gen_id,
+                            ),
                         )
-                        prev_miss = float(overhead_state.get("miss") or 0.0)
-                        if nacks_oh:
-                            miss_oh = 0.7 * prev_miss + 0.3 * raw_miss
-                        elif lag >= 24:
-                            # HOL still open: do not forget the miss that made it.
-                            miss_oh = prev_miss
+                        if packet_loss_fec:
+                            delta = take_loss_sample(
+                                overhead_state["loss_ingest"], loss_rep
+                            )
+                            sample = accumulate_loss_sample(
+                                overhead_state["loss_accum"], delta
+                            )
+                            overhead_state["loss_window_n"] = (
+                                int(sample["n"]) if sample is not None else 0
+                            )
+                            (
+                                overhead_state["pct"],
+                                overhead_state["p_fast"],
+                                overhead_state["p_slow"],
+                                overhead_state["p"],
+                                overhead_state["fec_base"],
+                                overhead_state["fec_boost"],
+                                overhead_state["clean_windows"],
+                            ) = apply_packet_loss_fec(
+                                cur_pct=int(overhead_state["pct"]),
+                                sample=sample,
+                                rank_miss=rank_miss,
+                                p_fast=float(overhead_state["p_fast"]),
+                                p_slow=float(overhead_state["p_slow"]),
+                                clean_windows=int(
+                                    overhead_state.get("clean_windows") or 0
+                                ),
+                                floor_pct=_OH_FLOOR_PCT,
+                                max_pct=max(overhead_pct, _OH_CEIL_PCT),
+                                start_pct=_OH_CEIL_PCT,
+                                elapsed_s=now - t0,
+                                sent_gens=gen_id,
+                                start_hold_s=_OH_START_HOLD_S,
+                                start_hold_gens=inflight_gen_limit,
+                            )
+                            if sample is not None:
+                                overhead_state["miss"] = float(sample["p"])
+                                overhead_state["loss_late"] = int(sample["late"])
+                                overhead_state["loss_pending"] = int(
+                                    sample["pending"]
+                                )
+                            elif rank_miss >= _OH_MISS_MID:
+                                overhead_state["miss"] = 0.7 * float(
+                                    overhead_state.get("miss") or 0.0
+                                ) + 0.3 * rank_miss
                         else:
-                            miss_oh = prev_miss * 0.92
-                        overhead_state["miss"] = miss_oh
-                        overhead_state["pct"] = adaptive_blast_overhead_pct(
-                            base_pct=overhead_pct,
-                            frontier_lag=lag,
-                            nack_count=len(nacks_oh),
-                            incomplete=incomplete,
-                            inflight_gen_limit=inflight_gen_limit,
-                            miss_frac=miss_oh,
-                            max_pct=max(overhead_pct, _OH_CEIL_PCT),
-                        )
+                            raw_miss = max(
+                                rank_miss,
+                                blast_fec_open_frac(
+                                    incomplete, inflight_gen_limit
+                                ),
+                            )
+                            prev_miss = float(overhead_state.get("miss") or 0.0)
+                            if nacks_oh or raw_miss >= _OH_MISS_MID:
+                                miss_oh = 0.7 * prev_miss + 0.3 * raw_miss
+                            else:
+                                miss_oh = prev_miss * 0.92
+                            overhead_state["miss"] = miss_oh
+                            overhead_state["pct"] = adaptive_blast_overhead_pct(
+                                base_pct=overhead_pct,
+                                frontier_lag=lag,
+                                nack_count=len(nacks_oh),
+                                incomplete=incomplete,
+                                inflight_gen_limit=inflight_gen_limit,
+                                miss_frac=miss_oh,
+                                max_pct=max(overhead_pct, _OH_CEIL_PCT),
+                                floor_pct=_OH_FLOOR_PCT,
+                                start_pct=_OH_CEIL_PCT,
+                                elapsed_s=now - t0,
+                                sent_gens=gen_id,
+                                start_hold_s=_OH_START_HOLD_S,
+                                start_hold_gens=inflight_gen_limit,
+                            )
                     if incomplete >= (inflight_gen_limit * 3) // 4:
                         limiter.set_burst_s(0.002)
                     elif incomplete <= inflight_gen_limit // 2:
@@ -3877,6 +4952,8 @@ def run_gen_server(
                         active=hol_pause_active,
                         hol_hole=hol_hole,
                         stuck=stuck_hol,
+                        occupancy=incomplete,
+                        inflight_gen_limit=inflight_gen_limit,
                     ) and gen_id > next_needed
                     if want_pause and not hol_pause_active:
                         last_repair_ts.pop(next_needed, None)
@@ -4046,33 +5123,9 @@ def run_gen_server(
                                         max(0, int(done_g) - last_c) * block_bytes / gdt
                                     )
                                     deliv_mib = delivery_bps / (1024 * 1024)
-                                    wire_bps = wire_bytes / max(dt, 1e-6)
-                                    filling = wire_bps >= pace_state["bps"] * 0.80
-                                    window_full = should_pause_blast(
-                                        max(0, gen_id - int(done_g)),
-                                        0,
-                                        inflight_gen_limit=inflight_gen_limit,
-                                    )
-                                    startup = bool(pace_state["bbr_startup"])
-                                    if (filling or window_full) and not startup:
-                                        new_bps, why = update_delivery_guard_bps(
-                                            delivery_bps=delivery_bps,
-                                            cur_bps=pace_state["bps"],
-                                            overhead_pct=int(overhead_state["pct"]),
-                                            min_bps=limiter.min_rate,
-                                            wire_bps=wire_bps,
-                                            window_full=window_full,
-                                        )
-                                        if why.startswith("cut"):
-                                            bad = int(pace_state["bad_streak"]) + 1
-                                            pace_state["bad_streak"] = bad
-                                            if bad >= 2:
-                                                pace_state["bps"] = new_bps
-                                                pace_state["hold_until"] = now + 1.2
-                                                pace_state["clean_streak"] = 0
-                                                limiter.set_rate(new_bps)
-                                        else:
-                                            pace_state["bad_streak"] = 0
+                                    # BBR already paces from delivery. Skip the
+                                    # old goodput guard: a HOL-full window is
+                                    # protocol stall, not a policer.
                                     pace_state["guard_completed"] = int(done_g)
                                     pace_state["guard_ts"] = now
                         with fountain_lock:
@@ -4082,15 +5135,9 @@ def run_gen_server(
                         # healthy; only back pace off when the pipeline agrees.
                         if repair_storm_detected(repair_rate, fount_n) and stressed:
                             storm_state["until"] = now + _REPAIR_STORM_BACKOFF_S
-                            if delay_cc or adapt_pace:
-                                with pace_lock:
-                                    if not pace_state["bbr_startup"]:
-                                        floor = limiter.min_rate
-                                        pace_state["bps"] = max(
-                                            floor, pace_state["bps"] * 0.70
-                                        )
-                                        pace_state["good_streak"] = 0
-                                        limiter.set_rate(pace_state["bps"])
+                            # Repair load is not a path-capacity sample. Keep the
+                            # confirmed BBR cruise; scheduling already yields
+                            # blast turns to targeted repair.
                         storm_flag = "storm" if now < storm_state["until"] else (
                             "fountain" if fountain_mode else (
                                 "stress" if stressed else "clean"
@@ -4101,8 +5148,37 @@ def run_gen_server(
                             q_ms = pace_state["queue_s"] * 1000.0
                             oh_pct = int(overhead_state["pct"])
                             oh_miss = float(overhead_state.get("miss") or 0.0)
+                            p_fast = float(overhead_state.get("p_fast") or 0.0)
+                            p_slow = float(overhead_state.get("p_slow") or 0.0)
+                            fec_base = int(overhead_state.get("fec_base") or oh_pct)
+                            fec_boost = int(overhead_state.get("fec_boost") or 0)
+                            loss_late = int(overhead_state.get("loss_late") or 0)
+                            loss_pending = int(
+                                overhead_state.get("loss_pending") or 0
+                            )
+                            loss_window_n = int(
+                                overhead_state.get("loss_window_n") or 0
+                            )
                             btlbw_mbit = float(pace_state["btlbw"]) * 8.0 / 1_000_000.0
                             startup_flag = "start" if pace_state["bbr_startup"] else "bw"
+                            startup_phase = str(pace_state["startup_phase"])
+                            startup_reason = str(pace_state["startup_reason"])
+                            startup_offer = (
+                                float(pace_state["startup_offer"])
+                                * 8.0
+                                / 1_000_000.0
+                            )
+                            startup_confirmed = (
+                                float(pace_state["startup_confirmed"])
+                                * 8.0
+                                / 1_000_000.0
+                            )
+                            startup_ratio = float(pace_state["startup_ratio"])
+                            startup_bad = int(pace_state["startup_bad"])
+                            startup_flat = int(pace_state["startup_flat"])
+                            startup_hol = int(pace_state["startup_hol"])
+                            sample_reason = str(pace_state["sample_reason"])
+                            bbr_gain = float(pace_state.get("gain") or 0.0)
                         for gid in list(repair_rounds):
                             if gid < nn:
                                 note_close_round(
@@ -4112,10 +5188,20 @@ def run_gen_server(
                             f"progress {gen_id}/{total_gens} "
                             f"client_done={done_g} "
                             f"fec={oh_pct}% "
-                            f"miss={oh_miss:.2f} "
+                            f"miss={oh_miss:.3f} "
+                            f"loss={oh_miss:.3f}/{p_fast:.3f}/{p_slow:.3f} "
+                            f"loss_n={loss_window_n} "
+                            f"late={loss_late} pend={loss_pending} "
+                            f"fec_base={fec_base} fec_boost={fec_boost} "
                             f"pace={pace_mbit:.0f}/{cap_mbit:.0f}Mbit "
                             f"btlbw={btlbw_mbit:.0f}Mbit "
                             f"bbr={startup_flag} "
+                            f"startup={startup_phase}/{startup_reason} "
+                            f"offer={startup_offer:.0f} confirmed={startup_confirmed:.0f} "
+                            f"ratio={startup_ratio:.2f} "
+                            f"bad={startup_bad} flat={startup_flat} hol={startup_hol} "
+                            f"sample={sample_reason} "
+                            f"g={bbr_gain:.2f} "
                             f"lag={gen_id - nn} "
                             f"incomplete={max(0, gen_id - int(done_g))}/"
                             f"{inflight_gen_limit} "
@@ -4357,6 +5443,7 @@ def run_gen_client(
     write_s = 0.0
     write_inline = 0
     rx_bytes = 0
+    blast_loss = BlastLossTracker()
     # Async pwrite; protocol treats the gen as done as soon as it decodes.
     write_q: queue.Queue[tuple[int, int, bytes] | None] = queue.Queue()
     write_lock = threading.Lock()
@@ -4503,6 +5590,9 @@ def run_gen_client(
             never_seen = drain_never_seen_frontier(
                 next_needed, max_gid_seen, total_gens
             )
+        pending = blast_loss.mature(now_fb)
+        blast_loss.adapt_grace()
+        loss_rep = blast_loss.report(pending)
         pkt = GenFeedbackPacket(
             next_needed,
             nacks,
@@ -4513,6 +5603,13 @@ def run_gen_client(
             miss_bitmap,
             epoch,
             never_seen,
+            int(loss_rep["epoch"]),
+            int(loss_rep["seq_begin"]),
+            int(loss_rep["seq_end"]),
+            int(loss_rep["rx"]),
+            int(loss_rep["lost"]),
+            int(loss_rep["late"]),
+            int(loss_rep["pending"]),
         )
         sock.sendto(pkt.pack(), server)
         if fin_seen and completed >= total_gens:
@@ -4564,6 +5661,7 @@ def run_gen_client(
                         rx_pkts += 1
                         rx_bytes += len(data)
                         last_echo = gp.send_ts_us
+                        blast_loss.on_packet(gp.blast_seq, time.monotonic())
                         gid = gp.gen_id
                         max_gid_seen = max(max_gid_seen, gid)
                         if bit_get(gid) or gid in pending_write:
@@ -4669,6 +5767,8 @@ def run_gen_client(
                 print(
                     f"  xfer rx={rx_mib:.1f} pkts={rx_pkts} "
                     f"skip_done={skip_done} dup_esi={dup_esi} "
+                    f"loss_rx={blast_loss.rx_unique} loss_lost={blast_loss.lost} "
+                    f"late={blast_loss.late} "
                     f"wait_rx={_pct(wait_rx_s, dt)}% "
                     f"recv={_pct(recv_s, dt)}% "
                     f"dec={_pct(dec_s, dt)}% "
