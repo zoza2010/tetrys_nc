@@ -15,9 +15,9 @@ WAN_SYMBOL_SIZE = 1350
 WAN_BLOCK_K = 768
 WAN_ACTIVE_BYTES = 64 * 1024 * 1024
 WAN_INITIAL_REPAIR_PCT = 20
-# Path carries ~900 Mbit at ~0.12% loss (iperf); 1 Gbit already drops ~13%.
-WAN_START_MBIT = 700.0
-WAN_PACE_CAP_MBIT = 920.0
+# Fixed 850 Mbit beat 880/920 on this path: extra-repair stays in check.
+WAN_START_MBIT = 850.0
+WAN_PACE_CAP_MBIT = 850.0
 # Delivery-rate cap: max-filter of send-equivalent unique over ~1–2 s.
 BTLBW_WINDOW = 10
 CRUISE_GAIN = 0.97

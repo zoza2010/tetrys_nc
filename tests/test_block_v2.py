@@ -353,9 +353,9 @@ def test_pace_limits_floor_equals_start(monkeypatch):
     monkeypatch.delenv("TETRYS_PACE_CAP_MBIT", raising=False)
     monkeypatch.delenv("TETRYS_PACE_MIN_FRAC", raising=False)
     min_bps, max_bps, start_bps = _pace_limits(2500.0)
-    assert start_bps == pytest.approx(700_000_000 / 8)
+    assert start_bps == pytest.approx(850_000_000 / 8)
     assert min_bps == pytest.approx(start_bps)
-    assert max_bps == pytest.approx(920_000_000 / 8)
+    assert max_bps == pytest.approx(850_000_000 / 8)
 
 
 def test_repair_debt_controller_ignores_packet_order():
