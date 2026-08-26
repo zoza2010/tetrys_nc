@@ -285,7 +285,12 @@ def run_block_server(
     feedback = SenderFeedbackState(session_id)
     stop = threading.Event()
     client_fin = threading.Event()
-    pacer = AckPacer(min_bps=min_bps, max_bps=max_bps, offer_bps=start_bps)
+    pacer = AckPacer(
+        min_bps=min_bps,
+        max_bps=max_bps,
+        offer_bps=start_bps,
+        fec_frac=initial_repair_pct / 100.0,
+    )
     limiter = RateLimiter(
         max_bps, start_bps=start_bps, min_frac=min_bps / max_bps
     )

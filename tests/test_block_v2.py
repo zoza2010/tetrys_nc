@@ -237,6 +237,15 @@ def test_ack_pacer_holds_while_repair_busy():
     assert pacer.cut_events == 0
 
 
+def test_ack_pacer_climbs_when_unique_matches_fec_payload():
+    start = 87_500_000  # 700 Mbit send; 20% FEC → ~70 MB/s unique
+    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
+    pacer.update(1_000_000, 1.00)
+    for _ in range(8):
+        pacer.update(pacer.last_unique + 10_500_000, pacer.last_ts + 0.15)
+    assert pacer.offer_bps > start * 1.10
+
+
 def test_ack_pacer_floor_is_start():
     start = 87_500_000
     pacer = AckPacer(start, 115_000_000, start)

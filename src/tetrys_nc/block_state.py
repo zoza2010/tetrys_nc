@@ -157,6 +157,8 @@ class AckPacer:
     min_bps: float
     max_bps: float
     offer_bps: float
+    # Unique ACK bytes omit repair; compare samples to offer×(1−fec).
+    fec_frac: float = 0.20
     confirmed_bps: float = 0.0
     delivery_bps: float = 0.0
     ewma_bps: float = 0.0
@@ -171,6 +173,12 @@ class AckPacer:
     cut_events: int = 0
     held_repair_events: int = 0
     repair_busy: bool = False
+
+    def _payload_frac(self) -> float:
+        return max(0.50, min(1.0, 1.0 - max(0.0, self.fec_frac)))
+
+    def _send_equiv(self, unique_bps: float) -> float:
+        return unique_bps / self._payload_frac()
 
     def _slew(self, target: float) -> float:
         hi = self.offer_bps * 1.10
@@ -208,14 +216,17 @@ class AckPacer:
             self.last_ts = now
             self.last_unique = unique_bytes
             return self.offer_bps
-        cruise = min(self.max_bps, max(self.min_bps, self.ewma_bps * 1.05))
+        payload_offer = self.offer_bps * self._payload_frac()
+        cruise = min(
+            self.max_bps, max(self.min_bps, self._send_equiv(self.ewma_bps) * 1.05)
+        )
         prev = self.offer_bps
         if self.startup:
-            if sample >= self.offer_bps * 0.85:
+            if sample >= payload_offer * 0.90:
                 self.weak_n = 0
                 self.plateau_n = 0
                 target = min(self.max_bps, self.offer_bps * 1.06)
-            elif sample >= self.offer_bps * 0.70:
+            elif sample >= payload_offer * 0.75:
                 self.weak_n = 0
                 self.plateau_n += 1
                 target = self.offer_bps
@@ -236,7 +247,7 @@ class AckPacer:
             if self.offer_bps >= self.max_bps * 0.995:
                 self.startup = False
         else:
-            if sample < self.offer_bps * 0.75:
+            if sample < payload_offer * 0.85:
                 if self.weak_n == 0:
                     self.weak_events += 1
                 self.weak_n += 1
