@@ -32,13 +32,8 @@ from .block_state import (
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
     REPAIR_INTERVAL_S,
-    REPAIR_TICK_PER_BLOCK,
-    REPAIR_TICK_PKTS,
-    REPAIR_TICK_S,
     TAIL_REPAIR_COOLDOWN_S,
     TAIL_REPAIR_TICK_PER_BLOCK,
-    TAIL_REPAIR_TICK_PKTS,
-    TAIL_REPAIR_TICK_S,
     RepairDebtController,
     SenderBlockState,
     SenderFeedbackState,
@@ -49,6 +44,9 @@ from .block_state import (
     WAN_START_MBIT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
+    block_loss_frac,
+    percentile,
+    repair_tick_limits,
     select_repair_candidates,
 )
 from .gen_raptor import GenEncoder, GenReceiveSlot
@@ -337,7 +335,7 @@ def run_block_server(
     repair_ctl = RepairDebtController(
         fec_floor,
         min_pct=fec_floor,
-        max_pct=max(22.0, fec_floor),
+        max_pct=max(28.0, fec_floor),
     )
     t0 = time.monotonic()
     last_log = t0
@@ -346,6 +344,8 @@ def run_block_server(
     first_close_seen = 0
     extra_blocks = 0
     extra_win = ExtraRepairWindow()
+    loss_samples: list[float] = []
+    extra_frac_samples: list[float] = []
     last_unique = 0
     source_wire_total = 0
     repair_wire_total = 0
@@ -409,30 +409,26 @@ def run_block_server(
             # Tail repair storms must not train primary FEC for later blocks.
             if not tail:
                 repair_ctl.observe(extra, block_k)
+                extra_win.observe(extra > 0)
+                extra_frac_samples.append(extra / max(1, block_k))
+                if extra == 0:
+                    loss_samples.append(0.0)
+                else:
+                    frac = block_loss_frac(state, block_k)
+                    if frac is not None:
+                        loss_samples.append(frac)
             first_close_seen += 1
             if extra == 0:
                 first_close += 1
             else:
                 extra_blocks += 1
-            if not tail:
-                extra_win.observe(extra > 0)
             enc_cache.pop(block_id, None)
             if block_id in enc_order:
                 enc_order.remove(block_id)
 
     def repair_tick(opened: dict[int, OpenBlock], now: float, tail: bool) -> int:
         t_r = time.perf_counter()
-        if tail:
-            budget = TAIL_REPAIR_TICK_PKTS
-            per_block = TAIL_REPAIR_TICK_PER_BLOCK
-            tick_s = TAIL_REPAIR_TICK_S
-            cooldown_s = TAIL_REPAIR_COOLDOWN_S
-        else:
-            budget = REPAIR_TICK_PKTS
-            per_block = REPAIR_TICK_PER_BLOCK
-            tick_s = REPAIR_TICK_S
-            cooldown_s = REPAIR_COOLDOWN_S
-        sent = 0
+        cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
         candidates = select_repair_candidates(
             active,
             opened,
@@ -442,6 +438,10 @@ def run_block_server(
             age_s=REPAIR_AGE_S,
             cooldown_s=cooldown_s,
         )
+        total_need = sum(need for need, _age, _bid in candidates)
+        budget, tick_s = repair_tick_limits(total_need, tail=tail)
+        per_block = TAIL_REPAIR_TICK_PER_BLOCK if tail else budget
+        sent = 0
         for need, _age, block_id in candidates:
             if sent >= budget or (time.perf_counter() - t_r) >= tick_s:
                 break
@@ -578,6 +578,7 @@ def run_block_server(
                             f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} "
                             f"cc={pacer.mode} "
                             f"xfrac={extra_win.frac * 100:.0f}% "
+                            f"loss_p50={((percentile(loss_samples, 50) or 0.0) * 100):.1f}% "
                             f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
                             f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
                             f"dt={pacer.last_dt:.2f}s "
@@ -635,6 +636,13 @@ def run_block_server(
         pace_txt = f"pace_p10={pace_p10:.0f} med={pace_med:.0f} max={pace_max:.0f}Mbit"
     else:
         pace_txt = "pace_p10=n/a"
+    loss_p50 = percentile(loss_samples, 50)
+    loss_p90 = percentile(loss_samples, 90)
+    loss_p99 = percentile(loss_samples, 99)
+    extra_p50 = percentile(extra_frac_samples, 50)
+    extra_p90 = percentile(extra_frac_samples, 90)
+    def _pct(val: float | None) -> str:
+        return "n/a" if val is None else f"{val * 100:.1f}%"
     print(
         f"v2 done in {elapsed:.2f}s — goodput "
         f"{file_size / elapsed / 1048576:.2f} MiB/s — "
@@ -642,6 +650,8 @@ def run_block_server(
         f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
         f"first_close={close_pct:.0f}% extra_blocks={extra_blocks} "
         f"xfrac={extra_win.frac * 100:.0f}% "
+        f"loss_p50={_pct(loss_p50)} p90={_pct(loss_p90)} p99={_pct(loss_p99)} "
+        f"extra_p50={_pct(extra_p50)} p90={_pct(extra_p90)} "
         f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
         f"weak={pacer.weak_events} cuts={pacer.cut_events} "
         f"held_repair={pacer.held_repair_events} "

@@ -26,6 +26,7 @@ from tetrys_nc.block_packets import (
 from tetrys_nc.block_state import (
     AckPacer,
     BlockGeometry,
+    REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
     RepairDebtController,
     SenderBlockState,
@@ -36,6 +37,9 @@ from tetrys_nc.block_state import (
     WAN_INITIAL_REPAIR_PCT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
+    block_loss_frac,
+    percentile,
+    repair_tick_limits,
     select_repair_candidates,
 )
 from tetrys_nc.block_xfer import (
@@ -402,6 +406,51 @@ def test_geometry_locks_wan_block_size():
     assert geometry.active_blocks >= 64
     assert WAN_INITIAL_REPAIR_PCT == 20
     assert 0 < TAIL_REPAIR_COOLDOWN_S < REPAIR_COOLDOWN_S
+    assert REPAIR_AGE_S <= 0.12
+
+
+def test_block_loss_frac_uses_unique_at_first_repair_age():
+    state = SenderBlockState(0, unique_rx=700, initial_repair=154, unique_at_age=700)
+    # 700 / (768+154) ≈ 0.76 received → ~24% loss on the initial flight.
+    assert block_loss_frac(state, 768) == pytest.approx(1.0 - 700 / 922)
+    assert block_loss_frac(SenderBlockState(1), 768) is None
+    assert percentile([0.1, 0.2, 0.3, 0.4, 0.5], 50) == pytest.approx(0.3)
+    budget, tick_s = repair_tick_limits(200, tail=False)
+    assert budget == 200
+    assert tick_s >= 0.024
+    small, _ = repair_tick_limits(10, tail=False)
+    assert small == 48
+    tail_b, _ = repair_tick_limits(10, tail=True)
+    assert tail_b == 256
+
+
+def test_repair_age_stamps_unique_once():
+    now = 10.0
+    young = SenderBlockState(0, unique_rx=500, sent_at=9.95)
+    old = SenderBlockState(1, unique_rx=700, sent_at=9.0)
+    opened = {0: OpenBlock(0, 500), 1: OpenBlock(1, 700)}
+    select_repair_candidates(
+        {0: young, 1: old},
+        opened,
+        now,
+        block_k=768,
+        tail=False,
+        age_s=0.12,
+        cooldown_s=0.0,
+    )
+    assert young.unique_at_age < 0
+    assert old.unique_at_age == 700
+    old.unique_rx = 720
+    select_repair_candidates(
+        {1: old},
+        {1: OpenBlock(1, 720)},
+        now,
+        block_k=768,
+        tail=False,
+        age_s=0.12,
+        cooldown_s=0.0,
+    )
+    assert old.unique_at_age == 700
 
 
 def test_repair_prefers_smallest_deficit_not_hol_frontier():

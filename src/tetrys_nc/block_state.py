@@ -32,11 +32,12 @@ CRUISE_SLEW = 0.03
 EXTRA_FRAC_WINDOW = 32
 EXTRA_FRAC_MIN_SAMPLES = 8
 EXTRA_FRAC_BUSY = 0.12
-# ~3 RTprop on the current Russia↔Spain path (~80 ms).
-REPAIR_AGE_S = 0.24
+# ~1.5 RTprop on the current Russia↔Spain path (~80 ms).
+REPAIR_AGE_S = 0.12
 REPAIR_COOLDOWN_S = 0.06
 REPAIR_TICK_PKTS = 48
-REPAIR_TICK_PER_BLOCK = 16
+REPAIR_TICK_PKTS_MAX = 256
+REPAIR_TICK_PER_BLOCK = 256
 REPAIR_TICK_S = 0.012
 REPAIR_INTERVAL_S = 0.050
 TAIL_REPAIR_TICK_PKTS = 256
@@ -72,6 +73,7 @@ class SenderBlockState:
     sent_at: float = 0.0
     last_repair_ts: float = 0.0
     decode_failed: bool = False
+    unique_at_age: int = -1
 
     def repair_need(self, block_k: int, margin: int = 2, pad: int = 4) -> int:
         if self.decode_failed and self.unique_rx >= block_k + margin:
@@ -151,6 +153,9 @@ def select_repair_candidates(
             state.decode_failed = item.decode_failed
         age = now - state.sent_at
         failed = state.decode_failed or (item is not None and item.decode_failed)
+        if age >= age_s or tail or failed:
+            if state.unique_at_age < 0:
+                state.unique_at_age = state.unique_rx
         if not tail and age < age_s and not failed:
             continue
         if now - state.last_repair_ts < cooldown_s:
@@ -162,6 +167,31 @@ def select_repair_candidates(
             candidates.append((need, -int(age * 1000), block_id))
     candidates.sort()
     return candidates
+
+
+def block_loss_frac(state: SenderBlockState, block_k: int) -> float | None:
+    """Loss vs initial flight (K + initial repair) at first repair age."""
+    if state.unique_at_age < 0:
+        return None
+    flight = max(1, block_k + max(0, state.initial_repair))
+    return max(0.0, min(1.0, 1.0 - state.unique_at_age / flight))
+
+
+def percentile(samples: list[float], p: float) -> float | None:
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    idx = int(round((p / 100.0) * (len(ordered) - 1)))
+    return ordered[min(len(ordered) - 1, max(0, idx))]
+
+
+def repair_tick_limits(total_need: int, *, tail: bool) -> tuple[int, float]:
+    """Packet budget and wall-time cap for one repair tick."""
+    if tail:
+        return TAIL_REPAIR_TICK_PKTS, TAIL_REPAIR_TICK_S
+    budget = min(REPAIR_TICK_PKTS_MAX, max(REPAIR_TICK_PKTS, max(0, int(total_need))))
+    tick_s = REPAIR_TICK_S if budget <= REPAIR_TICK_PKTS else max(REPAIR_TICK_S, 0.024)
+    return budget, tick_s
 
 
 @dataclass(slots=True)
@@ -395,7 +425,7 @@ class RepairDebtController:
     down_alpha: float = 0.16
     slew: float = 1.5
     min_pct: float = 12.0
-    max_pct: float = 22.0
+    max_pct: float = 28.0
     debt_need: int = 4
     clean_need: int = 8
     debt_n: int = 0
