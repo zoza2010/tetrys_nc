@@ -294,6 +294,9 @@ class AckPacer:
     def update(
         self, unique_bytes: int, now: float, repair_busy: bool | None = None
     ) -> float:
+        # Live WAN is min=start=cap; BBR never moves offer. Skip the state machine.
+        if self.min_bps >= self.max_bps * 0.999:
+            return self.offer_bps
         if repair_busy is None:
             repair_busy = self.repair_busy
         # Unique=0 feedback only arms the clock after the first delivered byte.

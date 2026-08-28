@@ -1,8 +1,4 @@
-"""Object-mux session on top of v2 RaptorQ blocks.
-
-One UDP session, many files enqueued while it runs. File bytes are packed
-into the same K×T blocks as single-file v2; OPEN/FIN are control datagrams.
-"""
+"""Object-mux: many named blobs over one v2 RaptorQ UDP session."""
 
 from __future__ import annotations
 
@@ -17,6 +13,7 @@ from pathlib import Path
 
 from .block_packets import (
     MUX_META_NAME,
+    BlockDataV2,
     BlockFeedbackV2,
     BlockFinV2,
     BlockMetaV2,
@@ -24,39 +21,52 @@ from .block_packets import (
     OpenBlock,
     ObjectFinV2,
     ObjectOpenV2,
-    ObjectResetV2,
-    BlockDataV2,
     pack_data_packets,
     parse_v2_packet,
 )
 from .block_state import (
-    AckPacer,
-    BlockGeometry,
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
     REPAIR_INTERVAL_S,
-    RepairDebtController,
+    BlockGeometry,
     SenderBlockState,
     SenderFeedbackState,
-    ExtraRepairWindow,
     repair_tick_limits,
     select_repair_candidates,
 )
 from .block_xfer import _pace_limits
 from .gen_raptor import GenEncoder, GenReceiveSlot
 from .netutil import recv_datagrams, send_datagrams, try_set_buffer
-from .object_frames import FRAME_HDR, BlockFill, ObjectCursor, unpack_block
-from .object_pack import is_pack_name, unpack_files
+from .object_frames import FRAME_HDR, BlockFill, ObjectCursor, is_pack_name, unpack_block, unpack_files
 from .ratectl import RateLimiter
 
 _FEEDBACK_S = 0.020
-_FLUSH_S = 0.008
 _SEND_CHUNK = 64
 
 
-class ObjectSession:
-    """Thread-safe queue of named blobs. close() means no more puts."""
+def _safe_name(name: str) -> str:
+    base = Path(name).name
+    return base if base and base not in {".", ".."} else f"obj_{abs(hash(name)) & 0xFFFF:x}"
 
+
+def _udp(host: str | None, port: int | None, *, snd: int, rcv: int) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try_set_buffer(sock, socket.SO_SNDBUF, snd)
+    try_set_buffer(sock, socket.SO_RCVBUF, rcv)
+    if host is not None and port is not None:
+        sock.bind((host, port))
+    sock.setblocking(False)
+    return sock
+
+
+def _burst(sock: socket.socket, addr, wire: bytes, n: int, pause: float = 0.005) -> None:
+    for i in range(n):
+        sock.sendto(wire, addr)
+        if pause and i + 1 < n:
+            time.sleep(pause)
+
+
+class ObjectSession:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: deque[ObjectCursor] = deque()
@@ -86,42 +96,14 @@ class ObjectSession:
 
     def pop_pending(self) -> ObjectCursor | None:
         with self._lock:
-            if not self._pending:
-                return None
-            return self._pending.popleft()
-
-    def pending_empty(self) -> bool:
-        with self._lock:
-            return not self._pending
+            return self._pending.popleft() if self._pending else None
 
     def idle(self, current: ObjectCursor | None) -> bool:
         with self._lock:
             return self._closed and not self._pending and current is None
 
 
-def _encode_payload(
-    payload: bytes,
-    symbol_size: int,
-    overhead_pct: int,
-    session_id: int,
-    block_id: int,
-) -> tuple[list[bytes], int, GenEncoder]:
-    encoder = GenEncoder(payload, symbol_size, overhead_pct)
-    stamp = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-    wires = pack_data_packets(session_id, block_id, encoder.packets(), 0, stamp)
-    return wires, encoder.repair_budget, encoder
-
-
-def _fill_block(
-    geometry: BlockGeometry,
-    session: ObjectSession,
-    current: ObjectCursor | None,
-    *,
-    flush: bool,
-    announce,
-    finish,
-) -> tuple[bytes | None, ObjectCursor | None]:
-    del flush
+def _fill_block(geometry: BlockGeometry, session: ObjectSession, current, announce, finish):
     fill = BlockFill(geometry.block_bytes)
     while fill.space() > FRAME_HDR:
         if current is None:
@@ -135,9 +117,7 @@ def _fill_block(
             current = None
         if not took:
             break
-    if not fill.chunks:
-        return None, current
-    return fill.packed(), current
+    return (fill.packed() if fill.chunks else None), current
 
 
 def run_object_server(
@@ -153,23 +133,15 @@ def run_object_server(
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
     min_bps, max_bps, start_bps = _pace_limits(rate_mbit)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_SNDBUF, 8 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_RCVBUF, 8 * 1024 * 1024)
-    sock.bind((host, port))
-    sock.setblocking(False)
+    sock = _udp(host, port, snd=8 << 20, rcv=8 << 20)
     print(
         f"object-mux server udp://{host}:{port} K={block_k} T={symbol_size} "
         f"fec={initial_repair_pct}%",
         flush=True,
     )
-
-    client: tuple[str, int] | None = None
-    session_id = 0
-    deadline = time.monotonic() + 30.0
+    client, session_id, deadline = None, 0, time.monotonic() + 30.0
     while client is None and time.monotonic() < deadline:
-        readable, _, _ = select.select([sock], [], [], 0.5)
-        if not readable:
+        if not select.select([sock], [], [], 0.5)[0]:
             continue
         try:
             raw, addr = sock.recvfrom(2048)
@@ -177,177 +149,115 @@ def run_object_server(
         except (BlockingIOError, ValueError):
             continue
         if isinstance(packet, BlockReadyV2):
-            client = addr
-            session_id = packet.session_id
+            client, session_id = addr, packet.session_id
     if client is None:
         sock.close()
         raise TimeoutError("object-mux server timed out waiting for READY")
 
     meta = BlockMetaV2(
-        session_id,
-        0,
-        MUX_META_NAME,
-        symbol_size,
-        block_k,
-        initial_repair_pct,
-        geometry.active_bytes,
-        "",
+        session_id, 0, MUX_META_NAME, symbol_size, block_k,
+        initial_repair_pct, geometry.active_bytes, "",
     ).pack()
-    for _ in range(8):
-        sock.sendto(meta, client)
+    _burst(sock, client, meta, 8, 0.0)
 
     feedback = SenderFeedbackState(session_id)
-    stop = threading.Event()
-    client_fin = threading.Event()
-    pacer = AckPacer(min_bps, max_bps, start_bps, fec_frac=initial_repair_pct / 100.0)
+    stop, client_fin = threading.Event(), threading.Event()
     limiter = RateLimiter(max_bps, start_bps=start_bps, min_frac=min_bps / max_bps)
 
     def feedback_loop() -> None:
         while not stop.is_set():
-            readable, _, _ = select.select([sock], [], [], 0.05)
-            if not readable:
+            if not select.select([sock], [], [], 0.05)[0]:
                 continue
             while True:
                 try:
-                    raw, _ = sock.recvfrom(4096)
+                    packet = parse_v2_packet(sock.recvfrom(4096)[0])
                 except BlockingIOError:
                     break
-                try:
-                    packet = parse_v2_packet(raw)
                 except ValueError:
                     continue
                 if isinstance(packet, BlockFeedbackV2):
-                    if feedback.apply(packet):
-                        limiter.set_rate(
-                            pacer.update(packet.unique_payload_bytes, time.monotonic())
-                        )
-                elif (
-                    isinstance(packet, BlockFinV2)
-                    and packet.session_id == session_id
-                    and packet.ok
-                ):
+                    feedback.apply(packet)
+                elif isinstance(packet, BlockFinV2) and packet.session_id == session_id and packet.ok:
                     client_fin.set()
 
     fb_thread = threading.Thread(target=feedback_loop, daemon=True)
     fb_thread.start()
-
     active: dict[int, SenderBlockState] = {}
     enc_cache: dict[int, GenEncoder] = {}
-    current: ObjectCursor | None = None
+    current = None
     next_block = 0
     last_repair = 0.0
-    last_fill = time.monotonic()
-    extra_win = ExtraRepairWindow()
-    repair_ctl = RepairDebtController(float(initial_repair_pct))
     announced: set[int] = set()
-
-    def send_ctrl(wire: bytes) -> None:
-        sock.sendto(wire, client)
 
     def announce(cursor: ObjectCursor) -> None:
         if cursor.obj_id in announced:
             return
-        send_ctrl(
-            ObjectOpenV2(
-                session_id, cursor.obj_id, len(cursor.data), cursor.name
-            ).pack()
+        sock.sendto(
+            ObjectOpenV2(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
+            client,
         )
         announced.add(cursor.obj_id)
 
     def finish(cursor: ObjectCursor) -> None:
-        send_ctrl(ObjectFinV2(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack())
+        sock.sendto(
+            ObjectFinV2(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
+            client,
+        )
 
     def send_wires(wires: list[bytes]) -> None:
-        for pos in range(0, len(wires), _SEND_CHUNK):
-            batch = wires[pos : pos + _SEND_CHUNK]
+        for i in range(0, len(wires), _SEND_CHUNK):
+            batch = wires[i : i + _SEND_CHUNK]
             limiter.consume(sum(map(len, batch)))
             send_datagrams(sock, client, batch, chunk=_SEND_CHUNK)
 
     def repair_tick(opened, now: float) -> None:
-        tail = session.idle(current)
         candidates = select_repair_candidates(
-            active,
-            opened,
-            now,
-            block_k=block_k,
-            tail=tail,
-            age_s=REPAIR_AGE_S,
-            cooldown_s=REPAIR_COOLDOWN_S,
+            active, opened, now, block_k=block_k, tail=session.idle(current),
+            age_s=REPAIR_AGE_S, cooldown_s=REPAIR_COOLDOWN_S,
         )
-        total_need = sum(need for need, _age, _bid in candidates)
-        budget, tick_s = repair_tick_limits(total_need, tail=tail)
-        t0 = time.perf_counter()
-        sent = 0
+        budget, tick_s = repair_tick_limits(sum(n for n, *_ in candidates), tail=session.idle(current))
+        t0, sent = time.perf_counter(), 0
         for need, _age, block_id in candidates:
             if sent >= budget or (time.perf_counter() - t0) >= tick_s:
                 break
-            encoder = enc_cache[block_id]
-            state = active[block_id]
-            n = min(need, budget - sent)
+            encoder, state = enc_cache[block_id], active[block_id]
             prev = encoder.packet_count
-            new_packets = encoder.ensure_repair(state.repair_emitted + n)
+            new_packets = encoder.ensure_repair(state.repair_emitted + min(need, budget - sent))
             if not new_packets:
                 continue
             stamp = int(now * 1_000_000) & 0xFFFFFFFF
-            send_wires(
-                pack_data_packets(session_id, block_id, new_packets, prev, stamp)
-            )
+            send_wires(pack_data_packets(session_id, block_id, new_packets, prev, stamp))
             state.repair_emitted += len(new_packets)
             state.last_repair_ts = now
             sent += len(new_packets)
 
     try:
         while not client_fin.is_set():
-            completed, opened, _unique, _decoded = feedback.snapshot()
+            completed, opened, *_ = feedback.snapshot()
             now = time.monotonic()
-            for block_id in list(active):
-                if block_id not in completed:
-                    continue
-                state = active.pop(block_id)
-                extra_win.observe(state.repair_emitted > state.initial_repair)
+            for block_id in [b for b in active if b in completed]:
+                active.pop(block_id)
                 enc_cache.pop(block_id, None)
-            pacer.repair_busy = extra_win.pressure()
-
             admitted = False
             while len(active) < geometry.active_blocks:
-                flush = session.closed or (now - last_fill >= _FLUSH_S)
-                payload, current = _fill_block(
-                    geometry,
-                    session,
-                    current,
-                    flush=flush,
-                    announce=announce,
-                    finish=finish,
-                )
+                payload, current = _fill_block(geometry, session, current, announce, finish)
                 if payload is None:
                     break
-                wires, budget, encoder = _encode_payload(
-                    payload,
-                    symbol_size,
-                    repair_ctl.current,
-                    session_id,
-                    next_block,
-                )
+                encoder = GenEncoder(payload, symbol_size, initial_repair_pct)
+                stamp = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+                send_wires(pack_data_packets(session_id, next_block, encoder.packets(), 0, stamp))
                 enc_cache[next_block] = encoder
                 active[next_block] = SenderBlockState(
-                    next_block,
-                    initial_repair=budget,
-                    repair_emitted=budget,
-                    sent_at=now,
+                    next_block, initial_repair=encoder.repair_budget,
+                    repair_emitted=encoder.repair_budget, sent_at=now,
                 )
-                send_wires(wires)
                 next_block += 1
-                last_fill = now
                 admitted = True
-
             if now - last_repair >= REPAIR_INTERVAL_S and active:
                 repair_tick(opened, now)
                 last_repair = now
-
             if session.idle(current) and not active and next_block > 0:
-                for _ in range(8):
-                    sock.sendto(BlockFinV2(session_id, next_block).pack(), client)
-                    time.sleep(0.005)
+                _burst(sock, client, BlockFinV2(session_id, next_block).pack(), 8)
                 grace = time.monotonic() + 2.0
                 while not client_fin.is_set() and time.monotonic() < grace:
                     time.sleep(0.02)
@@ -361,11 +271,104 @@ def run_object_server(
     return 0
 
 
-def _safe_name(name: str) -> str:
-    base = Path(name).name
-    if not base or base in {".", ".."}:
-        return f"obj_{abs(hash(name)) & 0xFFFF:x}"
-    return base
+class _Sink:
+    def __init__(self, output_dir: Path) -> None:
+        self.dir = output_dir
+        self.names: dict[int, str] = {}
+        self.sizes: dict[int, int] = {}
+        self.written: dict[int, int] = {}
+        self.finished: set[int] = set()
+        self.pending: dict[int, list] = {}
+        self._fds: OrderedDict[int, int] = OrderedDict()
+        self._truncated: set[int] = set()
+        self.decoded = 0
+
+    def _fd(self, obj_id: int) -> int | None:
+        if obj_id not in self.names:
+            return None
+        if obj_id in self._fds:
+            self._fds.move_to_end(obj_id)
+            return self._fds[obj_id]
+        while len(self._fds) >= 64:
+            os.close(self._fds.popitem(last=False)[1])
+        fd = os.open(self.dir / self.names[obj_id], os.O_CREAT | os.O_RDWR, 0o644)
+        if obj_id not in self._truncated:
+            if self.sizes.get(obj_id, 0) > 0:
+                os.ftruncate(fd, self.sizes[obj_id])
+            self._truncated.add(obj_id)
+        self._fds[obj_id] = fd
+        return fd
+
+    def _maybe_close(self, obj_id: int) -> None:
+        size = self.sizes.get(obj_id)
+        if obj_id not in self.finished or size is None or self.written.get(obj_id, 0) < size:
+            return
+        fd = self._fds.pop(obj_id, None)
+        if fd is not None:
+            os.close(fd)
+
+    def open(self, obj_id: int, name: str, size: int) -> None:
+        self.names[obj_id] = _safe_name(name)
+        self.sizes[obj_id] = size
+        self.written.setdefault(obj_id, 0)
+        for chunk in self.pending.pop(obj_id, []):
+            self.write(chunk)
+
+    def write(self, chunk) -> None:
+        fd = self._fd(chunk.obj_id)
+        if fd is None:
+            self.pending.setdefault(chunk.obj_id, []).append(chunk)
+            return
+        os.pwrite(fd, chunk.data, chunk.offset)
+        self.written[chunk.obj_id] = max(
+            self.written.get(chunk.obj_id, 0), chunk.offset + len(chunk.data)
+        )
+        self.decoded += len(chunk.data)
+        self._maybe_close(chunk.obj_id)
+
+    def fin(self, obj_id: int, name: str, size: int) -> None:
+        name = name or f"obj_{obj_id}.bin"
+        if obj_id not in self.names:
+            self.open(obj_id, name, size)
+        else:
+            safe, old = _safe_name(name), self.names[obj_id]
+            if old != safe:
+                src, dst = self.dir / old, self.dir / safe
+                if src.exists() and src != dst:
+                    src.replace(dst)
+                self.names[obj_id] = safe
+        self.sizes[obj_id] = size
+        self.finished.add(obj_id)
+        self._maybe_close(obj_id)
+
+    def ingest(self, payload: bytes) -> None:
+        for chunk in unpack_block(payload):
+            if chunk.name:
+                self.open(chunk.obj_id, chunk.name, chunk.size)
+            self.write(chunk)
+            size = self.sizes.get(chunk.obj_id)
+            if size is not None and self.written.get(chunk.obj_id, 0) >= size:
+                self.finished.add(chunk.obj_id)
+                self._maybe_close(chunk.obj_id)
+
+    def explode_packs(self) -> None:
+        for path in list(self.dir.iterdir()):
+            if path.is_file() and is_pack_name(path.name):
+                for fname, blob in unpack_files(path.read_bytes()):
+                    (self.dir / _safe_name(fname)).write_bytes(blob)
+                path.unlink()
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+
+    def check(self) -> None:
+        missing = [oid for oid, size in self.sizes.items() if self.written.get(oid, 0) < size]
+        if missing:
+            raise ValueError(f"incomplete objects {missing}")
+        if self.pending:
+            raise ValueError(f"unnamed object chunks {sorted(self.pending)}")
 
 
 def run_object_client(
@@ -378,26 +381,19 @@ def run_object_client(
     timeout_s: float = 180.0,
 ) -> int:
     del wan
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_RCVBUF, 32 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_SNDBUF, 8 * 1024 * 1024)
-    sock.setblocking(False)
+    sock = _udp(None, None, snd=8 << 20, rcv=32 << 20)
     server = (host, port)
     session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
     ready = BlockReadyV2(session_id, active_bytes).pack()
-    for _ in range(8):
-        sock.sendto(ready, server)
+    _burst(sock, server, ready, 8, 0.0)
 
-    meta: BlockMetaV2 | None = None
-    deadline = time.monotonic() + 30.0
+    meta, deadline = None, time.monotonic() + 30.0
     while meta is None and time.monotonic() < deadline:
-        readable, _, _ = select.select([sock], [], [], 0.5)
-        if not readable:
+        if not select.select([sock], [], [], 0.5)[0]:
             sock.sendto(ready, server)
             continue
         try:
-            raw, _ = sock.recvfrom(4096)
-            packet = parse_v2_packet(raw)
+            packet = parse_v2_packet(sock.recvfrom(4096)[0])
         except (BlockingIOError, ValueError):
             continue
         if isinstance(packet, BlockMetaV2) and packet.session_id == session_id:
@@ -411,108 +407,34 @@ def run_object_client(
 
     geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
     output_dir.mkdir(parents=True, exist_ok=True)
-    names: dict[int, str] = {}
-    sizes: dict[int, int] = {}
-    written: dict[int, int] = {}
-    fd_lru: OrderedDict[int, int] = OrderedDict()
-    truncated: set[int] = set()
-    finished: set[int] = set()
+    sink = _Sink(output_dir)
     slots: dict[int, GenReceiveSlot] = {}
-    done_blocks: set[int] = set()
-    unique_payload_bytes = 0
-    decoded_bytes = 0
-    feedback_id = 0
-    last_feedback = 0.0
-    last_echo = 0
+    done: set[int] = set()
+    unique = feedback_id = last_echo = 0
+    last_fb = 0.0
     total_blocks: int | None = None
     t0 = time.monotonic()
-    pending_chunks: dict[int, list] = {}
-
-    def _fd_for(obj_id: int) -> int | None:
-        if obj_id not in names:
-            return None
-        if obj_id in fd_lru:
-            fd_lru.move_to_end(obj_id)
-            return fd_lru[obj_id]
-        while len(fd_lru) >= 64:
-            _oid, old = fd_lru.popitem(last=False)
-            os.close(old)
-        path = output_dir / names[obj_id]
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
-        if obj_id not in truncated:
-            size = sizes.get(obj_id, 0)
-            if size > 0:
-                os.ftruncate(fd, size)
-            truncated.add(obj_id)
-        fd_lru[obj_id] = fd
-        return fd
-
-    def open_obj(obj_id: int, name: str, size: int) -> None:
-        names[obj_id] = _safe_name(name)
-        sizes[obj_id] = size
-        written.setdefault(obj_id, 0)
-        for chunk in pending_chunks.pop(obj_id, []):
-            _write_chunk(chunk)
-
-    def _write_chunk(chunk) -> None:
-        nonlocal decoded_bytes
-        fd = _fd_for(chunk.obj_id)
-        if fd is None:
-            pending_chunks.setdefault(chunk.obj_id, []).append(chunk)
-            return
-        os.pwrite(fd, chunk.data, chunk.offset)
-        written[chunk.obj_id] = max(
-            written.get(chunk.obj_id, 0), chunk.offset + len(chunk.data)
-        )
-        decoded_bytes += len(chunk.data)
-        _close_if_complete(chunk.obj_id)
-
-    def _close_if_complete(obj_id: int) -> None:
-        size = sizes.get(obj_id)
-        if obj_id not in finished or size is None:
-            return
-        if written.get(obj_id, 0) < size:
-            return
-        fd = fd_lru.pop(obj_id, None)
-        if fd is not None:
-            os.close(fd)
 
     def send_feedback(force: bool = False) -> None:
-        nonlocal feedback_id, last_feedback
+        nonlocal feedback_id, last_fb
         now = time.monotonic()
-        if not force and now - last_feedback < _FEEDBACK_S:
+        if not force and now - last_fb < _FEEDBACK_S:
             return
         feedback_id += 1
         opened = [
-            OpenBlock(block_id, slot.symbols_rx, False, 0)
-            for block_id, slot in sorted(slots.items())
+            OpenBlock(bid, slot.symbols_rx, False, 0) for bid, slot in sorted(slots.items())
         ][:64]
-        packet = BlockFeedbackV2(
-            session_id,
-            feedback_id,
-            unique_payload_bytes,
-            decoded_bytes,
-            last_echo,
-            sorted(done_blocks),
-            opened,
+        sock.sendto(
+            BlockFeedbackV2(
+                session_id, feedback_id, unique, sink.decoded, last_echo, sorted(done), opened
+            ).pack(),
+            server,
         )
-        sock.sendto(packet.pack(), server)
-        last_feedback = now
-
-    def ingest_block(payload: bytes) -> None:
-        for chunk in unpack_block(payload):
-            if chunk.name:
-                open_obj(chunk.obj_id, chunk.name, chunk.size)
-            _write_chunk(chunk)
-            size = sizes.get(chunk.obj_id)
-            if size is not None and written.get(chunk.obj_id, 0) >= size:
-                finished.add(chunk.obj_id)
-                _close_if_complete(chunk.obj_id)
+        last_fb = now
 
     try:
         while True:
-            readable, _, _ = select.select([sock], [], [], 0.02)
-            if readable:
+            if select.select([sock], [], [], 0.02)[0]:
                 try:
                     batch = recv_datagrams(sock, 64)
                 except BlockingIOError:
@@ -524,99 +446,54 @@ def run_object_client(
                         continue
                     if getattr(packet, "session_id", None) != session_id:
                         continue
-                    if isinstance(packet, ObjectOpenV2):
-                        if packet.obj_id not in names:
-                            open_obj(packet.obj_id, packet.name, packet.size)
-                    elif isinstance(packet, ObjectResetV2):
-                        fd = fd_lru.pop(packet.obj_id, None)
-                        if fd is not None:
-                            os.close(fd)
-                        name = names.get(packet.obj_id)
-                        if name:
-                            path = output_dir / name
-                            if path.exists():
-                                path.unlink()
+                    if isinstance(packet, ObjectOpenV2) and packet.obj_id not in sink.names:
+                        sink.open(packet.obj_id, packet.name, packet.size)
                     elif isinstance(packet, ObjectFinV2):
-                        name = packet.name or f"obj_{packet.obj_id}.bin"
-                        if packet.obj_id not in names:
-                            open_obj(packet.obj_id, name, packet.size)
-                        else:
-                            safe = _safe_name(name)
-                            old = names[packet.obj_id]
-                            if old != safe:
-                                src = output_dir / old
-                                dst = output_dir / safe
-                                if src.exists() and src != dst:
-                                    src.replace(dst)
-                                names[packet.obj_id] = safe
-                        sizes[packet.obj_id] = packet.size
-                        finished.add(packet.obj_id)
-                        _close_if_complete(packet.obj_id)
-                    elif isinstance(packet, BlockMetaV2):
-                        continue
+                        sink.fin(packet.obj_id, packet.name, packet.size)
                     elif isinstance(packet, BlockDataV2):
-                        block_id = packet.block_id
-                        if block_id in done_blocks:
+                        if packet.block_id in done:
                             continue
-                        slot = slots.get(block_id)
+                        slot = slots.get(packet.block_id)
                         if slot is None:
                             slot = GenReceiveSlot(
-                                block_id,
+                                packet.block_id,
                                 gen_k=meta.block_k,
                                 symbol_size=meta.symbol_size,
                                 block_bytes=geometry.block_bytes,
                                 tlen=geometry.block_bytes,
                             )
-                            slots[block_id] = slot
+                            slots[packet.block_id] = slot
                         before = slot.symbols_rx
                         decoded = slot.add_packet(packet.payload, packet.esi)
                         if slot.symbols_rx == before:
                             continue
-                        unique_payload_bytes += len(raw)
+                        unique += len(raw)
                         last_echo = packet.send_ts_us
                         if decoded is not None:
-                            ingest_block(decoded[: geometry.block_bytes])
-                            done_blocks.add(block_id)
+                            sink.ingest(decoded[: geometry.block_bytes])
+                            done.add(packet.block_id)
                             slot.close()
-                            slots.pop(block_id, None)
+                            slots.pop(packet.block_id, None)
                     elif isinstance(packet, BlockFinV2):
                         total_blocks = packet.total_blocks
             send_feedback()
             if (
-                total_blocks is not None
-                and total_blocks > 0
-                and all(i in done_blocks for i in range(total_blocks))
-                and not pending_chunks
+                total_blocks
+                and all(i in done for i in range(total_blocks))
+                and not sink.pending
             ):
                 break
             if time.monotonic() - t0 > timeout_s:
                 raise TimeoutError("object-mux client timed out")
         send_feedback(force=True)
-        for _ in range(16):
-            sock.sendto(BlockFinV2(session_id, total_blocks or 0).pack(), server)
-            time.sleep(0.005)
+        _burst(sock, server, BlockFinV2(session_id, total_blocks or 0).pack(), 16)
     finally:
         for slot in slots.values():
             slot.close()
-        for fd in fd_lru.values():
-            os.close(fd)
-        fd_lru.clear()
+        sink.close()
         sock.close()
-
-    missing = [oid for oid, size in sizes.items() if written.get(oid, 0) < size]
-    if missing:
-        raise ValueError(f"incomplete objects {missing}")
-    if pending_chunks:
-        raise ValueError(f"unnamed object chunks {sorted(pending_chunks)}")
-    for path in list(output_dir.iterdir()):
-        if path.is_file() and is_pack_name(path.name):
-            for fname, blob in unpack_files(path.read_bytes()):
-                (output_dir / _safe_name(fname)).write_bytes(blob)
-            path.unlink()
+    sink.check()
+    sink.explode_packs()
     nfiles = sum(1 for p in output_dir.iterdir() if p.is_file())
-    print(
-        f"object-mux OK: {nfiles} files in {output_dir} "
-        f"blocks={len(done_blocks)}",
-        flush=True,
-    )
+    print(f"object-mux OK: {nfiles} files in {output_dir} blocks={len(done)}", flush=True)
     return 0

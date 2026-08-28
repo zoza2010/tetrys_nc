@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import threading
 import time
 from pathlib import Path
@@ -12,27 +11,39 @@ from .block_state import (
     WAN_ACTIVE_BYTES,
     WAN_BLOCK_K,
     WAN_INITIAL_REPAIR_PCT,
+    WAN_PACE_CAP_MBIT,
     WAN_SYMBOL_SIZE,
 )
-from .object_pack import is_pack_name, split_for_session
+from .object_frames import is_pack_name, split_for_session
 from .object_xfer import ObjectSession, run_object_client, run_object_server
+
+
+def _next_pack(objects: list[tuple[str, bytes]], start: int) -> int:
+    n = start
+    for name, _ in objects:
+        if is_pack_name(name):
+            n = max(n, int(Path(name).stem.rsplit("_", 1)[-1], 10) + 1)
+    return n
 
 
 def _put_dir(session: ObjectSession, folder: Path, pack_start: int) -> tuple[int, int]:
     if not folder.is_dir():
         return 0, pack_start
-    files: list[tuple[str, bytes]] = []
-    for path in sorted(folder.iterdir()):
-        if path.is_file() and not path.name.startswith("."):
-            files.append((path.name, path.read_bytes()))
+    files = [
+        (p.name, p.read_bytes())
+        for p in sorted(folder.iterdir())
+        if p.is_file() and not p.name.startswith(".")
+    ]
     objects = split_for_session(files, pack_start=pack_start)
-    next_pack = pack_start
     for name, blob in objects:
         session.put(name, blob)
-        if is_pack_name(name):
-            stem = Path(name).stem  # __pack_0000
-            next_pack = max(next_pack, int(stem.rsplit("_", 1)[-1], 10) + 1)
-    return len(files), next_pack
+    return len(files), _next_pack(objects, pack_start)
+
+
+def _wan_defaults(wan: bool, fec: int, rate: float):
+    if wan:
+        return WAN_SYMBOL_SIZE, WAN_BLOCK_K, fec or WAN_INITIAL_REPAIR_PCT, WAN_ACTIVE_BYTES, rate or WAN_PACE_CAP_MBIT
+    return 256, 64, fec or 14, 4 << 20, rate or 400.0
 
 
 def main_objserver(argv: list[str] | None = None) -> int:
@@ -46,13 +57,7 @@ def main_objserver(argv: list[str] | None = None) -> int:
     p.add_argument("--fec", type=int, default=0)
     p.add_argument("--rate-mbit", type=float, default=0.0)
     args = p.parse_args(argv)
-    symbol = WAN_SYMBOL_SIZE if args.wan else 256
-    block_k = WAN_BLOCK_K if args.wan else 64
-    fec = args.fec if args.fec > 0 else (WAN_INITIAL_REPAIR_PCT if args.wan else 14)
-    active = WAN_ACTIVE_BYTES if args.wan else 4 << 20
-    rate = args.rate_mbit
-    if rate <= 0:
-        rate = 2500.0 if args.wan else 400.0
+    symbol, block_k, fec, active, rate = _wan_defaults(args.wan, args.fec, args.rate_mbit)
     session = ObjectSession()
 
     def feed() -> None:
@@ -67,14 +72,9 @@ def main_objserver(argv: list[str] | None = None) -> int:
 
     threading.Thread(target=feed, daemon=True).start()
     return run_object_server(
-        args.host,
-        args.port,
-        session,
-        symbol_size=symbol,
-        block_k=block_k,
-        initial_repair_pct=fec,
-        active_bytes=active,
-        rate_mbit=rate,
+        args.host, args.port, session,
+        symbol_size=symbol, block_k=block_k, initial_repair_pct=fec,
+        active_bytes=active, rate_mbit=rate,
     )
 
 
@@ -86,24 +86,10 @@ def main_objclient(argv: list[str] | None = None) -> int:
     p.add_argument("--wan", action="store_true")
     p.add_argument("--timeout", type=float, default=180.0)
     args = p.parse_args(argv)
-    active = WAN_ACTIVE_BYTES if args.wan else 4 << 20
     print(f"connecting object-mux to udp://{args.host}:{args.port}", flush=True)
     return run_object_client(
-        args.host,
-        args.port,
-        args.output,
+        args.host, args.port, args.output,
         wan=args.wan,
-        active_bytes=active,
+        active_bytes=WAN_ACTIVE_BYTES if args.wan else 4 << 20,
         timeout_s=args.timeout,
     )
-
-
-def write_manifest(folder: Path, dest: Path) -> None:
-    lines = []
-    for path in sorted(folder.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        rel = path.name
-        lines.append(f"{digest} {path.stat().st_size} {rel}")
-    dest.write_text("\n".join(sorted(lines)) + "\n")

@@ -1,14 +1,20 @@
-"""Pack many objects into a fixed-size RaptorQ block payload."""
+"""Object frames inside a RaptorQ block, plus packed-micro containers."""
 
 from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 
-# obj_id, byte offset, payload length, name length (0 on continuation).
 _FRAME = struct.Struct("!IQIB")
 FRAME_HDR = _FRAME.size
 _SIZE = struct.Struct("!Q")
+PACK_MAGIC = b"TNCK"
+PACK_NAME_PREFIX = "__pack_"
+_HDR = struct.Struct("!I")
+_ENT = struct.Struct("!HQ")
+SMALL_MAX = 256 * 1024
+PACK_MAX = 4 << 20
 
 
 def _name_bytes(name: str) -> bytes:
@@ -30,7 +36,6 @@ class ObjectChunk:
 
 
 def pack_block(block_bytes: int, chunks: list[ObjectChunk]) -> bytes:
-    """Serialize chunks into a padded block. Remaining space is zeros."""
     if block_bytes <= FRAME_HDR:
         raise ValueError("block too small for an object frame")
     buf = bytearray(block_bytes)
@@ -42,9 +47,7 @@ def pack_block(block_bytes: int, chunks: list[ObjectChunk]) -> bytes:
         need = FRAME_HDR + (0 if not name else _SIZE.size + len(name)) + len(chunk.data)
         if pos + need > block_bytes:
             raise ValueError("chunks overflow block")
-        _FRAME.pack_into(
-            buf, pos, chunk.obj_id, chunk.offset, len(chunk.data), len(name)
-        )
+        _FRAME.pack_into(buf, pos, chunk.obj_id, chunk.offset, len(chunk.data), len(name))
         pos += FRAME_HDR
         if name:
             _SIZE.pack_into(buf, pos, chunk.size & 0xFFFFFFFFFFFFFFFF)
@@ -57,17 +60,14 @@ def pack_block(block_bytes: int, chunks: list[ObjectChunk]) -> bytes:
 
 
 def unpack_block(block: bytes) -> list[ObjectChunk]:
-    """Parse frames until padding (length 0 or truncated header)."""
     out: list[ObjectChunk] = []
-    pos = 0
-    n = len(block)
+    pos, n = 0, len(block)
     while pos + FRAME_HDR <= n:
         obj_id, offset, length, nlen = _FRAME.unpack_from(block, pos)
         if length == 0 and obj_id == 0:
             break
         pos += FRAME_HDR
-        name = ""
-        size = 0
+        name, size = "", 0
         if nlen:
             if pos + _SIZE.size + nlen > n:
                 break
@@ -77,9 +77,7 @@ def unpack_block(block: bytes) -> list[ObjectChunk]:
             pos += nlen
         if length <= 0 or pos + length > n:
             break
-        out.append(
-            ObjectChunk(obj_id, offset, bytes(block[pos : pos + length]), name, size)
-        )
+        out.append(ObjectChunk(obj_id, offset, bytes(block[pos : pos + length]), name, size))
         pos += length
     return out
 
@@ -90,7 +88,6 @@ class ObjectCursor:
         self.name = name
         self.data = data
         self.pos = 0
-        self.announced = False
 
     @property
     def remaining(self) -> int:
@@ -102,46 +99,99 @@ class ObjectCursor:
 
 
 class BlockFill:
-    """Fill one block from a sequence of object cursors."""
-
     def __init__(self, block_bytes: int) -> None:
         self.block_bytes = block_bytes
         self.chunks: list[ObjectChunk] = []
         self._pos = 0
-        self.opened: list[ObjectCursor] = []
-        self.finished: list[ObjectCursor] = []
 
     def space(self) -> int:
         return self.block_bytes - self._pos
 
     def take(self, cursor: ObjectCursor) -> bool:
-        """Append as much of cursor as fits. Return True if any bytes taken."""
-        room = self.space()
         first = cursor.pos == 0
         hdr = frame_overhead(cursor.name if first else "")
+        room = self.space()
         if room <= hdr or cursor.done:
             return False
         n = min(cursor.remaining, room - hdr)
         if n <= 0:
             return False
-        if not cursor.announced:
-            self.opened.append(cursor)
-            cursor.announced = True
-        chunk = cursor.data[cursor.pos : cursor.pos + n]
         self.chunks.append(
             ObjectChunk(
                 cursor.obj_id,
                 cursor.pos,
-                chunk,
+                cursor.data[cursor.pos : cursor.pos + n],
                 cursor.name if first else "",
                 len(cursor.data) if first else 0,
             )
         )
         cursor.pos += n
         self._pos += hdr + n
-        if cursor.done:
-            self.finished.append(cursor)
         return True
 
     def packed(self) -> bytes:
         return pack_block(self.block_bytes, self.chunks)
+
+
+def pack_files(files: list[tuple[str, bytes]]) -> bytes:
+    buf = bytearray(PACK_MAGIC) + _HDR.pack(len(files))
+    for name, data in files:
+        raw = Path(name).name.encode("utf-8")[:255]
+        buf += _ENT.pack(len(raw), len(data)) + raw + data
+    return bytes(buf)
+
+
+def unpack_files(blob: bytes) -> list[tuple[str, bytes]]:
+    if not blob.startswith(PACK_MAGIC):
+        raise ValueError("not a tetrys object pack")
+    pos = len(PACK_MAGIC)
+    (count,) = _HDR.unpack_from(blob, pos)
+    pos += _HDR.size
+    out: list[tuple[str, bytes]] = []
+    for _ in range(count):
+        nlen, size = _ENT.unpack_from(blob, pos)
+        pos += _ENT.size
+        name = blob[pos : pos + nlen].decode("utf-8")
+        pos += nlen
+        out.append((name, blob[pos : pos + size]))
+        pos += size
+    return out
+
+
+def is_pack_name(name: str) -> bool:
+    return Path(name).name.startswith(PACK_NAME_PREFIX)
+
+
+def split_for_session(
+    files: list[tuple[str, bytes]],
+    *,
+    small_max: int = SMALL_MAX,
+    pack_max: int = PACK_MAX,
+    pack_start: int = 0,
+) -> list[tuple[str, bytes]]:
+    objects: list[tuple[str, bytes]] = []
+    batch: list[tuple[str, bytes]] = []
+    batch_bytes = 0
+    pack_i = pack_start
+
+    def flush() -> None:
+        nonlocal pack_i, batch_bytes
+        if not batch:
+            return
+        objects.append((f"{PACK_NAME_PREFIX}{pack_i:04d}.tnck", pack_files(batch)))
+        pack_i += 1
+        batch.clear()
+        batch_bytes = 0
+
+    for name, data in files:
+        if len(data) > small_max:
+            flush()
+            objects.append((name, data))
+            continue
+        extra = 2 + 8 + min(255, len(Path(name).name.encode("utf-8"))) + len(data)
+        if batch and batch_bytes + extra > pack_max:
+            flush()
+        batch.append((name, data))
+        batch_bytes += extra
+    flush()
+    return objects

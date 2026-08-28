@@ -50,7 +50,6 @@ from tetrys_nc.block_xfer import (
     run_block_server,
 )
 from tetrys_nc.gen_raptor import GenEncoder, GenReceiveSlot
-from tetrys_nc.packets import parse_packet
 
 
 def test_v2_wire_roundtrips_and_rejects_v1():
@@ -114,11 +113,11 @@ def test_completion_ranges_are_compact_and_rotate():
     assert first != second
 
 
-def test_parse_packet_dispatches_v2_and_rejects_unknown_version():
+def test_parse_v2_rejects_unknown_version():
     ready = BlockReadyV2(9, 64 << 20).pack()
-    assert parse_packet(ready) == BlockReadyV2(9, 64 << 20)
+    assert parse_v2_packet(ready) == BlockReadyV2(9, 64 << 20)
     with pytest.raises(ValueError):
-        parse_packet(b"\x54\x09\x30\x00" + bytes(8))
+        parse_v2_packet(b"\x54\x09\x30\x00" + bytes(8))
 
 
 def test_feedback_state_is_idempotent_and_monotonic():
