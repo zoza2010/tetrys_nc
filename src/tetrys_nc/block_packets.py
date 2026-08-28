@@ -26,6 +26,9 @@ class BlockPacketType(IntEnum):
     DATA = 0x32
     FEEDBACK = 0x33
     FIN = 0x34
+    OBJ_OPEN = 0x35
+    OBJ_FIN = 0x36
+    OBJ_RESET = 0x37
 
 
 @dataclass(slots=True, frozen=True)
@@ -245,6 +248,90 @@ class BlockFinV2:
         )
 
 
+MUX_META_NAME = "__objects__"
+
+
+@dataclass(slots=True)
+class ObjectOpenV2:
+    session_id: int
+    obj_id: int
+    size: int
+    name: str
+
+    def pack(self) -> bytes:
+        name = self.name.encode("utf-8")[:255]
+        return (
+            _HDR.pack(MAGIC, VERSION, BlockPacketType.OBJ_OPEN, 0, self.session_id)
+            + struct.pack(
+                "!IQB",
+                self.obj_id & 0xFFFFFFFF,
+                self.size & 0xFFFFFFFFFFFFFFFF,
+                len(name),
+            )
+            + name
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> ObjectOpenV2:
+        _require(data, 21, BlockPacketType.OBJ_OPEN)
+        session = struct.unpack_from("!I", data, 4)[0]
+        obj_id, size, nlen = struct.unpack_from("!IQB", data, 8)
+        if len(data) < 21 + nlen:
+            raise ValueError("v2 OBJ_OPEN truncated")
+        name = data[21 : 21 + nlen].decode("utf-8")
+        return cls(session, obj_id, size, name)
+
+
+@dataclass(slots=True)
+class ObjectFinV2:
+    session_id: int
+    obj_id: int
+    size: int
+    name: str = ""
+
+    def pack(self) -> bytes:
+        name = self.name.encode("utf-8")[:255]
+        return (
+            _HDR.pack(MAGIC, VERSION, BlockPacketType.OBJ_FIN, 0, self.session_id)
+            + struct.pack(
+                "!IQB",
+                self.obj_id & 0xFFFFFFFF,
+                self.size & 0xFFFFFFFFFFFFFFFF,
+                len(name),
+            )
+            + name
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> ObjectFinV2:
+        _require(data, 21, BlockPacketType.OBJ_FIN)
+        session = struct.unpack_from("!I", data, 4)[0]
+        obj_id, size, nlen = struct.unpack_from("!IQB", data, 8)
+        if len(data) < 21 + nlen:
+            raise ValueError("v2 OBJ_FIN truncated")
+        name = data[21 : 21 + nlen].decode("utf-8")
+        return cls(session, obj_id, size, name)
+
+
+@dataclass(slots=True)
+class ObjectResetV2:
+    session_id: int
+    obj_id: int
+
+    def pack(self) -> bytes:
+        return _HDR.pack(
+            MAGIC, VERSION, BlockPacketType.OBJ_RESET, 0, self.session_id
+        ) + struct.pack("!I", self.obj_id & 0xFFFFFFFF)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> ObjectResetV2:
+        _require(data, 12, BlockPacketType.OBJ_RESET)
+        return cls(
+            struct.unpack_from("!I", data, 4)[0],
+            struct.unpack_from("!I", data, 8)[0],
+        )
+
+
 def parse_v2_packet(data: bytes):
     if len(data) < 8 or data[0] != MAGIC or data[1] != VERSION:
         raise ValueError("not a v2 packet")
@@ -258,6 +345,9 @@ def parse_v2_packet(data: bytes):
         BlockPacketType.DATA: BlockDataV2,
         BlockPacketType.FEEDBACK: BlockFeedbackV2,
         BlockPacketType.FIN: BlockFinV2,
+        BlockPacketType.OBJ_OPEN: ObjectOpenV2,
+        BlockPacketType.OBJ_FIN: ObjectFinV2,
+        BlockPacketType.OBJ_RESET: ObjectResetV2,
     }[kind]
     return cls.unpack(data)
 

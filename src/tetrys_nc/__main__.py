@@ -14,6 +14,10 @@ def main() -> int:
             "  python -m tetrys_nc genfile --output PATH [--size 1G]\n"
             "  python -m tetrys_nc netem --listen 127.0.0.1:7495 --forward 127.0.0.1:7494 --profile spain\n"
             "  python -m tetrys_nc encbench [--k 96] [--seconds 8]\n"
+            "  python -m tetrys_nc objserver --early DIR [--late DIR] [--wan] [--port 7494]\n"
+            "  python -m tetrys_nc objclient --output DIR [--host HOST --port 7494] [--wan]\n"
+            "  python -m tetrys_nc treeserver --dir DIR [--wan] [--port 7494]\n"
+            "  python -m tetrys_nc treeclient --output DIR [--host HOST --port 7494] [--wan]\n"
         )
         return 0
     cmd = sys.argv[1]
@@ -34,6 +38,22 @@ def main() -> int:
         from .netem_udp import main as netem_main
 
         return netem_main(argv)
+    if cmd == "objserver":
+        from .object_cli import main_objserver
+
+        return main_objserver(argv)
+    if cmd == "objclient":
+        from .object_cli import main_objclient
+
+        return main_objclient(argv)
+    if cmd == "treeserver":
+        from .tree_cli import main_treeserver
+
+        return main_treeserver(argv)
+    if cmd == "treeclient":
+        from .tree_cli import main_treeclient
+
+        return main_treeclient(argv)
     if cmd == "encbench":
         from .encbench import main as encbench_main
 
