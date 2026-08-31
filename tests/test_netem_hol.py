@@ -17,7 +17,7 @@ def _progress_done(log: str) -> list[tuple[int, int]]:
     """(gens_sent, client_done) from server progress lines."""
     out: list[tuple[int, int]] = []
     for m in re.finditer(
-        r"v2 progress sent=(\d+)/\d+ done=(\d+)", log
+        r"progress sent=(\d+)/\d+ done=(\d+)", log
     ):
         out.append((int(m.group(1)), int(m.group(2))))
     return out
@@ -47,8 +47,7 @@ def test_hol_stall_profile_does_not_freeze_blast(tmp_path: Path) -> None:
         [
             sys.executable,
             "-m",
-            "tetrys_nc",
-            "genfile",
+            "sim.genfile",
             "--output",
             str(blob),
             "--size",

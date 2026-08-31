@@ -128,8 +128,7 @@ def test_wan_profiles_transfer_8m(tmp_path: Path, profile: str) -> None:
             [
                 sys.executable,
                 "-m",
-                "tetrys_nc",
-                "genfile",
+                "sim.genfile",
                 "--output",
                 str(blob),
                 "--size",

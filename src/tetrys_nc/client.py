@@ -1,4 +1,4 @@
-"""Reorder-insensitive RaptorQ block transfer v2 client."""
+"""RaptorQ UDP file client."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from .block_xfer import run_block_client
 
 
 def run_client(host: str, port: int, output: Path, wan: bool = False) -> int:
-    print(f"connecting v2 to udp://{host}:{port}" + (" (wan buffers)" if wan else ""))
+    print(f"connecting to udp://{host}:{port}" + (" (wan buffers)" if wan else ""))
     return run_block_client(host, port, output, wan=wan)
 
 

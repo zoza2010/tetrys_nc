@@ -136,8 +136,7 @@ def main() -> int:
             [
                 sys.executable,
                 "-m",
-                "tetrys_nc",
-                "genfile",
+                "sim.genfile",
                 "--output",
                 str(blob),
                 "--size",

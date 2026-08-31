@@ -11,7 +11,6 @@ dependencies = [
 [project.scripts]
 tetrys-server = "tetrys_nc.server:main"
 tetrys-client = "tetrys_nc.client:main"
-tetrys-genfile = "tetrys_nc.genfile:main"
 
 [build-system]
 requires = ["hatchling"]

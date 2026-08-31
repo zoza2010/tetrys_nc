@@ -1,4 +1,4 @@
-"""Version 2 reorder-insensitive block transfer wire protocol."""
+"""Block transfer wire protocol."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class OpenBlock:
 
 
 @dataclass(slots=True)
-class BlockReadyV2:
+class BlockReady:
     session_id: int
     active_bytes: int
 
@@ -49,13 +49,13 @@ class BlockReadyV2:
         ) + struct.pack("!I", self.active_bytes & 0xFFFFFFFF)
 
     @classmethod
-    def unpack(cls, data: bytes) -> BlockReadyV2:
+    def unpack(cls, data: bytes) -> BlockReady:
         _require(data, 12, BlockPacketType.READY)
         return cls(struct.unpack_from("!I", data, 4)[0], struct.unpack_from("!I", data, 8)[0])
 
 
 @dataclass(slots=True)
-class BlockMetaV2:
+class BlockMeta:
     session_id: int
     file_size: int
     file_name: str
@@ -86,7 +86,7 @@ class BlockMetaV2:
         )
 
     @classmethod
-    def unpack(cls, data: bytes) -> BlockMetaV2:
+    def unpack(cls, data: bytes) -> BlockMeta:
         _require(data, 27, BlockPacketType.META)
         session = struct.unpack_from("!I", data, 4)[0]
         file_size, symbol_size, block_k, fec, active_bytes, nlen, dlen = (
@@ -94,7 +94,7 @@ class BlockMetaV2:
         )
         off = 27
         if len(data) < off + nlen + dlen:
-            raise ValueError("v2 META strings truncated")
+            raise ValueError("META strings truncated")
         name = data[off : off + nlen].decode("utf-8")
         off += nlen
         digest = data[off : off + dlen].decode("ascii")
@@ -102,7 +102,7 @@ class BlockMetaV2:
 
 
 @dataclass(slots=True)
-class BlockDataV2:
+class BlockData:
     session_id: int
     block_id: int
     esi: int
@@ -117,7 +117,7 @@ class BlockDataV2:
         )
 
     @classmethod
-    def unpack(cls, data: bytes) -> BlockDataV2:
+    def unpack(cls, data: bytes) -> BlockData:
         _require(data, 20, BlockPacketType.DATA)
         session = struct.unpack_from("!I", data, 4)[0]
         block_id, esi, stamp = _DATA.unpack_from(data, 8)
@@ -131,7 +131,7 @@ def pack_data_packets(
     first_esi: int = 0,
     send_ts_us: int = 0,
 ) -> list[bytes]:
-    """Pack DATA datagrams without allocating BlockDataV2 per symbol."""
+    """Pack DATA datagrams without allocating BlockData per symbol."""
     sid = session_id & 0xFFFFFFFF
     bid = block_id & 0xFFFFFFFF
     stamp = send_ts_us & 0xFFFFFFFF
@@ -146,7 +146,7 @@ def pack_data_packets(
 
 
 @dataclass(slots=True)
-class BlockFeedbackV2:
+class BlockFeedback:
     session_id: int
     feedback_id: int
     unique_payload_bytes: int
@@ -187,27 +187,27 @@ class BlockFeedbackV2:
             MAGIC, VERSION, BlockPacketType.FEEDBACK, 0, self.session_id
         ) + body
         if len(out) > MAX_DATAGRAM:
-            raise ValueError("v2 feedback exceeds one datagram")
+            raise ValueError("feedback exceeds one datagram")
         return out
 
     @classmethod
-    def unpack(cls, data: bytes) -> BlockFeedbackV2:
+    def unpack(cls, data: bytes) -> BlockFeedback:
         _require(data, 36, BlockPacketType.FEEDBACK)
         session = struct.unpack_from("!I", data, 4)[0]
         feedback_id, unique, decoded, echo, nranges, nopen = _FB_BASE.unpack_from(
             data, 8
         )
         if nranges > MAX_DONE_RANGES or nopen > MAX_OPEN_BLOCKS:
-            raise ValueError("v2 feedback count out of bounds")
+            raise ValueError("feedback count out of bounds")
         off = 36
         need = off + nranges * _RANGE.size + nopen * _OPEN.size
         if len(data) < need:
-            raise ValueError("v2 feedback truncated")
+            raise ValueError("feedback truncated")
         ranges: list[tuple[int, int]] = []
         for _ in range(nranges):
             start, count = _RANGE.unpack_from(data, off)
             if count <= 0 or count > MAX_RANGE_SPAN:
-                raise ValueError("v2 done range too large")
+                raise ValueError("done range too large")
             ranges.append((start, count))
             off += _RANGE.size
         opened: list[OpenBlock] = []
@@ -227,7 +227,7 @@ class BlockFeedbackV2:
 
 
 @dataclass(slots=True)
-class BlockFinV2:
+class BlockFin:
     session_id: int
     total_blocks: int
     ok: bool = True
@@ -238,7 +238,7 @@ class BlockFinV2:
         ) + struct.pack("!I", self.total_blocks)
 
     @classmethod
-    def unpack(cls, data: bytes) -> BlockFinV2:
+    def unpack(cls, data: bytes) -> BlockFin:
         _require(data, 12, BlockPacketType.FIN)
         return cls(
             struct.unpack_from("!I", data, 4)[0],
@@ -265,12 +265,12 @@ def _unpack_obj_named(cls, data: bytes, kind: BlockPacketType):
     session = struct.unpack_from("!I", data, 4)[0]
     obj_id, size, nlen = _OBJ_NAMED.unpack_from(data, 8)
     if len(data) < 21 + nlen:
-        raise ValueError(f"v2 {kind.name} truncated")
+        raise ValueError(f"{kind.name} truncated")
     return cls(session, obj_id, size, data[21 : 21 + nlen].decode("utf-8"))
 
 
 @dataclass(slots=True)
-class ObjectOpenV2:
+class ObjectOpen:
     session_id: int
     obj_id: int
     size: int
@@ -282,12 +282,12 @@ class ObjectOpenV2:
         )
 
     @classmethod
-    def unpack(cls, data: bytes) -> ObjectOpenV2:
+    def unpack(cls, data: bytes) -> ObjectOpen:
         return _unpack_obj_named(cls, data, BlockPacketType.OBJ_OPEN)
 
 
 @dataclass(slots=True)
-class ObjectFinV2:
+class ObjectFin:
     session_id: int
     obj_id: int
     size: int
@@ -299,25 +299,25 @@ class ObjectFinV2:
         )
 
     @classmethod
-    def unpack(cls, data: bytes) -> ObjectFinV2:
+    def unpack(cls, data: bytes) -> ObjectFin:
         return _unpack_obj_named(cls, data, BlockPacketType.OBJ_FIN)
 
 
-def parse_v2_packet(data: bytes):
+def parse_packet(data: bytes):
     if len(data) < 8 or data[0] != MAGIC or data[1] != VERSION:
-        raise ValueError("not a v2 packet")
+        raise ValueError("not a tetrys packet")
     try:
         kind = BlockPacketType(data[2])
     except ValueError as exc:
-        raise ValueError(f"unknown v2 packet type {data[2]}") from exc
+        raise ValueError(f"unknown packet type {data[2]}") from exc
     cls = {
-        BlockPacketType.META: BlockMetaV2,
-        BlockPacketType.READY: BlockReadyV2,
-        BlockPacketType.DATA: BlockDataV2,
-        BlockPacketType.FEEDBACK: BlockFeedbackV2,
-        BlockPacketType.FIN: BlockFinV2,
-        BlockPacketType.OBJ_OPEN: ObjectOpenV2,
-        BlockPacketType.OBJ_FIN: ObjectFinV2,
+        BlockPacketType.META: BlockMeta,
+        BlockPacketType.READY: BlockReady,
+        BlockPacketType.DATA: BlockData,
+        BlockPacketType.FEEDBACK: BlockFeedback,
+        BlockPacketType.FIN: BlockFin,
+        BlockPacketType.OBJ_OPEN: ObjectOpen,
+        BlockPacketType.OBJ_FIN: ObjectFin,
     }[kind]
     return cls.unpack(data)
 
@@ -356,7 +356,7 @@ def ranges_to_block_ids(ranges: list[tuple[int, int]]) -> list[int]:
     out: list[int] = []
     for start, count in ranges:
         if count <= 0 or count > MAX_RANGE_SPAN:
-            raise ValueError("v2 done range too large")
+            raise ValueError("done range too large")
         out.extend(range(start, start + count))
     return out
 
@@ -368,4 +368,4 @@ def _require(data: bytes, size: int, kind: BlockPacketType) -> None:
         or data[1] != VERSION
         or data[2] != int(kind)
     ):
-        raise ValueError(f"invalid v2 {kind.name} packet")
+        raise ValueError(f"invalid {kind.name} packet")

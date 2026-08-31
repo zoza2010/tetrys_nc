@@ -1,3 +1,3 @@
-"""tetrys_nc — generation RaptorQ file transfer over UDP."""
+"""tetrys_nc — RaptorQ UDP file transfer."""
 
 __version__ = "0.1.0"

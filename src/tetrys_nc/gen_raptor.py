@@ -33,13 +33,6 @@ def blast_repair_budget(k: int, overhead_pct: int) -> int:
     return repair_count(k, overhead_pct)
 
 
-def fountain_blast_budget(k: int, target_pct: int = 8) -> int:
-    """Per-gen repair bundled with systematic when overhead_pct=0 (fountain mode)."""
-    if k <= 0 or target_pct <= 0:
-        return 0
-    return repair_count(k, target_pct)
-
-
 @dataclass
 class GenEncoder:
     """Encode one file generation; can emit more repair on demand."""

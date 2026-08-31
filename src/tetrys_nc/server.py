@@ -1,16 +1,16 @@
-"""Reorder-insensitive RaptorQ block transfer v2 server."""
+"""RaptorQ UDP file server."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from .block_state import WAN_INITIAL_REPAIR_PCT
+from .block_state import WAN_INITIAL_REPAIR_PCT, WAN_PACE_CAP_MBIT
 from .block_xfer import run_block_server
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="RaptorQ block transfer v2 UDP server")
+    p = argparse.ArgumentParser(description="RaptorQ UDP file server")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--file", type=Path, required=True)
@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         dest="rate_mbit",
-        help="safety-ceiling UDP send rate in Mbit/s (alias: --rate). WAN default 2500; BBR sets pace from BtlBw with a 200 Mbit floor",
+        help="UDP send rate in Mbit/s (alias: --rate). WAN default follows --wan cap (850)",
     )
     p.add_argument(
         "--ramp-s",
@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
     rate = args.rate_mbit
     if args.wan and rate <= 0:
-        rate = 2500.0
+        rate = WAN_PACE_CAP_MBIT
     elif rate <= 0:
         rate = 1500.0
     if args.gen_overhead is not None:

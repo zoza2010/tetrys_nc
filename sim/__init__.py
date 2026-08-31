@@ -1,1 +1,1 @@
-"""Network simulators and benches (not the transfer path)."""
+"""Test helpers: netem, encode bench, blob generator (not the transfer path)."""

@@ -8,7 +8,7 @@ alwaysApply: true
 - **Commit**: `53ce5f6bdbb8c1c1737e170e40e24a08e18358fb` (`Raise WAN FEC floor to 24% so first-pass covers dirty-run p90 loss.`)
 - Live CLI is **v2 only** (`server.py` / `client.py` → `block_xfer.py`). Matched client+server on Russia↔Spain UDP **7494**.
 - User marked this as the WAN baseline: goodput is **stable across times of day** (~78–80 MiB/s skip-hash 2 GiB). Prefer incremental changes **on top of this commit**.
-- Geometry/pace: K=768, T=1350, 64 MiB window, **start=min=cap 850 Mbit**, FEC **24%** fixed, `--ramp-s 0`. `AckPacer` does not move pace while min=max.
+- Geometry/pace: K=768, T=1350, 64 MiB window, **start=min=cap 850 Mbit**, FEC **24%** fixed, `--ramp-s 0`. Pace is a locked RateLimiter; unused BBR AckPacer was removed.
 - Typical matched 5×2 GiB: median **~79 MiB/s**, min **~78 MiB/s**, `first_close` 97–99%, `source_wire` ~2587 MiB, `pace_p10=med=max=850`.
 - If a change regresses below ~75 MiB/s, widens run-to-run spread, or causes freezes/tail storms, revert toward this SHA before stacking more experiments.
 - Do **not** treat later FEC/AIMD/forecast/GRO experiments as safer without a fresh matched A/B vs this SHA.

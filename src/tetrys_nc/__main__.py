@@ -1,4 +1,4 @@
-"""python -m tetrys_nc {server|client|genfile} ..."""
+"""python -m tetrys_nc {server|client|objserver|objclient} ..."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ def main() -> int:
             "usage:\n"
             "  python -m tetrys_nc server --file PATH [--port 9000] [--wan] [--gen-k 768]\n"
             "  python -m tetrys_nc client --output PATH [--host HOST --port 9000]\n"
-            "  python -m tetrys_nc genfile --output PATH [--size 1G]\n"
             "  python -m tetrys_nc objserver --early DIR [--late DIR] [--wan] [--port 7494]\n"
             "  python -m tetrys_nc objclient --output DIR [--host HOST --port 7494] [--wan]\n"
         )
@@ -26,10 +25,6 @@ def main() -> int:
         from .client import main as client_main
 
         return client_main(argv)
-    if cmd == "genfile":
-        from .genfile import main as gen_main
-
-        return gen_main(argv)
     if cmd == "objserver":
         from .object_cli import main_objserver
 

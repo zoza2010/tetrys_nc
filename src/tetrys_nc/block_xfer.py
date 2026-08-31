@@ -1,4 +1,4 @@
-"""Reorder-insensitive RaptorQ block transfer v2."""
+"""RaptorQ block transfer over UDP."""
 
 from __future__ import annotations
 
@@ -17,17 +17,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .block_packets import (
-    BlockDataV2,
-    BlockFeedbackV2,
-    BlockFinV2,
-    BlockMetaV2,
-    BlockReadyV2,
+    BlockData,
+    BlockFeedback,
+    BlockFin,
+    BlockMeta,
+    BlockReady,
     OpenBlock,
     pack_data_packets,
-    parse_v2_packet,
+    parse_packet,
 )
 from .block_state import (
-    AckPacer,
     BlockGeometry,
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
@@ -134,7 +133,7 @@ def encode_block_job(
     overhead_pct: int,
     session_id: int,
 ) -> tuple[int, list[bytes], int, float]:
-    """Worker: mmap offset → RaptorQ packets already wrapped as v2 DATA wires."""
+    """Worker: mmap offset → RaptorQ packets already wrapped as DATA wires."""
     mm = _worker_open(path)
     off = block_id * block_bytes
     tlen = min(block_bytes, max(0, file_size - off))
@@ -236,7 +235,7 @@ def run_block_server(
     sock.bind((host, port))
     sock.setblocking(False)
     print(
-        f"v2 server udp://{host}:{port} file={file_path.name} size={file_size} "
+        f"server udp://{host}:{port} file={file_path.name} size={file_size} "
         f"blocks={total_blocks} K={block_k} T={symbol_size} "
         f"block={geometry.block_bytes / 1048576:.2f}MiB active={geometry.active_blocks} "
         f"start={start_bps * 8 / 1e6:.0f}Mbit min={min_bps * 8 / 1e6:.0f}Mbit "
@@ -254,10 +253,10 @@ def run_block_server(
             continue
         try:
             raw, addr = sock.recvfrom(2048)
-            packet = parse_v2_packet(raw)
+            packet = parse_packet(raw)
         except (BlockingIOError, ValueError):
             continue
-        if isinstance(packet, BlockReadyV2):
+        if isinstance(packet, BlockReady):
             client = addr
             session_id = packet.session_id
             geometry.active_bytes = min(
@@ -266,9 +265,9 @@ def run_block_server(
             prefetch_depth = min(64, max(geometry.active_blocks, 32))
     if client is None:
         sock.close()
-        raise TimeoutError("v2 server timed out waiting for READY")
+        raise TimeoutError("server timed out waiting for READY")
 
-    meta = BlockMetaV2(
+    meta = BlockMeta(
         session_id,
         file_size,
         file_path.name,
@@ -284,12 +283,6 @@ def run_block_server(
     feedback = SenderFeedbackState(session_id)
     stop = threading.Event()
     client_fin = threading.Event()
-    pacer = AckPacer(
-        min_bps=min_bps,
-        max_bps=max_bps,
-        offer_bps=start_bps,
-        fec_frac=initial_repair_pct / 100.0,
-    )
     limiter = RateLimiter(
         max_bps, start_bps=start_bps, min_frac=min_bps / max_bps
     )
@@ -307,17 +300,13 @@ def run_block_server(
                 except BlockingIOError:
                     break
                 try:
-                    packet = parse_v2_packet(raw)
+                    packet = parse_packet(raw)
                 except ValueError:
                     continue
-                if isinstance(packet, BlockFeedbackV2):
-                    if feedback.apply(packet):
-                        rate = pacer.update(
-                            packet.unique_payload_bytes, time.monotonic()
-                        )
-                        limiter.set_rate(rate)
+                if isinstance(packet, BlockFeedback):
+                    feedback.apply(packet)
                 elif (
-                    isinstance(packet, BlockFinV2)
+                    isinstance(packet, BlockFin)
                     and packet.session_id == session_id
                     and packet.ok
                 ):
@@ -409,7 +398,6 @@ def run_block_server(
             # Tail repair storms must not train primary FEC for later blocks.
             if not tail:
                 repair_ctl.observe(extra, block_k)
-                pacer.fec_frac = repair_ctl.current / 100.0
                 extra_win.observe(extra > 0)
                 extra_frac_samples.append(extra / max(1, block_k))
                 if extra == 0:
@@ -521,7 +509,6 @@ def run_block_server(
                     if tail and tail_started is None:
                         tail_started = now
                     reap_completed(completed, tail=tail)
-                    pacer.repair_busy = extra_win.pressure(tail)
                     submit_ahead()
 
                     admitted = False
@@ -570,19 +557,14 @@ def run_block_server(
                         )
                         pace_samples.append(limiter.rate * 8 / 1e6)
                         print(
-                            f"v2 progress sent={next_block}/{total_blocks} "
+                            f"progress sent={next_block}/{total_blocks} "
                             f"done={len(completed)} active={len(active)} "
                             f"ready={len(ready)} inflight={len(inflight)} "
                             f"open={len(opened)} fec={repair_ctl.current}% "
                             f"close={close_pct:.0f}% "
                             f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
-                            f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} "
-                            f"cc={pacer.mode} "
                             f"xfrac={extra_win.frac * 100:.0f}% "
                             f"loss_p50={((percentile(loss_samples, 50) or 0.0) * 100):.1f}% "
-                            f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
-                            f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
-                            f"dt={pacer.last_dt:.2f}s "
                             f"ack={unique_rx / elapsed / 1048576:.1f} "
                             f"inst={inst_unique / 1048576:.1f} "
                             f"app={decoded / elapsed / 1048576:.1f}MiB/s "
@@ -600,11 +582,11 @@ def run_block_server(
                         last_log = now
 
                     if next_block >= total_blocks:
-                        sock.sendto(BlockFinV2(session_id, total_blocks).pack(), client)
+                        sock.sendto(BlockFin(session_id, total_blocks).pack(), client)
                     if len(completed) >= total_blocks:
                         for _ in range(16):
                             sock.sendto(
-                                BlockFinV2(session_id, total_blocks).pack(), client
+                                BlockFin(session_id, total_blocks).pack(), client
                             )
                         break
                     if next_block >= total_blocks and not active:
@@ -645,7 +627,7 @@ def run_block_server(
     def _pct(val: float | None) -> str:
         return "n/a" if val is None else f"{val * 100:.1f}%"
     print(
-        f"v2 done in {elapsed:.2f}s — goodput "
+        f"done in {elapsed:.2f}s — goodput "
         f"{file_size / elapsed / 1048576:.2f} MiB/s — "
         f"source_wire={source_wire_total / 1048576:.1f}MiB "
         f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
@@ -653,14 +635,7 @@ def run_block_server(
         f"xfrac={extra_win.frac * 100:.0f}% "
         f"loss_p50={_pct(loss_p50)} p90={_pct(loss_p90)} p99={_pct(loss_p99)} "
         f"extra_p50={_pct(extra_p50)} p90={_pct(extra_p90)} "
-        f"fec={repair_ctl.current}% tail={tail_s:.2f}s "
-        f"weak={pacer.weak_events} cuts={pacer.cut_events} "
-        f"held_repair={pacer.held_repair_events} "
-        f"backoff={pacer.backoff_events} probe={pacer.probe_events} "
-        f"btlbw={pacer.btlbw_bps * 8 / 1e6:.0f} cc={pacer.mode} "
-        f"ewma={pacer.ewma_bps * 8 / 1e6:.0f} "
-        f"sample={pacer.last_sample_bps * 8 / 1e6:.0f} "
-        f"dt={pacer.last_dt:.2f}s {pace_txt}",
+        f"fec={repair_ctl.current}% tail={tail_s:.2f}s {pace_txt}",
         flush=True,
     )
     return 0
@@ -681,11 +656,11 @@ def run_block_client(
     sock.setblocking(False)
     server = (host, port)
     session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
-    ready = BlockReadyV2(session_id, active_bytes).pack()
+    ready = BlockReady(session_id, active_bytes).pack()
     for _ in range(8):
         sock.sendto(ready, server)
 
-    meta: BlockMetaV2 | None = None
+    meta: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
     while meta is None and time.monotonic() < deadline:
         readable, _, _ = select.select([sock], [], [], 0.5)
@@ -694,19 +669,19 @@ def run_block_client(
             continue
         try:
             raw, _ = sock.recvfrom(4096)
-            packet = parse_v2_packet(raw)
+            packet = parse_packet(raw)
         except (BlockingIOError, ValueError):
             continue
-        if isinstance(packet, BlockMetaV2) and packet.session_id == session_id:
+        if isinstance(packet, BlockMeta) and packet.session_id == session_id:
             meta = packet
     if meta is None:
         sock.close()
-        raise TimeoutError("v2 client timed out waiting for META")
+        raise TimeoutError("client timed out waiting for META")
 
     geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
     total_blocks = geometry.total_blocks(meta.file_size)
     print(
-        f"v2 META name={meta.file_name} size={meta.file_size} "
+        f"META name={meta.file_name} size={meta.file_size} "
         f"blocks={total_blocks} K={meta.block_k} T={meta.symbol_size} "
         f"fec={meta.initial_repair_pct}%",
         flush=True,
@@ -744,7 +719,7 @@ def run_block_client(
             for block_id, slot in sorted(slots.items())
             if block_id not in done
         ][:64]
-        packet = BlockFeedbackV2(
+        packet = BlockFeedback(
             session_id,
             feedback_id,
             unique_payload_bytes,
@@ -766,12 +741,12 @@ def run_block_client(
                     batch = []
                 for raw in batch:
                     try:
-                        packet = parse_v2_packet(raw)
+                        packet = parse_packet(raw)
                     except ValueError:
                         continue
                     if getattr(packet, "session_id", None) != session_id:
                         continue
-                    if isinstance(packet, BlockDataV2):
+                    if isinstance(packet, BlockData):
                         block_id = packet.block_id
                         if block_id >= total_blocks or block_id in done:
                             continue
@@ -802,14 +777,14 @@ def run_block_client(
                             slot.close()
                             slots.pop(block_id, None)
                             slot_seen.pop(block_id, None)
-                    elif isinstance(packet, BlockFinV2):
+                    elif isinstance(packet, BlockFin):
                         fin_seen = True
             send_feedback()
             now = time.monotonic()
             if now - last_log >= 1.0:
                 elapsed = max(now - t0, 1e-6)
                 print(
-                    f"v2 progress {len(done)}/{total_blocks} "
+                    f"progress {len(done)}/{total_blocks} "
                     f"({100.0 * len(done) / total_blocks:.1f}%) "
                     f"open={len(slots)} unique={unique_payload_bytes / elapsed / 1048576:.1f} "
                     f"app={decoded_bytes / elapsed / 1048576:.1f}MiB/s "
@@ -819,7 +794,7 @@ def run_block_client(
                 last_log = now
         send_feedback(force=True)
         for _ in range(16):
-            sock.sendto(BlockFinV2(session_id, total_blocks).pack(), server)
+            sock.sendto(BlockFin(session_id, total_blocks).pack(), server)
             time.sleep(0.005)
     finally:
         for slot in slots.values():
@@ -831,9 +806,9 @@ def run_block_client(
     if meta.sha256_hex:
         got = _hash_file(output)
         if got != meta.sha256_hex:
-            raise ValueError("v2 output hash mismatch")
+            raise ValueError("output hash mismatch")
     print(
-        f"v2 OK: wrote {output} ({meta.file_size} bytes) in {elapsed:.2f}s "
+        f"OK: wrote {output} ({meta.file_size} bytes) in {elapsed:.2f}s "
         f"({meta.file_size / elapsed / 1048576:.2f} MiB/s) fin={fin_seen}",
         flush=True,
     )

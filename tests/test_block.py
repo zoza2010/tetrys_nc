@@ -13,18 +13,17 @@ import pytest
 pytest.importorskip("raptorq")
 
 from tetrys_nc.block_packets import (
-    BlockDataV2,
-    BlockFeedbackV2,
-    BlockFinV2,
-    BlockMetaV2,
-    BlockReadyV2,
+    BlockData,
+    BlockFeedback,
+    BlockFin,
+    BlockMeta,
+    BlockReady,
     OpenBlock,
     block_ids_to_ranges,
     pack_data_packets,
-    parse_v2_packet,
+    parse_packet,
 )
 from tetrys_nc.block_state import (
-    AckPacer,
     BlockGeometry,
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
@@ -52,12 +51,12 @@ from tetrys_nc.block_xfer import (
 from tetrys_nc.gen_raptor import GenEncoder, GenReceiveSlot
 
 
-def test_v2_wire_roundtrips_and_rejects_v1():
+def test_wire_roundtrips_and_rejects_wrong_version():
     packets = [
-        BlockReadyV2(9, 64 << 20),
-        BlockMetaV2(9, 1234, "blob.bin", 1350, 768, 14, 64 << 20, "ab"),
-        BlockDataV2(9, 7, 3, b"x" * 100, 55),
-        BlockFeedbackV2(
+        BlockReady(9, 64 << 20),
+        BlockMeta(9, 1234, "blob.bin", 1350, 768, 14, 64 << 20, "ab"),
+        BlockData(9, 7, 3, b"x" * 100, 55),
+        BlockFeedback(
             9,
             4,
             1000,
@@ -66,16 +65,16 @@ def test_v2_wire_roundtrips_and_rejects_v1():
             [1, 3],
             [OpenBlock(7, 700), OpenBlock(8, 770, True)],
         ),
-        BlockFinV2(9, 20),
+        BlockFin(9, 20),
     ]
     for packet in packets:
-        assert parse_v2_packet(packet.pack()) == packet
+        assert parse_packet(packet.pack()) == packet
     with pytest.raises(ValueError):
-        parse_v2_packet(b"\x54\x01\x20\x00" + bytes(20))
+        parse_packet(b"\x54\x01\x20\x00" + bytes(20))
 
 
-def test_v2_feedback_ranges_fit_in_one_datagram():
-    sequential = BlockFeedbackV2(
+def test_feedback_ranges_fit_in_one_datagram():
+    sequential = BlockFeedback(
         3,
         1,
         0,
@@ -85,10 +84,10 @@ def test_v2_feedback_ranges_fit_in_one_datagram():
     )
     wire = sequential.pack()
     assert len(wire) <= 1400
-    got = BlockFeedbackV2.unpack(wire)
+    got = BlockFeedback.unpack(wire)
     assert got.done_blocks == list(range(2000))
     assert len(got.open_blocks or []) == 64
-    sparse = BlockFeedbackV2(
+    sparse = BlockFeedback(
         3,
         2,
         0,
@@ -98,10 +97,10 @@ def test_v2_feedback_ranges_fit_in_one_datagram():
     )
     sparse_wire = sparse.pack()
     assert len(sparse_wire) <= 1400
-    sparse_got = BlockFeedbackV2.unpack(sparse_wire)
+    sparse_got = BlockFeedback.unpack(sparse_wire)
     assert len(sparse_got.done_blocks or []) == 48
     with pytest.raises(ValueError):
-        BlockFeedbackV2.unpack(wire[:-3])
+        BlockFeedback.unpack(wire[:-3])
 
 
 def test_completion_ranges_are_compact_and_rotate():
@@ -113,19 +112,19 @@ def test_completion_ranges_are_compact_and_rotate():
     assert first != second
 
 
-def test_parse_v2_rejects_unknown_version():
-    ready = BlockReadyV2(9, 64 << 20).pack()
-    assert parse_v2_packet(ready) == BlockReadyV2(9, 64 << 20)
+def test_parse_packet_rejects_unknown_version():
+    ready = BlockReady(9, 64 << 20).pack()
+    assert parse_packet(ready) == BlockReady(9, 64 << 20)
     with pytest.raises(ValueError):
-        parse_v2_packet(b"\x54\x09\x30\x00" + bytes(8))
+        parse_packet(b"\x54\x09\x30\x00" + bytes(8))
 
 
 def test_feedback_state_is_idempotent_and_monotonic():
     state = SenderFeedbackState(11)
-    newer = BlockFeedbackV2(
+    newer = BlockFeedback(
         11, 2, 200, 100, done_blocks=[1], open_blocks=[OpenBlock(2, 50)]
     )
-    stale = BlockFeedbackV2(
+    stale = BlockFeedback(
         11, 1, 999, 999, done_blocks=[9], open_blocks=[OpenBlock(2, 80)]
     )
     assert state.apply(newer, now=1.0)
@@ -183,104 +182,10 @@ def test_one_stuck_block_does_not_define_admission_frontier():
     assert len(active) < geometry.active_blocks
 
 
-def test_ack_pacer_uses_unique_bytes_not_decoded_bytes():
-    pacer = AckPacer(25_000_000, 143_750_000, 27_500_000)
-    assert pacer.update(0, 1.0) == 27_500_000
-    assert pacer.update(1_000_000, 1.0) == 27_500_000
-    raised = pacer.update(8_000_000, 1.25)
-    assert raised > 27_500_000
 
 
-def test_ack_pacer_ignores_empty_and_stretched_samples():
-    start = 87_500_000  # 700 Mbit
-    pacer = AckPacer(start * 0.85, 115_000_000, start)
-    assert pacer.update(0, 1.00) == start
-    assert pacer.update(1_000_000, 1.00) == start
-    # dt=0.8s would look like ~10 Mbit if treated as BtlBw.
-    assert pacer.update(2_000_000, 1.80) == start
-    assert pacer.startup is True
-    climbed = pacer.update(12_000_000, 1.95)
-    assert climbed >= start
-    assert pacer.startup is True
 
 
-def test_ack_pacer_holds_through_one_weak_sample():
-    start = 87_500_000
-    pacer = AckPacer(start * 0.85, 115_000_000, start)
-    pacer.update(1_000_000, 1.00)
-    # Strong sample: 14 MB / 0.15s ≈ 93 MB/s > start.
-    pacer.update(1_000_000 + 14_000_000, 1.15)
-    pacer.startup = False
-    held = pacer.offer_bps
-    # Weak unique without repair is app-limited; BtlBw max-filter holds.
-    once = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
-    assert once >= held * 0.99
-    twice = pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
-    assert twice >= held * 0.99
-    for _ in range(5):
-        pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
-    assert pacer.offer_bps >= held * 0.90
-
-
-def test_ack_pacer_holds_while_repair_busy():
-    start = 87_500_000
-    pacer = AckPacer(start, 115_000_000, start)
-    pacer.update(1_000_000, 1.00)
-    pacer.update(1_000_000 + 14_000_000, 1.15)
-    pacer.startup = False
-    held = pacer.offer_bps
-    for _ in range(2):
-        got = pacer.update(
-            pacer.last_unique + 2_000_000,
-            pacer.last_ts + 0.15,
-            repair_busy=True,
-        )
-    assert got >= held * 0.99
-    assert pacer.held_repair_events >= 1
-    assert pacer.backoff_events == 0
-
-
-def test_ack_pacer_backoff_on_sustained_repair():
-    start = 87_500_000
-    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
-    pacer.update(1_000_000, 1.00)
-    for _ in range(12):
-        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
-        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
-    held = pacer.offer_bps
-    assert held > start
-    assert pacer.btlbw_bps > 0
-    for _ in range(8):
-        pacer.update(
-            pacer.last_unique + 2_000_000,
-            pacer.last_ts + 0.15,
-            repair_busy=True,
-        )
-    assert pacer.backoff_events >= 1
-    assert pacer.offer_bps < held
-    assert pacer.offer_bps >= start
-
-
-def test_ack_pacer_backoff_cools_without_flooring():
-    start = 87_500_000
-    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
-    pacer.update(1_000_000, 1.00)
-    for _ in range(12):
-        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
-        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
-    held = pacer.offer_bps
-    for _ in range(40):
-        pacer.update(
-            pacer.last_unique + 2_000_000,
-            pacer.last_ts + 0.15,
-            repair_busy=True,
-        )
-    assert pacer.backoff_events >= 1
-    assert pacer.backoff_events <= 4
-    assert pacer.offer_bps < held
-    assert pacer.offer_bps > start * 1.05
-    pacer.update(pacer.last_unique + 12_000_000, pacer.last_ts + 0.15)
-    assert pacer.mode != "probe"
 
 
 def test_extra_repair_window_busy_on_sliding_fraction():
@@ -304,51 +209,8 @@ def test_extra_repair_window_busy_on_sliding_fraction():
     assert early.pressure() is False
 
 
-def test_ack_pacer_cruises_near_btlbw_not_hard_cap():
-    start = 87_500_000
-    cap = 115_000_000
-    pacer = AckPacer(start, cap, start, fec_frac=0.20)
-    pacer.update(1_000_000, 1.00)
-    for _ in range(24):
-        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
-        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
-    assert pacer.btlbw_bps > 0
-    assert pacer.mode in ("cruise", "probe")
-    # Cruise 0.97×BtlBw; probe may briefly go to 1.03×. Never need the hard cap
-    # unless BtlBw itself is the cap.
-    assert pacer.offer_bps <= max(pacer.btlbw_bps * 1.04, pacer.min_bps)
 
 
-def test_ack_pacer_climbs_when_unique_tracks_offer():
-    start = 87_500_000
-    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
-    pacer.update(1_000_000, 1.00)
-    for _ in range(12):
-        delta = max(1, int(pacer.offer_bps * 0.80 * 0.15))
-        pacer.update(pacer.last_unique + delta, pacer.last_ts + 0.15)
-    assert pacer.offer_bps > start * 1.10
-    assert pacer.btlbw_bps > start
-
-
-def test_ack_pacer_stays_near_start_when_unique_is_start_payload():
-    start = 87_500_000  # 700 Mbit send; 20% FEC → ~70 MB/s unique
-    pacer = AckPacer(start, 115_000_000, start, fec_frac=0.20)
-    pacer.update(1_000_000, 1.00)
-    for _ in range(16):
-        pacer.update(pacer.last_unique + 10_500_000, pacer.last_ts + 0.15)
-    assert pacer.offer_bps <= start * 1.08
-    assert pacer.btlbw_bps <= start * 1.05
-
-
-def test_ack_pacer_floor_is_start():
-    start = 87_500_000
-    pacer = AckPacer(start, 115_000_000, start)
-    pacer.update(1_000_000, 1.00)
-    pacer.update(1_000_000 + 14_000_000, 1.15)
-    pacer.startup = False
-    for _ in range(12):
-        pacer.update(pacer.last_unique + 2_000_000, pacer.last_ts + 0.15)
-    assert pacer.offer_bps >= start
 
 
 def test_pace_limits_floor_equals_start(monkeypatch):
@@ -477,8 +339,8 @@ def test_encode_block_job_matches_direct_pack(tmp_path: Path):
     assert block_id == 0
     assert encode_s >= 0.0
     assert budget > 0
-    parsed = [parse_v2_packet(bytes(w)) for w in wires]
-    assert all(isinstance(p, BlockDataV2) for p in parsed)
+    parsed = [parse_packet(bytes(w)) for w in wires]
+    assert all(isinstance(p, BlockData) for p in parsed)
     assert parsed[0].session_id == 9
     encoder = GenEncoder(data, t, 14)
     assert [p.payload for p in parsed] == encoder.packets()
@@ -488,8 +350,8 @@ def test_pack_data_packets_roundtrips_like_blockdata():
     payloads = [b"aa", b"bb"]
     wires = pack_data_packets(3, 4, payloads, first_esi=7, send_ts_us=11)
     for i, wire in enumerate(wires):
-        got = BlockDataV2.unpack(bytes(wire))
-        assert got == BlockDataV2(3, 4, 7 + i, payloads[i], 11)
+        got = BlockData.unpack(bytes(wire))
+        assert got == BlockData(3, 4, 7 + i, payloads[i], 11)
 
 
 def test_decode_failed_skips_repair_age_wait():
@@ -528,7 +390,7 @@ def _free_udp_port() -> int:
     return port
 
 
-def test_v2_loopback_transfer_is_byte_correct(tmp_path: Path):
+def test_loopback_transfer_is_byte_correct(tmp_path: Path):
     src = tmp_path / "in.bin"
     dst = tmp_path / "out.bin"
     payload = os.urandom(3 * 64 * 256 + 17)

@@ -1,4 +1,4 @@
-"""Object-mux: many named blobs over one v2 RaptorQ UDP session."""
+"""Object-mux: many named blobs over one RaptorQ UDP session."""
 
 from __future__ import annotations
 
@@ -13,16 +13,16 @@ from pathlib import Path
 
 from .block_packets import (
     MUX_META_NAME,
-    BlockDataV2,
-    BlockFeedbackV2,
-    BlockFinV2,
-    BlockMetaV2,
-    BlockReadyV2,
+    BlockData,
+    BlockFeedback,
+    BlockFin,
+    BlockMeta,
+    BlockReady,
     OpenBlock,
-    ObjectFinV2,
-    ObjectOpenV2,
+    ObjectFin,
+    ObjectOpen,
     pack_data_packets,
-    parse_v2_packet,
+    parse_packet,
 )
 from .block_state import (
     REPAIR_AGE_S,
@@ -145,16 +145,16 @@ def run_object_server(
             continue
         try:
             raw, addr = sock.recvfrom(2048)
-            packet = parse_v2_packet(raw)
+            packet = parse_packet(raw)
         except (BlockingIOError, ValueError):
             continue
-        if isinstance(packet, BlockReadyV2):
+        if isinstance(packet, BlockReady):
             client, session_id = addr, packet.session_id
     if client is None:
         sock.close()
         raise TimeoutError("object-mux server timed out waiting for READY")
 
-    meta = BlockMetaV2(
+    meta = BlockMeta(
         session_id, 0, MUX_META_NAME, symbol_size, block_k,
         initial_repair_pct, geometry.active_bytes, "",
     ).pack()
@@ -170,14 +170,14 @@ def run_object_server(
                 continue
             while True:
                 try:
-                    packet = parse_v2_packet(sock.recvfrom(4096)[0])
+                    packet = parse_packet(sock.recvfrom(4096)[0])
                 except BlockingIOError:
                     break
                 except ValueError:
                     continue
-                if isinstance(packet, BlockFeedbackV2):
+                if isinstance(packet, BlockFeedback):
                     feedback.apply(packet)
-                elif isinstance(packet, BlockFinV2) and packet.session_id == session_id and packet.ok:
+                elif isinstance(packet, BlockFin) and packet.session_id == session_id and packet.ok:
                     client_fin.set()
 
     fb_thread = threading.Thread(target=feedback_loop, daemon=True)
@@ -193,14 +193,14 @@ def run_object_server(
         if cursor.obj_id in announced:
             return
         sock.sendto(
-            ObjectOpenV2(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
+            ObjectOpen(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
             client,
         )
         announced.add(cursor.obj_id)
 
     def finish(cursor: ObjectCursor) -> None:
         sock.sendto(
-            ObjectFinV2(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
+            ObjectFin(session_id, cursor.obj_id, len(cursor.data), cursor.name).pack(),
             client,
         )
 
@@ -257,7 +257,7 @@ def run_object_server(
                 repair_tick(opened, now)
                 last_repair = now
             if session.idle(current) and not active and next_block > 0:
-                _burst(sock, client, BlockFinV2(session_id, next_block).pack(), 8)
+                _burst(sock, client, BlockFin(session_id, next_block).pack(), 8)
                 grace = time.monotonic() + 2.0
                 while not client_fin.is_set() and time.monotonic() < grace:
                     time.sleep(0.02)
@@ -384,7 +384,7 @@ def run_object_client(
     sock = _udp(None, None, snd=8 << 20, rcv=32 << 20)
     server = (host, port)
     session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
-    ready = BlockReadyV2(session_id, active_bytes).pack()
+    ready = BlockReady(session_id, active_bytes).pack()
     _burst(sock, server, ready, 8, 0.0)
 
     meta, deadline = None, time.monotonic() + 30.0
@@ -393,10 +393,10 @@ def run_object_client(
             sock.sendto(ready, server)
             continue
         try:
-            packet = parse_v2_packet(sock.recvfrom(4096)[0])
+            packet = parse_packet(sock.recvfrom(4096)[0])
         except (BlockingIOError, ValueError):
             continue
-        if isinstance(packet, BlockMetaV2) and packet.session_id == session_id:
+        if isinstance(packet, BlockMeta) and packet.session_id == session_id:
             meta = packet
     if meta is None:
         sock.close()
@@ -425,7 +425,7 @@ def run_object_client(
             OpenBlock(bid, slot.symbols_rx, False, 0) for bid, slot in sorted(slots.items())
         ][:64]
         sock.sendto(
-            BlockFeedbackV2(
+            BlockFeedback(
                 session_id, feedback_id, unique, sink.decoded, last_echo, sorted(done), opened
             ).pack(),
             server,
@@ -441,16 +441,16 @@ def run_object_client(
                     batch = []
                 for raw in batch:
                     try:
-                        packet = parse_v2_packet(raw)
+                        packet = parse_packet(raw)
                     except ValueError:
                         continue
                     if getattr(packet, "session_id", None) != session_id:
                         continue
-                    if isinstance(packet, ObjectOpenV2) and packet.obj_id not in sink.names:
+                    if isinstance(packet, ObjectOpen) and packet.obj_id not in sink.names:
                         sink.open(packet.obj_id, packet.name, packet.size)
-                    elif isinstance(packet, ObjectFinV2):
+                    elif isinstance(packet, ObjectFin):
                         sink.fin(packet.obj_id, packet.name, packet.size)
-                    elif isinstance(packet, BlockDataV2):
+                    elif isinstance(packet, BlockData):
                         if packet.block_id in done:
                             continue
                         slot = slots.get(packet.block_id)
@@ -474,7 +474,7 @@ def run_object_client(
                             done.add(packet.block_id)
                             slot.close()
                             slots.pop(packet.block_id, None)
-                    elif isinstance(packet, BlockFinV2):
+                    elif isinstance(packet, BlockFin):
                         total_blocks = packet.total_blocks
             send_feedback()
             if (
@@ -486,7 +486,7 @@ def run_object_client(
             if time.monotonic() - t0 > timeout_s:
                 raise TimeoutError("object-mux client timed out")
         send_feedback(force=True)
-        _burst(sock, server, BlockFinV2(session_id, total_blocks or 0).pack(), 16)
+        _burst(sock, server, BlockFin(session_id, total_blocks or 0).pack(), 16)
     finally:
         for slot in slots.values():
             slot.close()

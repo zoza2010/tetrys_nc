@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("raptorq")
 
-from tetrys_nc.block_packets import ObjectFinV2, ObjectOpenV2, parse_v2_packet
+from tetrys_nc.block_packets import ObjectFin, ObjectOpen, parse_packet
 from tetrys_nc.object_frames import (
     BlockFill,
     ObjectChunk,
@@ -68,10 +68,10 @@ def _loopback(tmp_path: Path, objects: dict[str, bytes] | list[tuple[str, bytes]
 
 def test_object_control_packets_roundtrip():
     for packet in (
-        ObjectOpenV2(9, 3, 12, "note.txt"),
-        ObjectFinV2(9, 3, 12, "note.txt"),
+        ObjectOpen(9, 3, 12, "note.txt"),
+        ObjectFin(9, 3, 12, "note.txt"),
     ):
-        assert parse_v2_packet(packet.pack()) == packet
+        assert parse_packet(packet.pack()) == packet
 
 
 def test_pack_unpack_two_objects_in_one_block():

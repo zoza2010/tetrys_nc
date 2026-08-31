@@ -30,8 +30,7 @@ def ensure_blob(name: str, size: str) -> Path:
             [
                 sys.executable,
                 "-m",
-                "tetrys_nc",
-                "genfile",
+                "sim.genfile",
                 "--output",
                 str(blob),
                 "--size",
