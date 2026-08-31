@@ -247,13 +247,30 @@ def test_pace_limits_cc_uses_search_cap(monkeypatch):
     assert min_bps < start_bps
 
 
-def test_rate_cc_defaults_off(monkeypatch):
+def test_rate_cc_defaults_on(monkeypatch):
     monkeypatch.delenv("TETRYS_CC", raising=False)
-    assert _rate_cc_enabled(None) is False
+    assert _rate_cc_enabled(None) is True
     assert _rate_cc_enabled(True) is True
     assert _rate_cc_enabled(False) is False
+    monkeypatch.setenv("TETRYS_CC", "0")
+    assert _rate_cc_enabled(None) is False
     monkeypatch.setenv("TETRYS_CC", "1")
     assert _rate_cc_enabled(None) is True
+
+
+def test_cli_explicit_rate_locks_cc():
+    from tetrys_nc.server import _cli_pace
+
+    wan_rate, wan_cc = _cli_pace(True, None)
+    assert wan_rate == pytest.approx(850.0)
+    assert wan_cc is True
+    lock_rate, lock_cc = _cli_pace(True, 850.0)
+    assert lock_rate == pytest.approx(850.0)
+    assert lock_cc is False
+    lan_rate, lan_cc = _cli_pace(False, None)
+    assert lan_rate == pytest.approx(1500.0)
+    assert lan_cc is True
+    assert _cli_pace(False, 80.0) == (80.0, False)
 
 
 def test_repair_debt_controller_ignores_packet_order():

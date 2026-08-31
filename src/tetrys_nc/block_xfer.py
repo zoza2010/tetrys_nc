@@ -201,7 +201,11 @@ def _rate_cc_enabled(flag: bool | None) -> bool:
     if flag is False:
         return False
     env = os.environ.get("TETRYS_CC", "").strip().lower()
-    return env in {"1", "on", "true", "blast", "yes"}
+    if env in {"0", "off", "false", "no"}:
+        return False
+    if env in {"1", "on", "true", "blast", "yes"}:
+        return True
+    return True
 
 
 def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, float]:

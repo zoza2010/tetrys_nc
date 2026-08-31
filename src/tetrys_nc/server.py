@@ -26,6 +26,17 @@ def _root_and_default(dir_arg: Path | None, file_arg: Path | None) -> tuple[Path
     return root, default
 
 
+def _cli_pace(wan: bool, rate_mbit: float | None) -> tuple[float, bool]:
+    """Explicit --rate locks pace (CC off). Omitted --rate keeps CC on."""
+    locked = rate_mbit is not None
+    rate = float(rate_mbit) if locked else 0.0
+    if wan and rate <= 0:
+        rate = WAN_PACE_CAP_MBIT
+    elif rate <= 0:
+        rate = 1500.0
+    return rate, not locked
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="RaptorQ UDP file server")
     p.add_argument("--host", default="0.0.0.0")
@@ -58,21 +69,16 @@ def main(argv: list[str] | None = None) -> int:
         "--rate-mbit",
         "--rate",
         type=float,
-        default=0.0,
+        default=None,
         dest="rate_mbit",
-        help="UDP send rate in Mbit/s (alias: --rate). WAN default follows --wan cap (850)",
+        help="lock UDP send rate in Mbit/s (disables rate search). "
+        "Omit to search (WAN start 850, cap 1600)",
     )
     p.add_argument(
         "--ramp-s",
         type=float,
         default=0.0,
         help="seconds to ease-in pace from 0 to start rate (0=immediate blast)",
-    )
-    p.add_argument(
-        "--cc",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="blast rate search (default off = locked --rate). Pass --cc to enable",
     )
     p.add_argument(
         "--once",
@@ -94,11 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
-    rate = args.rate_mbit
-    if args.wan and rate <= 0:
-        rate = WAN_PACE_CAP_MBIT
-    elif rate <= 0:
-        rate = 1500.0
+    rate, rate_cc = _cli_pace(args.wan, args.rate_mbit)
     if args.gen_overhead is not None:
         overhead_pct = args.gen_overhead
     elif args.wan:
@@ -119,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
-        rate_cc=args.cc,
+        rate_cc=rate_cc,
         once=args.once,
     )
 

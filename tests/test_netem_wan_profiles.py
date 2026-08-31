@@ -55,7 +55,6 @@ def _run_through_netem(
             "0.2",
             "--gen-k",
             "48",
-            "--no-cc",
         ],
         cwd=ROOT,
         env=env,
