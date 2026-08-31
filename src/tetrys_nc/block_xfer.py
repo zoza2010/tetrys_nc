@@ -514,6 +514,7 @@ def run_block_server(
             )
             t0 = time.monotonic()
             last_log = t0
+            aborted = False
             tail_idle_start: float | None = None
             first_close = 0
             first_close_seen = 0
@@ -695,6 +696,15 @@ def run_block_server(
                                 feedback.snapshot()
                             )
                             now = time.monotonic()
+                            if feedback.client_lost(now, t0):
+                                aborted = True
+                                print(
+                                    f"abort — client silent "
+                                    f"sent={next_block}/{total_blocks} "
+                                    f"done={len(completed)}",
+                                    flush=True,
+                                )
+                                break
                             if cc is not None:
                                 limiter.set_rate(
                                     cc.on_feedback(
@@ -812,6 +822,11 @@ def run_block_server(
                 fh.close()
 
             elapsed = max(time.monotonic() - t0, 1e-6)
+            if aborted:
+                if once:
+                    break
+                print("idle — waiting for READY", flush=True)
+                continue
             close_pct = 100.0 * first_close / first_close_seen if first_close_seen else 0.0
             tail_s = (time.monotonic() - tail_started) if tail_started else 0.0
             pace_sorted = sorted(pace_samples)

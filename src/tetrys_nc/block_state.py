@@ -36,6 +36,10 @@ TAIL_REPAIR_TICK_PKTS = 256
 TAIL_REPAIR_TICK_PER_BLOCK = 48
 TAIL_REPAIR_TICK_S = 0.040
 TAIL_REPAIR_COOLDOWN_S = 0.020
+# Stop blasting if the receiver vanished. After at least one ACK, 2s covers
+# WAN loss bursts; never-heard waits longer for the first RTT.
+CLIENT_GONE_S = 2.0
+CLIENT_NEVER_S = 8.0
 
 
 @dataclass(slots=True)
@@ -113,6 +117,12 @@ class SenderFeedbackState:
             }
             self.last_feedback_ts = time.monotonic() if now is None else now
         return True
+
+    def client_lost(self, now: float, start_ts: float) -> bool:
+        with self.lock:
+            if self.feedback_id < 0:
+                return now - start_ts > CLIENT_NEVER_S
+            return now - self.last_feedback_ts > CLIENT_GONE_S
 
     def snapshot(
         self,

@@ -273,6 +273,15 @@ def test_cli_explicit_rate_locks_cc():
     assert _cli_pace(False, 80.0) == (80.0, False)
 
 
+def test_feedback_client_lost_after_silence():
+    st = SenderFeedbackState(1)
+    assert st.client_lost(10.0, 9.5) is False
+    assert st.client_lost(18.0, 9.5) is True
+    st.apply(BlockFeedback(1, 1, 1000, 500), now=10.0)
+    assert st.client_lost(11.5, 9.5) is False
+    assert st.client_lost(12.1, 9.5) is True
+
+
 def test_repair_debt_controller_ignores_packet_order():
     ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=24.0)
     first = ctl.observe(30, 768)
@@ -582,3 +591,40 @@ def test_loopback_directory_uses_mux(tmp_path: Path):
     assert not errors, errors[0]
     got = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
     assert got == blobs
+
+
+def test_server_stops_when_client_silent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tetrys_nc.block_state.CLIENT_NEVER_S", 0.35)
+    monkeypatch.setattr("tetrys_nc.block_state.CLIENT_GONE_S", 0.25)
+    src = tmp_path / "in.bin"
+    src.write_bytes(os.urandom(4 * 1024 * 1024))
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1",
+                port,
+                tmp_path,
+                default_file="in.bin",
+                symbol_size=256,
+                block_k=64,
+                initial_repair_pct=14,
+                active_bytes=4 << 20,
+                rate_mbit=400,
+                skip_hash=True,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.sendto(BlockReady(7, 4 << 20, "in.bin").pack(), ("127.0.0.1", port))
+    time.sleep(0.05)
+    sock.close()
+    thread.join(timeout=3.0)
+    assert not errors, errors[0]
+    assert not thread.is_alive()

@@ -319,9 +319,17 @@ def run_object_session(
             sent += len(new_packets)
 
     try:
+        aborted = False
         while not client_fin.is_set():
             completed, opened, *_ = feedback.snapshot()
             now = time.monotonic()
+            if feedback.client_lost(now, t0):
+                aborted = True
+                print(
+                    f"abort — client silent mux blocks={next_block}",
+                    flush=True,
+                )
+                break
             for block_id in [b for b in active if b in completed]:
                 active.pop(block_id)
                 enc_cache.pop(block_id, None)
@@ -357,11 +365,12 @@ def run_object_session(
         if close_sock:
             sock.close()
     elapsed = max(time.monotonic() - t0, 1e-6)
-    print(
-        f"done in {elapsed:.2f}s — mux blocks={next_block} "
-        f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload",
-        flush=True,
-    )
+    if not aborted:
+        print(
+            f"done in {elapsed:.2f}s — mux blocks={next_block} "
+            f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload",
+            flush=True,
+        )
     return 0
 
 
