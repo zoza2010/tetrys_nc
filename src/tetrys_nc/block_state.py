@@ -19,6 +19,8 @@ WAN_INITIAL_REPAIR_PCT = 24
 # Fixed 850 Mbit beat 880/920 on this path: extra-repair stays in check.
 WAN_START_MBIT = 850.0
 WAN_PACE_CAP_MBIT = 850.0
+# Safety ceiling while --cc searches; locked --no-cc still uses WAN_PACE_CAP.
+WAN_CC_CAP_MBIT = 1600.0
 # Sliding extra-repair fraction over recent non-tail completions.
 EXTRA_FRAC_WINDOW = 32
 EXTRA_FRAC_MIN_SAMPLES = 8
@@ -81,6 +83,7 @@ class SenderFeedbackState:
     feedback_id: int = -1
     unique_payload_bytes: int = 0
     decoded_file_bytes: int = 0
+    echo_ts_us: int = 0
     completed: set[int] = field(default_factory=set)
     open_rx: dict[int, OpenBlock] = field(default_factory=dict)
     last_feedback_ts: float = 0.0
@@ -99,6 +102,7 @@ class SenderFeedbackState:
             self.decoded_file_bytes = max(
                 self.decoded_file_bytes, packet.decoded_file_bytes
             )
+            self.echo_ts_us = packet.echo_ts_us & 0xFFFFFFFF
             self.completed.update(packet.done_blocks or [])
             for block_id in packet.done_blocks or []:
                 self.open_rx.pop(block_id, None)
@@ -110,13 +114,17 @@ class SenderFeedbackState:
             self.last_feedback_ts = time.monotonic() if now is None else now
         return True
 
-    def snapshot(self) -> tuple[set[int], dict[int, OpenBlock], int, int]:
+    def snapshot(
+        self,
+    ) -> tuple[set[int], dict[int, OpenBlock], int, int, int, int]:
         with self.lock:
             return (
                 set(self.completed),
                 dict(self.open_rx),
                 self.unique_payload_bytes,
                 self.decoded_file_bytes,
+                self.echo_ts_us,
+                self.feedback_id,
             )
 
 

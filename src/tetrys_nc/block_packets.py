@@ -145,6 +145,20 @@ def pack_data_packets(
     return out
 
 
+def stamp_data_wires(wires: list[bytes], send_ts_us: int) -> None:
+    """Overwrite DATA send_ts in place so echo RTT is not encode/prefetch age."""
+    packed = struct.pack("!I", send_ts_us & 0xFFFFFFFF)
+    for i, wire in enumerate(wires):
+        if len(wire) < 20:
+            continue
+        if isinstance(wire, bytearray):
+            wire[16:20] = packed
+            continue
+        buf = bytearray(wire)
+        buf[16:20] = packed
+        wires[i] = buf
+
+
 @dataclass(slots=True)
 class BlockFeedback:
     session_id: int

@@ -41,6 +41,12 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds to ease-in pace from 0 to start rate (0=immediate blast)",
     )
     p.add_argument(
+        "--cc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="blast rate search (default off = locked --rate). Pass --cc to enable",
+    )
+    p.add_argument(
         "--gen-k",
         type=int,
         default=None,
@@ -78,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
+        rate_cc=args.cc,
     )
 
 

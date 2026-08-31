@@ -43,6 +43,7 @@ from tetrys_nc.block_state import (
 )
 from tetrys_nc.block_xfer import (
     _pace_limits,
+    _rate_cc_enabled,
     encode_block_job,
     rebuild_block_encoder,
     run_block_client,
@@ -129,10 +130,11 @@ def test_feedback_state_is_idempotent_and_monotonic():
     )
     assert state.apply(newer, now=1.0)
     assert not state.apply(stale, now=2.0)
-    done, opened, unique, decoded = state.snapshot()
+    done, opened, unique, decoded, echo, fb_id = state.snapshot()
     assert done == {1}
     assert opened[2].unique_esi == 50
     assert (unique, decoded) == (200, 100)
+    assert fb_id == 2
 
 
 def test_reordered_symbols_decode_like_ordered_symbols():
@@ -221,6 +223,23 @@ def test_pace_limits_floor_equals_start(monkeypatch):
     assert start_bps == pytest.approx(850_000_000 / 8)
     assert min_bps == pytest.approx(start_bps)
     assert max_bps == pytest.approx(850_000_000 / 8)
+
+
+def test_pace_limits_cc_uses_search_cap(monkeypatch):
+    monkeypatch.delenv("TETRYS_CC_CAP_MBIT", raising=False)
+    min_bps, max_bps, start_bps = _pace_limits(850.0, cc=True)
+    assert start_bps == pytest.approx(850_000_000 / 8)
+    assert max_bps == pytest.approx(1600_000_000 / 8)
+    assert min_bps < start_bps
+
+
+def test_rate_cc_defaults_off(monkeypatch):
+    monkeypatch.delenv("TETRYS_CC", raising=False)
+    assert _rate_cc_enabled(None) is False
+    assert _rate_cc_enabled(True) is True
+    assert _rate_cc_enabled(False) is False
+    monkeypatch.setenv("TETRYS_CC", "1")
+    assert _rate_cc_enabled(None) is True
 
 
 def test_repair_debt_controller_ignores_packet_order():

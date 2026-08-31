@@ -25,6 +25,7 @@ from .block_packets import (
     OpenBlock,
     pack_data_packets,
     parse_packet,
+    stamp_data_wires,
 )
 from .block_state import (
     BlockGeometry,
@@ -40,6 +41,7 @@ from .block_state import (
     WAN_BLOCK_K,
     WAN_INITIAL_REPAIR_PCT,
     WAN_PACE_CAP_MBIT,
+    WAN_CC_CAP_MBIT,
     WAN_START_MBIT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
@@ -48,6 +50,7 @@ from .block_state import (
     repair_tick_limits,
     select_repair_candidates,
 )
+from .blastcc import BlastCc, _SEED_FRAC
 from .gen_raptor import GenEncoder, GenReceiveSlot
 from .netutil import recv_datagrams, send_datagrams, take_send_stats, try_set_buffer
 from .ratectl import RateLimiter
@@ -173,7 +176,27 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _pace_limits(rate_mbit: float) -> tuple[float, float, float]:
+def _rate_cc_enabled(flag: bool | None) -> bool:
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    env = os.environ.get("TETRYS_CC", "").strip().lower()
+    return env in {"1", "on", "true", "blast", "yes"}
+
+
+def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, float]:
+    if cc:
+        cap_mbit = max(
+            rate_mbit,
+            1.0,
+            _env_float("TETRYS_CC_CAP_MBIT", WAN_CC_CAP_MBIT),
+        )
+        max_bps = cap_mbit * 1_000_000 / 8
+        start_mbit = min(cap_mbit, max(rate_mbit, 1.0))
+        start_bps = start_mbit * 1_000_000 / 8
+        min_bps = min(start_bps, max(80_000_000 / 8, max_bps * 0.10))
+        return min_bps, max_bps, start_bps
     cap_mbit = min(
         max(rate_mbit, 1.0),
         _env_float("TETRYS_PACE_CAP_MBIT", WAN_PACE_CAP_MBIT),
@@ -219,6 +242,7 @@ def run_block_server(
     rate_mbit: float = 1150.0,
     ramp_s: float = 0.0,
     skip_hash: bool = False,
+    rate_cc: bool | None = None,
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
     file_size = file_path.stat().st_size
@@ -227,7 +251,8 @@ def run_block_server(
     file_path_str = str(file_path.resolve())
     workers = _encode_workers()
     prefetch_depth = min(64, max(geometry.active_blocks, 32))
-    min_bps, max_bps, start_bps = _pace_limits(rate_mbit)
+    cc_on = _rate_cc_enabled(rate_cc)
+    min_bps, max_bps, start_bps = _pace_limits(rate_mbit, cc=cc_on)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)
@@ -240,6 +265,7 @@ def run_block_server(
         f"block={geometry.block_bytes / 1048576:.2f}MiB active={geometry.active_blocks} "
         f"start={start_bps * 8 / 1e6:.0f}Mbit min={min_bps * 8 / 1e6:.0f}Mbit "
         f"cap={max_bps * 8 / 1e6:.0f}Mbit "
+        f"cc={'blast' if cc_on else 'off'} "
         f"fec={initial_repair_pct}% enc_workers={workers} prefetch={prefetch_depth}",
         flush=True,
     )
@@ -284,9 +310,15 @@ def run_block_server(
     stop = threading.Event()
     client_fin = threading.Event()
     limiter = RateLimiter(
-        max_bps, start_bps=start_bps, min_frac=min_bps / max_bps
+        max_bps, start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
+        min_frac=min_bps / max_bps,
     )
     limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
+    cc = (
+        BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
+        if cc_on
+        else None
+    )
     encode_pool = _make_encode_pool(workers)
 
     def feedback_loop() -> None:
@@ -346,15 +378,18 @@ def run_block_server(
 
     def send_wires(wires: list[bytes], *, repair: bool) -> None:
         nonlocal source_wire_total, repair_wire_total
-        if ramp_s > 0:
+        if ramp_s > 0 and cc is None:
             elapsed = time.monotonic() - t0
             if elapsed < ramp_s:
                 limiter.set_rate(max(min_bps, start_bps * max(0.05, elapsed / ramp_s)))
         for pos in range(0, len(wires), _SEND_CHUNK):
+            if cc is not None:
+                limiter.set_rate(cc.on_timer(time.monotonic()))
             batch = wires[pos : pos + _SEND_CHUNK]
             t_pace = time.perf_counter()
             limiter.consume(sum(map(len, batch)))
             timers.pace_s += time.perf_counter() - t_pace
+            stamp_data_wires(batch, int(time.monotonic() * 1_000_000) & 0xFFFFFFFF)
             t_send = time.perf_counter()
             send_datagrams(sock, client, batch, chunk=_SEND_CHUNK)
             timers.send_s += time.perf_counter() - t_send
@@ -503,8 +538,22 @@ def run_block_server(
             try:
                 submit_ahead()
                 while not client_fin.is_set():
-                    completed, opened, unique_rx, decoded = feedback.snapshot()
+                    completed, opened, unique_rx, decoded, echo_ts, fb_id = (
+                        feedback.snapshot()
+                    )
                     now = time.monotonic()
+                    if cc is not None:
+                        limiter.set_rate(
+                            cc.on_feedback(
+                                now,
+                                feedback_id=fb_id,
+                                unique_bytes=unique_rx,
+                                decoded_bytes=decoded,
+                                echo_ts_us=echo_ts,
+                                extra_frac=extra_win.frac,
+                                window_full=len(active) >= geometry.active_blocks,
+                            )
+                        )
                     tail = next_block >= total_blocks
                     if tail and tail_started is None:
                         tail_started = now
@@ -563,6 +612,7 @@ def run_block_server(
                             f"open={len(opened)} fec={repair_ctl.current}% "
                             f"close={close_pct:.0f}% "
                             f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
+                            f"cc={cc.phase if cc is not None else 'off'} "
                             f"xfrac={extra_win.frac * 100:.0f}% "
                             f"loss_p50={((percentile(loss_samples, 50) or 0.0) * 100):.1f}% "
                             f"ack={unique_rx / elapsed / 1048576:.1f} "
