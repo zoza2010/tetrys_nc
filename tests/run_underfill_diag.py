@@ -125,9 +125,8 @@ def run_xfer(
     emu = None
     if profile:
         emu = subprocess.Popen(
-            py
+            [sys.executable, "-u", "-m", "sim.netem_udp"]
             + [
-                "netem",
                 "--listen",
                 f"127.0.0.1:{cli_port}",
                 "--forward",

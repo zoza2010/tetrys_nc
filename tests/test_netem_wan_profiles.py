@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tetrys_nc.netem_udp import PROFILES
+from sim.netem_udp import PROFILES
 
 ROOT = Path(__file__).resolve().parents[1]
 WAN_PROFILES = (
@@ -62,9 +62,8 @@ def _run_through_netem(
         stderr=subprocess.STDOUT,
     )
     emu = subprocess.Popen(
-        py
+        [sys.executable, "-u", "-m", "sim.netem_udp"]
         + [
-            "netem",
             "--listen",
             f"127.0.0.1:{srv_port + 1}",
             "--forward",

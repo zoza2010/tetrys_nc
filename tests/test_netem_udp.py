@@ -6,8 +6,8 @@ import socket
 import threading
 import time
 
-from tetrys_nc.netem_udp import Direction, PathSpec, UdpNetem, parse_hostport
-from tetrys_nc.netem_udp import PROFILES
+from sim.netem_udp import Direction, PathSpec, UdpNetem, parse_hostport
+from sim.netem_udp import PROFILES
 
 
 def test_parse_hostport():

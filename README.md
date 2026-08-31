@@ -15,6 +15,13 @@ uv run python -m tetrys_nc objclient --output DIR --host HOST --port 7494 --wan
 
 WAN defaults: T=1350, K=768, 64 MiB window, 24% FEC, 850 Mbit pace.
 
+Loopback WAN emulator and encode bench live in `sim/` (not the transfer package):
+
+```bash
+uv run python -m sim.netem_udp --listen 127.0.0.1:7495 --forward 127.0.0.1:7494 --profile spain
+uv run python -m sim.encbench --k 96 --seconds 8
+```
+
 ```bash
 uv run pytest -q
 ```

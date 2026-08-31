@@ -72,9 +72,8 @@ def run_one(blob: Path, profile: str, port: int, timeout: int) -> dict:
         stderr=subprocess.STDOUT,
     )
     emu = subprocess.Popen(
-        py
+        [sys.executable, "-u", "-m", "sim.netem_udp"]
         + [
-            "netem",
             "--listen",
             f"127.0.0.1:{port + 1}",
             "--forward",

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tetrys_nc.netem_udp import PROFILES, Direction, PathSpec
+from sim.netem_udp import PROFILES, Direction, PathSpec
 
 from test_netem_wan_profiles import _run_through_netem
 

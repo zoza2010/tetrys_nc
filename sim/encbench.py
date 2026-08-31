@@ -13,7 +13,8 @@ import os
 import sys
 import time
 
-from .gen_raptor import GenEncoder, require_raptorq
+from tetrys_nc.gen_raptor import GenEncoder, require_raptorq
+
 from .hostcpu import HostCpuSampler
 
 
@@ -87,7 +88,7 @@ def bench_encode(
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="tetrys_nc encbench",
+        prog="python -m sim.encbench",
         description=(
             "RaptorQ encode microbench + host CPU (steal/PSI/throttle). "
             "Run on the WAN sender while idle, then compare with the same "

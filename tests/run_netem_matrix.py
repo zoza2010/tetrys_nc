@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from tetrys_nc.netem_udp import PROFILES
+from sim.netem_udp import PROFILES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -45,9 +45,8 @@ def run_one(blob: Path, profile: str, port: int, timeout: int) -> dict:
         stderr=subprocess.STDOUT,
     )
     emu = subprocess.Popen(
-        py
+        [sys.executable, "-u", "-m", "sim.netem_udp"]
         + [
-            "netem",
             "--listen",
             f"127.0.0.1:{port + 1}",
             "--forward",

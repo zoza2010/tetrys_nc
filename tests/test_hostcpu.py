@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tetrys_nc.hostcpu import (
+from sim.hostcpu import (
     CpuDelta,
     HostCpuSampler,
     cgroup_cpu_stat_path,
@@ -152,7 +152,7 @@ def test_cpu_line_hides_zero_throttles():
 
 def test_encbench_reports_gens_per_s():
     pytest.importorskip("raptorq")
-    from tetrys_nc.encbench import bench_encode
+    from sim.encbench import bench_encode
 
     got = bench_encode(k=16, symbol_size=64, overhead_pct=10, n=2, warmup=1)
     assert got.n == 2

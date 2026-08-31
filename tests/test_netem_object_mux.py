@@ -47,7 +47,9 @@ def test_object_mux_packed_through_netem(tmp_path: Path, profile: str) -> None:
     env = os.environ.copy()
     env["TETRYS_GSO"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(ROOT) + os.pathsep + str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    )
     py = [sys.executable, "-u", "-m", "tetrys_nc"]
     srv_log = tmp_path / "srv.log"
     emu_log = tmp_path / "emu.log"
@@ -74,9 +76,8 @@ def test_object_mux_packed_through_netem(tmp_path: Path, profile: str) -> None:
         stderr=subprocess.STDOUT,
     )
     emu = subprocess.Popen(
-        py
+        [sys.executable, "-u", "-m", "sim.netem_udp"]
         + [
-            "netem",
             "--listen",
             f"127.0.0.1:{srv_port + 1}",
             "--forward",

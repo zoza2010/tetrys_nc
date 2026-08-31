@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from tetrys_nc.netem_udp import PROFILES, Direction, PathSpec
+from sim.netem_udp import PROFILES, Direction, PathSpec
 
 
 def test_wan_long_profiles_exist():

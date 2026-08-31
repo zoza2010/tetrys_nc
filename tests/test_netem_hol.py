@@ -86,9 +86,8 @@ def test_hol_stall_profile_does_not_freeze_blast(tmp_path: Path) -> None:
         stderr=subprocess.STDOUT,
     )
     emu = subprocess.Popen(
-        py
+        [sys.executable, "-u", "-m", "sim.netem_udp"]
         + [
-            "netem",
             "--listen",
             "127.0.0.1:17595",
             "--forward",
