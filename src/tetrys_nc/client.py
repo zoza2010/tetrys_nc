@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--progress",
         action="store_true",
-        help="TTY bars: mux shows group + current files; single file shows one bar",
+        help="TTY bars: mux shows group total plus the in-flight file",
     )
     args = p.parse_args(argv)
     files = args.files or []

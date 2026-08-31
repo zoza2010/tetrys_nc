@@ -181,21 +181,62 @@ def test_split_packs_micros_keeps_larges():
 def test_mux_progress_is_group_plus_current():
     from tetrys_nc.object_xfer import mux_progress_lines
 
-    rows = [
-        ("a.bin", 1000, 1000, True),
-        ("b.bin", 400, 1000, False),
-        ("c.bin", 100, 1000, False),
-    ]
-    total, current = mux_progress_lines(rows, inst_bps=2 * 1048576)
+    total, current = mux_progress_lines(
+        decoded=1500,
+        expected_bytes=3000,
+        finished=1,
+        expected_files=3,
+        current=("b.bin", 400, 1000, False),
+        inst_bps=2 * 1048576,
+    )
     assert total.startswith("total")
+    assert "50.0%" in total
     assert "1/3 files" in total
     assert "2.0MiB/s" in total
-    assert current.startswith("current")
-    assert "b.bin +1" in current
-    packed = mux_progress_lines([("__pack_0", 50, 100, False)])
-    assert "pack" in packed[1]
-    idle = mux_progress_lines([("z.bin", 10, 10, True)])
-    assert "done" in idle[1]
+    assert current.startswith("b.bin")
+    assert "current" not in current
+    assert "+1" not in current
+    packed = mux_progress_lines(
+        decoded=50,
+        expected_bytes=100,
+        finished=0,
+        expected_files=1,
+        current=("__pack_0", 50, 100, False),
+    )
+    assert packed[1].startswith("pack_0")
+    later = mux_progress_lines(
+        decoded=2000,
+        expected_bytes=3000,
+        finished=2,
+        expected_files=3,
+        current=("c.bin", 500, 1000, False),
+    )
+    assert "66.7%" in later[0]
+    assert "2/3 files" in later[0]
+    assert later[1].startswith("c.bin")
+
+
+def test_current_progress_stays_on_oldest_incomplete(tmp_path: Path):
+    from tetrys_nc.object_xfer import _Sink
+
+    sink = _Sink(tmp_path)
+    sink.open(1, "a.bin", 1000)
+    sink.open(2, "b.bin", 1000)
+    sink.written[1] = 400
+    sink.written[2] = 50
+    name, wrote, size, done = sink.current_progress()
+    assert name == "a.bin"
+    assert wrote == 400
+    sink.written[2] = 900
+    name, wrote, _, _ = sink.current_progress()
+    assert name == "a.bin" and wrote == 400
+    sink.written[1] = 300
+    name, wrote, _, _ = sink.current_progress()
+    assert name == "a.bin" and wrote == 400
+    sink.finished.add(1)
+    sink.written[1] = 1000
+    name, wrote, _, _ = sink.current_progress()
+    assert name == "b.bin" and wrote == 900
 
 
 def test_split_pack_start_avoids_name_collision():

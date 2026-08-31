@@ -82,64 +82,45 @@ def _file_bar_line(
 
 def _short_obj_name(name: str) -> str:
     if name.startswith("__pack_"):
-        return "pack"
-    return name.split("/")[-1]
+        suffix = name[len("__pack_") :]
+        return f"pack_{suffix}" if suffix else "pack"
+    return Path(name).name or name
 
 
 def mux_progress_lines(
-    rows: list[tuple[str, int, int, bool]],
-    inst_bps: float = 0.0,
     *,
-    blocks_done: int = 0,
-    total_blocks: int | None = None,
+    decoded: int,
+    expected_bytes: int,
+    finished: int,
+    expected_files: int,
+    current: tuple[str, int, int, bool] | None,
+    inst_bps: float = 0.0,
 ) -> list[str]:
-    """Two TTY lines: whole mux group, then in-flight objects only."""
-    n_all = len(rows)
-    n_done = 0
-    total_size = 0
-    total_wrote = 0
-    cur_size = 0
-    cur_wrote = 0
-    cur_names: list[str] = []
-    for name, wrote, size, done in rows:
-        cap = size if size > 0 else wrote
-        total_size += cap
-        total_wrote += min(wrote, cap) if cap else wrote
-        if done:
-            n_done += 1
-            continue
-        cur_size += cap
-        cur_wrote += min(wrote, cap) if cap else wrote
-        cur_names.append(_short_obj_name(name))
-    if total_size > 0:
-        group_frac = min(1.0, total_wrote / total_size)
-    elif total_blocks:
-        group_frac = min(1.0, blocks_done / total_blocks)
+    """Two TTY lines: group totals, then the in-flight file name as the label."""
+    col = 16
+    denom = expected_bytes if expected_bytes > 0 else max(decoded, 1)
+    group_frac = min(1.0, decoded / denom)
+    if expected_files > 0:
+        files_txt = f"{min(finished, expected_files)}/{expected_files} files "
     else:
-        group_frac = 1.0 if n_all and n_done == n_all else 0.0
-    files_txt = f"{n_done}/{n_all}" if n_all else "0/0"
+        files_txt = f"{finished} files "
     group = (
-        f"{'total':<8} [{_bar(group_frac)}] {100.0 * group_frac:5.1f}% "
-        f"{files_txt} files {_fmt_size(total_wrote)}/{_fmt_size(total_size)}"
+        f"{'total':<{col}} [{_bar(group_frac)}] {100.0 * group_frac:5.1f}% "
+        f"{files_txt}{_fmt_size(decoded)}/{_fmt_size(expected_bytes)}"
         f"  {_fmt_rate(inst_bps)}"
     )
-    if cur_names:
-        cur_frac = min(1.0, cur_wrote / cur_size) if cur_size else 0.0
-        label = cur_names[0]
-        if len(cur_names) > 1:
-            extra = len(cur_names) - 1
-            budget = 28 - len(f" +{extra}")
-            label = f"{label[: max(4, budget)]} +{extra}"
-        current = (
-            f"{'current':<8} [{_bar(cur_frac)}] {100.0 * cur_frac:5.1f}% "
-            f"{label} {_fmt_size(cur_wrote)}/{_fmt_size(cur_size)}"
-        )
+    if current is None:
+        cur = f"{'—':<{col}} [{_bar(0.0)}]"
     else:
-        current = (
-            f"{'current':<8} [{_bar(1.0 if n_all and n_done == n_all else 0.0)}] "
-            f"{'idle' if n_done < n_all or not n_all else 'done'}"
+        name, wrote, size, _done = current
+        cap = size if size > 0 else max(wrote, 1)
+        frac = min(1.0, wrote / cap)
+        label = (_short_obj_name(name) or "file")[:col]
+        cur = (
+            f"{label:<{col}} [{_bar(frac)}] {100.0 * frac:5.1f}% "
+            f"{_fmt_size(wrote)}/{_fmt_size(size)}"
         )
-    return [group, current]
+    return [f"{group:<96}", f"{cur:<96}"]
 
 
 def _redraw_file_bars(lines: list[str], prev_rows: int) -> int:
@@ -186,6 +167,8 @@ class ObjectSession:
         self._pending: deque[ObjectCursor] = deque()
         self._next_id = 1
         self._closed = False
+        self.nobj = 0
+        self.nbytes = 0
 
     def put(self, name: str, data: bytes) -> int:
         safe = Path(name).name
@@ -197,6 +180,8 @@ class ObjectSession:
             obj_id = self._next_id
             self._next_id += 1
             self._pending.append(ObjectCursor(obj_id, safe, data))
+            self.nobj += 1
+            self.nbytes += len(data)
             return obj_id
 
     def close(self) -> None:
@@ -269,8 +254,8 @@ def run_object_server(
         raise TimeoutError("object-mux server timed out waiting for READY")
 
     meta = BlockMeta(
-        session_id, 0, MUX_META_NAME, symbol_size, block_k,
-        initial_repair_pct, geometry.active_bytes, "",
+        session_id, session.nbytes, MUX_META_NAME, symbol_size, block_k,
+        initial_repair_pct, geometry.active_bytes, f"n={session.nobj}",
     ).pack()
     _burst(sock, client, meta, 8, 0.0)
     return run_object_session(
@@ -448,6 +433,9 @@ class _Sink:
         self._truncated: set[int] = set()
         self.decoded = 0
         self.just_finished: list[tuple[str, int]] = []
+        self.last_oid: int | None = None
+        self._bar_name = ""
+        self._bar_frac = 0.0
 
     def _mark_finished(self, obj_id: int) -> None:
         if obj_id in self.finished:
@@ -497,6 +485,7 @@ class _Sink:
             self.written.get(chunk.obj_id, 0), chunk.offset + len(chunk.data)
         )
         self.decoded += len(chunk.data)
+        self.last_oid = chunk.obj_id
         size = self.sizes.get(chunk.obj_id)
         if size is not None and self.written.get(chunk.obj_id, 0) >= size:
             self._mark_finished(chunk.obj_id)
@@ -534,6 +523,35 @@ class _Sink:
             done = oid in self.finished or (size > 0 and wrote >= size)
             rows.append((name, wrote, size, done))
         return rows
+
+    def current_progress(self) -> tuple[str, int, int, bool] | None:
+        """Oldest incomplete object so the current bar only advances."""
+        oid = None
+        for cand in self.names:
+            size = self.sizes.get(cand, 0)
+            wrote = self.written.get(cand, 0)
+            done = cand in self.finished or (size > 0 and wrote >= size)
+            if done:
+                continue
+            if oid is None or cand < oid:
+                oid = cand
+        if oid is None:
+            if not self.names:
+                return None
+            oid = max(self.names)
+        name = self.names.get(oid, f"obj_{oid}")
+        size = self.sizes.get(oid, 0)
+        wrote = self.written.get(oid, 0)
+        done = oid in self.finished or (size > 0 and wrote >= size)
+        cap = size if size > 0 else max(wrote, 1)
+        frac = 1.0 if done else min(1.0, wrote / cap)
+        if name != self._bar_name:
+            self._bar_name = name
+            self._bar_frac = frac
+        else:
+            self._bar_frac = max(self._bar_frac, frac)
+        show = cap if self._bar_frac >= 1.0 else int(self._bar_frac * cap)
+        return name, show, size, done
 
     def explode_packs(self) -> None:
         for path in list(self.dir.iterdir()):
@@ -610,6 +628,14 @@ def consume_object_stream(
     geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
     output_dir.mkdir(parents=True, exist_ok=True)
     sink = _Sink(output_dir)
+    expected_bytes = int(meta.file_size or 0)
+    expected_files = 0
+    digest = (meta.sha256_hex or "").strip()
+    if digest.startswith("n="):
+        try:
+            expected_files = int(digest[2:])
+        except ValueError:
+            expected_files = 0
     slots: dict[int, GenReceiveSlot] = {}
     done: set[int] = set()
     unique = feedback_id = last_echo = 0
@@ -702,10 +728,12 @@ def consume_object_stream(
                 if tty and now - last_draw >= 0.05:
                     bar_rows = _redraw_file_bars(
                         mux_progress_lines(
-                            sink.all_bars(),
-                            inst,
-                            blocks_done=len(done),
-                            total_blocks=total_blocks,
+                            decoded=sink.decoded,
+                            expected_bytes=expected_bytes,
+                            finished=len(sink.finished),
+                            expected_files=expected_files,
+                            current=sink.current_progress(),
+                            inst_bps=inst,
                         ),
                         bar_rows,
                     )
@@ -746,10 +774,12 @@ def consume_object_stream(
             inst = sample_rate(time.monotonic(), sink.decoded)
             _redraw_file_bars(
                 mux_progress_lines(
-                    sink.all_bars(),
-                    inst,
-                    blocks_done=len(done),
-                    total_blocks=total_blocks,
+                    decoded=sink.decoded,
+                    expected_bytes=expected_bytes,
+                    finished=len(sink.finished),
+                    expected_files=expected_files,
+                    current=sink.current_progress(),
+                    inst_bps=inst,
                 ),
                 bar_rows,
             )

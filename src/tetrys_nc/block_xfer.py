@@ -406,20 +406,20 @@ def run_block_server(
                     f"serve mux files={len(files)} from {client[0]}:{client[1]}",
                     flush=True,
                 )
+                obj_session = ObjectSession()
+                queue_disk_files(obj_session, files)
                 meta = BlockMeta(
                     session_id,
-                    0,
+                    obj_session.nbytes,
                     MUX_META_NAME,
                     symbol_size,
                     block_k,
                     initial_repair_pct,
                     geometry.active_bytes,
-                    "",
+                    f"n={obj_session.nobj}",
                 ).pack()
                 for _ in range(8):
                     sock.sendto(meta, client)
-                obj_session = ObjectSession()
-                queue_disk_files(obj_session, files)
                 run_object_session(
                     sock,
                     client,
