@@ -85,6 +85,11 @@ def main_objclient(argv: list[str] | None = None) -> int:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--wan", action="store_true")
     p.add_argument("--timeout", type=float, default=180.0)
+    p.add_argument(
+        "--progress",
+        action="store_true",
+        help="per-file progress bars (TTY)",
+    )
     args = p.parse_args(argv)
     print(f"connecting object-mux to udp://{args.host}:{args.port}", flush=True)
     return run_object_client(
@@ -92,4 +97,5 @@ def main_objclient(argv: list[str] | None = None) -> int:
         wan=args.wan,
         active_bytes=WAN_ACTIVE_BYTES if args.wan else 4 << 20,
         timeout_s=args.timeout,
+        file_progress=args.progress,
     )

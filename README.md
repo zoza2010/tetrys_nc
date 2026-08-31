@@ -6,8 +6,9 @@ Block transfer (`server` / `client`) and object-mux (`objserver` / `objclient`) 
 uv sync --group dev
 uv run python -m sim.genfile --output testdata/blob_1g.bin --size 1G
 
-uv run python -m tetrys_nc server --file testdata/blob_1g.bin --port 7494 --wan --skip-hash
-uv run python -m tetrys_nc client --host 127.0.0.1 --port 7494 --wan --output testdata/recv.bin
+uv run python -m tetrys_nc server --dir testdata --port 7494 --wan --skip-hash
+uv run python -m tetrys_nc client --host 127.0.0.1 --port 7494 --wan --file blob_1g.bin --output testdata/recv.bin
+uv run python -m tetrys_nc client --host 127.0.0.1 --port 7494 --wan --file cmp_1000small --output testdata/recvdir
 
 uv run python -m tetrys_nc objserver --early DIR [--late DIR] --wan --port 7494
 uv run python -m tetrys_nc objclient --output DIR --host HOST --port 7494 --wan

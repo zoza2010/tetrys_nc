@@ -44,6 +44,7 @@ from tetrys_nc.block_state import (
 from tetrys_nc.block_xfer import (
     _pace_limits,
     _rate_cc_enabled,
+    _safe_join,
     encode_block_job,
     rebuild_block_encoder,
     run_block_client,
@@ -116,8 +117,21 @@ def test_completion_ranges_are_compact_and_rotate():
 def test_parse_packet_rejects_unknown_version():
     ready = BlockReady(9, 64 << 20).pack()
     assert parse_packet(ready) == BlockReady(9, 64 << 20)
+    named = BlockReady(9, 64 << 20, "testdata/blob.bin")
+    assert parse_packet(named.pack()) == named
     with pytest.raises(ValueError):
         parse_packet(b"\x54\x09\x30\x00" + bytes(8))
+
+
+def test_safe_join_stays_under_root(tmp_path: Path):
+    blob = tmp_path / "sub" / "x.bin"
+    blob.parent.mkdir()
+    blob.write_bytes(b"ok")
+    assert _safe_join(tmp_path, "sub/x.bin") == blob.resolve()
+    assert _safe_join(tmp_path, "../x.bin") is None
+    assert _safe_join(tmp_path, "/etc/passwd") is None
+    assert _safe_join(tmp_path, "") is None
+    assert _safe_join(tmp_path, "missing.bin") is None
 
 
 def test_feedback_state_is_idempotent_and_monotonic():
@@ -422,7 +436,8 @@ def test_loopback_transfer_is_byte_correct(tmp_path: Path):
             run_block_server(
                 "127.0.0.1",
                 port,
-                src,
+                tmp_path,
+                default_file="in.bin",
                 symbol_size=256,
                 block_k=64,
                 initial_repair_pct=14,
@@ -436,7 +451,117 @@ def test_loopback_transfer_is_byte_correct(tmp_path: Path):
     thread = threading.Thread(target=server, daemon=False)
     thread.start()
     time.sleep(0.05)
-    run_block_client("127.0.0.1", port, dst, active_bytes=4 << 20)
+    run_block_client("127.0.0.1", port, dst, remote="in.bin", active_bytes=4 << 20)
     thread.join(timeout=8)
     assert not errors, errors[0]
     assert dst.read_bytes() == payload
+
+
+def test_loopback_server_serves_two_clients(tmp_path: Path):
+    src = tmp_path / "in.bin"
+    dst1 = tmp_path / "out1.bin"
+    dst2 = tmp_path / "out2.bin"
+    payload = os.urandom(3 * 64 * 256 + 17)
+    src.write_bytes(payload)
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1",
+                port,
+                tmp_path,
+                default_file="in.bin",
+                symbol_size=256,
+                block_k=64,
+                initial_repair_pct=14,
+                active_bytes=4 << 20,
+                rate_mbit=400,
+                skip_hash=True,
+                once=False,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    run_block_client("127.0.0.1", port, dst1, remote="in.bin", active_bytes=4 << 20)
+    run_block_client("127.0.0.1", port, dst2, remote="in.bin", active_bytes=4 << 20)
+    assert dst1.read_bytes() == payload
+    assert dst2.read_bytes() == payload
+    assert not errors, errors[0]
+
+
+def test_loopback_client_picks_file_under_root(tmp_path: Path):
+    (tmp_path / "a.bin").write_bytes(b"aaa" * 1000)
+    (tmp_path / "b.bin").write_bytes(b"bbb" * 2000)
+    dst = tmp_path / "out.bin"
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1",
+                port,
+                tmp_path,
+                symbol_size=256,
+                block_k=64,
+                initial_repair_pct=14,
+                active_bytes=4 << 20,
+                rate_mbit=400,
+                skip_hash=True,
+                once=False,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    run_block_client("127.0.0.1", port, dst, remote="b.bin", active_bytes=4 << 20)
+    assert dst.read_bytes() == b"bbb" * 2000
+    with pytest.raises(FileNotFoundError):
+        run_block_client(
+            "127.0.0.1", port, tmp_path / "bad.bin", remote="../etc/passwd",
+            active_bytes=4 << 20,
+        )
+    assert not errors, errors[0]
+
+
+def test_loopback_directory_uses_mux(tmp_path: Path):
+    src = tmp_path / "many"
+    src.mkdir()
+    blobs = {f"f{i}.bin": os.urandom(800 + i) for i in range(12)}
+    for name, data in blobs.items():
+        (src / name).write_bytes(data)
+    out = tmp_path / "out"
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1",
+                port,
+                tmp_path,
+                symbol_size=256,
+                block_k=64,
+                initial_repair_pct=14,
+                active_bytes=4 << 20,
+                rate_mbit=400,
+                skip_hash=True,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=False)
+    thread.start()
+    time.sleep(0.05)
+    run_block_client("127.0.0.1", port, out, remote="many", active_bytes=4 << 20)
+    thread.join(timeout=15)
+    assert not errors, errors[0]
+    got = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert got == blobs

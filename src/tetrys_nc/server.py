@@ -9,11 +9,39 @@ from .block_state import WAN_INITIAL_REPAIR_PCT, WAN_PACE_CAP_MBIT
 from .block_xfer import run_block_server
 
 
+def _root_and_default(dir_arg: Path | None, file_arg: Path | None) -> tuple[Path, str]:
+    if file_arg is not None and file_arg.exists():
+        resolved = file_arg.resolve()
+        if dir_arg is None:
+            return resolved.parent, resolved.name
+        root = dir_arg.resolve()
+        try:
+            return root, str(resolved.relative_to(root))
+        except ValueError:
+            return root, resolved.name
+    root = (dir_arg or Path(".")).resolve()
+    default = "" if file_arg is None else str(file_arg)
+    if Path(default).is_absolute():
+        default = Path(default).name
+    return root, default
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="RaptorQ UDP file server")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9000)
-    p.add_argument("--file", type=Path, required=True)
+    p.add_argument(
+        "--dir",
+        type=Path,
+        default=None,
+        help="root directory; client READY paths are relative to this",
+    )
+    p.add_argument(
+        "--file",
+        type=Path,
+        default=None,
+        help="optional default relative file if the client omits a path",
+    )
     p.add_argument("--skip-hash", action="store_true")
     p.add_argument(
         "--wan",
@@ -47,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
         help="blast rate search (default off = locked --rate). Pass --cc to enable",
     )
     p.add_argument(
+        "--once",
+        action="store_true",
+        help="exit after one transfer (default: stay idle and wait for the next client)",
+    )
+    p.add_argument(
         "--gen-k",
         type=int,
         default=None,
@@ -73,11 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         overhead_pct = 0
     gen_k = args.gen_k if args.gen_k is not None else 768
+    root, default_file = _root_and_default(args.dir, args.file)
 
     return run_block_server(
         args.host,
         args.port,
-        args.file,
+        root,
+        default_file=default_file,
         symbol_size=symbol,
         block_k=gen_k,
         initial_repair_pct=overhead_pct,
@@ -85,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
         rate_cc=args.cc,
+        once=args.once,
     )
 
 

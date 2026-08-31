@@ -42,16 +42,33 @@ class OpenBlock:
 class BlockReady:
     session_id: int
     active_bytes: int
+    rel_path: str = ""
 
     def pack(self) -> bytes:
-        return _HDR.pack(
-            MAGIC, VERSION, BlockPacketType.READY, 0, self.session_id & 0xFFFFFFFF
-        ) + struct.pack("!I", self.active_bytes & 0xFFFFFFFF)
+        name = self.rel_path.encode("utf-8")[:1200]
+        return (
+            _HDR.pack(
+                MAGIC, VERSION, BlockPacketType.READY, 0, self.session_id & 0xFFFFFFFF
+            )
+            + struct.pack("!IH", self.active_bytes & 0xFFFFFFFF, len(name))
+            + name
+        )
 
     @classmethod
     def unpack(cls, data: bytes) -> BlockReady:
         _require(data, 12, BlockPacketType.READY)
-        return cls(struct.unpack_from("!I", data, 4)[0], struct.unpack_from("!I", data, 8)[0])
+        session = struct.unpack_from("!I", data, 4)[0]
+        active = struct.unpack_from("!I", data, 8)[0]
+        if len(data) <= 12:
+            return cls(session, active, "")
+        if len(data) == 13 + data[12]:
+            path = data[13 : 13 + data[12]].decode("utf-8")
+            return cls(session, active, path)
+        nlen = struct.unpack_from("!H", data, 12)[0]
+        if len(data) < 14 + nlen:
+            raise ValueError("READY path truncated")
+        path = data[14 : 14 + nlen].decode("utf-8")
+        return cls(session, active, path)
 
 
 @dataclass(slots=True)
@@ -78,8 +95,9 @@ class BlockMeta:
             len(name),
             len(digest),
         )
+        flags = 1 if self.file_size == 0 and self.file_name.startswith("!") else 0
         return (
-            _HDR.pack(MAGIC, VERSION, BlockPacketType.META, 0, self.session_id)
+            _HDR.pack(MAGIC, VERSION, BlockPacketType.META, flags, self.session_id)
             + body
             + name
             + digest

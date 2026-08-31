@@ -6,6 +6,7 @@ import os
 import random
 import select
 import socket
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -37,11 +38,62 @@ from .block_state import (
 from .block_xfer import _pace_limits
 from .gen_raptor import GenEncoder, GenReceiveSlot
 from .netutil import recv_datagrams, send_datagrams, try_set_buffer
-from .object_frames import FRAME_HDR, BlockFill, ObjectCursor, is_pack_name, unpack_block, unpack_files
+from .object_frames import FRAME_HDR, BlockFill, ObjectCursor, is_pack_name, split_for_session, unpack_block, unpack_files
 from .ratectl import RateLimiter
 
 _FEEDBACK_S = 0.020
 _SEND_CHUNK = 64
+_BAR_W = 22
+
+
+def _bar(frac: float, width: int = _BAR_W) -> str:
+    frac = 0.0 if frac < 0 else 1.0 if frac > 1 else frac
+    filled = int(round(width * frac))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _fmt_size(n: int) -> str:
+    if n >= 1048576:
+        return f"{n / 1048576:.1f}MiB"
+    if n >= 1024:
+        return f"{n / 1024:.1f}KiB"
+    return f"{n}B"
+
+
+def _fmt_rate(bps: float) -> str:
+    return f"{max(0.0, bps) / 1048576:.1f}MiB/s"
+
+
+def _file_bar_line(
+    name: str, wrote: int, size: int, done: bool, rate_bps: float | None = None
+) -> str:
+    total = size or wrote
+    frac = 1.0 if done else ((wrote / total) if total else 0.0)
+    pct = 100.0 if done else 100.0 * frac
+    shown = total if done else wrote
+    line = (
+        f"{name[:36]:<36} [{_bar(frac)}] {pct:5.1f}% "
+        f"{_fmt_size(shown)}/{_fmt_size(size)}"
+    )
+    if rate_bps is not None:
+        line += f"  {_fmt_rate(rate_bps)}"
+    return line
+
+
+def _redraw_file_bars(lines: list[str], prev_rows: int) -> int:
+    n = len(lines)
+    parts: list[str] = []
+    if prev_rows:
+        parts.append(f"\x1b[{prev_rows}A")
+    for line in lines:
+        parts.append(f"\x1b[2K{line}\n")
+    extra = prev_rows - n
+    if extra > 0:
+        parts.extend("\x1b[2K\n" for _ in range(extra))
+        parts.append(f"\x1b[{extra}A")
+    sys.stdout.write("".join(parts))
+    sys.stdout.flush()
+    return n
 
 
 def _safe_name(name: str) -> str:
@@ -159,10 +211,45 @@ def run_object_server(
         initial_repair_pct, geometry.active_bytes, "",
     ).pack()
     _burst(sock, client, meta, 8, 0.0)
+    return run_object_session(
+        sock, client, session_id, session,
+        geometry=geometry,
+        initial_repair_pct=initial_repair_pct,
+        min_bps=min_bps,
+        max_bps=max_bps,
+        start_bps=start_bps,
+        close_sock=True,
+    )
 
+
+def queue_disk_files(session: ObjectSession, files: list[tuple[str, Path]]) -> int:
+    blobs = [(name, path.read_bytes()) for name, path in files]
+    packed = split_for_session(blobs)
+    for name, blob in packed:
+        session.put(name, blob)
+    session.close()
+    return len(files)
+
+
+def run_object_session(
+    sock: socket.socket,
+    client,
+    session_id: int,
+    session: ObjectSession,
+    *,
+    geometry: BlockGeometry,
+    initial_repair_pct: int,
+    min_bps: float,
+    max_bps: float,
+    start_bps: float,
+    close_sock: bool = False,
+) -> int:
+    block_k = geometry.block_k
+    symbol_size = geometry.symbol_size
+    limiter = RateLimiter(max_bps, start_bps=start_bps, min_frac=min_bps / max_bps)
     feedback = SenderFeedbackState(session_id)
     stop, client_fin = threading.Event(), threading.Event()
-    limiter = RateLimiter(max_bps, start_bps=start_bps, min_frac=min_bps / max_bps)
+    t0 = time.monotonic()
 
     def feedback_loop() -> None:
         while not stop.is_set():
@@ -267,7 +354,14 @@ def run_object_server(
     finally:
         stop.set()
         fb_thread.join(timeout=1.0)
-        sock.close()
+        if close_sock:
+            sock.close()
+    elapsed = max(time.monotonic() - t0, 1e-6)
+    print(
+        f"done in {elapsed:.2f}s — mux blocks={next_block} "
+        f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload",
+        flush=True,
+    )
     return 0
 
 
@@ -282,6 +376,14 @@ class _Sink:
         self._fds: OrderedDict[int, int] = OrderedDict()
         self._truncated: set[int] = set()
         self.decoded = 0
+        self.just_finished: list[tuple[str, int]] = []
+
+    def _mark_finished(self, obj_id: int) -> None:
+        if obj_id in self.finished:
+            return
+        self.finished.add(obj_id)
+        name = self.names.get(obj_id, f"obj_{obj_id}")
+        self.just_finished.append((name, self.sizes.get(obj_id, 0)))
 
     def _fd(self, obj_id: int) -> int | None:
         if obj_id not in self.names:
@@ -324,6 +426,9 @@ class _Sink:
             self.written.get(chunk.obj_id, 0), chunk.offset + len(chunk.data)
         )
         self.decoded += len(chunk.data)
+        size = self.sizes.get(chunk.obj_id)
+        if size is not None and self.written.get(chunk.obj_id, 0) >= size:
+            self._mark_finished(chunk.obj_id)
         self._maybe_close(chunk.obj_id)
 
     def fin(self, obj_id: int, name: str, size: int) -> None:
@@ -338,7 +443,10 @@ class _Sink:
                     src.replace(dst)
                 self.names[obj_id] = safe
         self.sizes[obj_id] = size
-        self.finished.add(obj_id)
+        if self.written.get(obj_id, 0) >= size:
+            self._mark_finished(obj_id)
+        else:
+            self.finished.add(obj_id)
         self._maybe_close(obj_id)
 
     def ingest(self, payload: bytes) -> None:
@@ -346,10 +454,15 @@ class _Sink:
             if chunk.name:
                 self.open(chunk.obj_id, chunk.name, chunk.size)
             self.write(chunk)
-            size = self.sizes.get(chunk.obj_id)
-            if size is not None and self.written.get(chunk.obj_id, 0) >= size:
-                self.finished.add(chunk.obj_id)
-                self._maybe_close(chunk.obj_id)
+
+    def all_bars(self) -> list[tuple[str, int, int, bool]]:
+        rows: list[tuple[str, int, int, bool]] = []
+        for oid, name in self.names.items():
+            size = self.sizes.get(oid, 0)
+            wrote = self.written.get(oid, 0)
+            done = oid in self.finished or (size > 0 and wrote >= size)
+            rows.append((name, wrote, size, done))
+        return rows
 
     def explode_packs(self) -> None:
         for path in list(self.dir.iterdir()):
@@ -379,6 +492,7 @@ def run_object_client(
     wan: bool = False,
     active_bytes: int = 4 << 20,
     timeout_s: float = 180.0,
+    file_progress: bool = False,
 ) -> int:
     del wan
     sock = _udp(None, None, snd=8 << 20, rcv=32 << 20)
@@ -404,6 +518,23 @@ def run_object_client(
     if meta.file_name != MUX_META_NAME:
         sock.close()
         raise ValueError("not an object-mux session")
+    return consume_object_stream(
+        sock, server, session_id, meta, output_dir, timeout_s, close_sock=True,
+        file_progress=file_progress,
+    )
+
+
+def consume_object_stream(
+    sock: socket.socket,
+    server,
+    session_id: int,
+    meta: BlockMeta,
+    output_dir: Path,
+    timeout_s: float,
+    *,
+    close_sock: bool = True,
+    file_progress: bool = False,
+) -> int:
 
     geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -414,6 +545,23 @@ def run_object_client(
     last_fb = 0.0
     total_blocks: int | None = None
     t0 = time.monotonic()
+    last_log = t0
+    last_draw = 0.0
+    bar_rows = 0
+    tty = sys.stdout.isatty()
+    rate_t = t0
+    rate_b = 0
+    inst_bps = 0.0
+
+    def sample_rate(now: float, nbytes: int) -> float:
+        nonlocal rate_t, rate_b, inst_bps
+        dt = now - rate_t
+        if dt >= 0.2:
+            inst_bps = (nbytes - rate_b) / dt
+            rate_t, rate_b = now, nbytes
+        elif now > t0:
+            inst_bps = nbytes / (now - t0)
+        return inst_bps
 
     def send_feedback(force: bool = False) -> None:
         nonlocal feedback_id, last_fb
@@ -477,6 +625,39 @@ def run_object_client(
                     elif isinstance(packet, BlockFin):
                         total_blocks = packet.total_blocks
             send_feedback()
+            now = time.monotonic()
+            if file_progress:
+                inst = sample_rate(now, sink.decoded)
+                if tty and now - last_draw >= 0.05:
+                    lines = [
+                        _file_bar_line(name, wrote, size, done, inst)
+                        for name, wrote, size, done in sink.all_bars()
+                    ]
+                    if lines:
+                        bar_rows = _redraw_file_bars(lines, bar_rows)
+                        last_draw = now
+                elif not tty:
+                    for name, size in sink.just_finished:
+                        print(
+                            _file_bar_line(name, size, size, True, inst),
+                            flush=True,
+                        )
+                    sink.just_finished.clear()
+            elif now - last_log >= 1.0:
+                elapsed = max(now - t0, 1e-6)
+                inst = sample_rate(now, sink.decoded)
+                blk = (
+                    f"{len(done)}/{total_blocks}"
+                    if total_blocks is not None
+                    else str(len(done))
+                )
+                print(
+                    f"progress files={len(sink.finished)} blocks={blk} "
+                    f"app={sink.decoded / elapsed / 1048576:.1f}MiB/s "
+                    f"inst={_fmt_rate(inst)}",
+                    flush=True,
+                )
+                last_log = now
             if (
                 total_blocks
                 and all(i in done for i in range(total_blocks))
@@ -487,13 +668,29 @@ def run_object_client(
                 raise TimeoutError("object-mux client timed out")
         send_feedback(force=True)
         _burst(sock, server, BlockFin(session_id, total_blocks or 0).pack(), 16)
+        if file_progress and tty:
+            inst = sample_rate(time.monotonic(), sink.decoded)
+            lines = [
+                _file_bar_line(name, wrote, size, done, inst)
+                for name, wrote, size, done in sink.all_bars()
+            ]
+            if lines:
+                _redraw_file_bars(lines, bar_rows)
     finally:
         for slot in slots.values():
             slot.close()
         sink.close()
-        sock.close()
+        if close_sock:
+            sock.close()
     sink.check()
     sink.explode_packs()
     nfiles = sum(1 for p in output_dir.iterdir() if p.is_file())
-    print(f"object-mux OK: {nfiles} files in {output_dir} blocks={len(done)}", flush=True)
+    nbytes = sum(p.stat().st_size for p in output_dir.iterdir() if p.is_file())
+    elapsed = max(time.monotonic() - t0, 1e-6)
+    print(
+        f"done in {elapsed:.2f}s — goodput {nbytes / elapsed / 1048576:.2f} MiB/s — "
+        f"files={nfiles} in {output_dir} blocks={len(done)} "
+        f"decoded={sink.decoded / 1048576:.1f}MiB",
+        flush=True,
+    )
     return 0
