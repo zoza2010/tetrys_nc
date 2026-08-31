@@ -80,6 +80,68 @@ def _file_bar_line(
     return line
 
 
+def _short_obj_name(name: str) -> str:
+    if name.startswith("__pack_"):
+        return "pack"
+    return name.split("/")[-1]
+
+
+def mux_progress_lines(
+    rows: list[tuple[str, int, int, bool]],
+    inst_bps: float = 0.0,
+    *,
+    blocks_done: int = 0,
+    total_blocks: int | None = None,
+) -> list[str]:
+    """Two TTY lines: whole mux group, then in-flight objects only."""
+    n_all = len(rows)
+    n_done = 0
+    total_size = 0
+    total_wrote = 0
+    cur_size = 0
+    cur_wrote = 0
+    cur_names: list[str] = []
+    for name, wrote, size, done in rows:
+        cap = size if size > 0 else wrote
+        total_size += cap
+        total_wrote += min(wrote, cap) if cap else wrote
+        if done:
+            n_done += 1
+            continue
+        cur_size += cap
+        cur_wrote += min(wrote, cap) if cap else wrote
+        cur_names.append(_short_obj_name(name))
+    if total_size > 0:
+        group_frac = min(1.0, total_wrote / total_size)
+    elif total_blocks:
+        group_frac = min(1.0, blocks_done / total_blocks)
+    else:
+        group_frac = 1.0 if n_all and n_done == n_all else 0.0
+    files_txt = f"{n_done}/{n_all}" if n_all else "0/0"
+    group = (
+        f"{'total':<8} [{_bar(group_frac)}] {100.0 * group_frac:5.1f}% "
+        f"{files_txt} files {_fmt_size(total_wrote)}/{_fmt_size(total_size)}"
+        f"  {_fmt_rate(inst_bps)}"
+    )
+    if cur_names:
+        cur_frac = min(1.0, cur_wrote / cur_size) if cur_size else 0.0
+        label = cur_names[0]
+        if len(cur_names) > 1:
+            extra = len(cur_names) - 1
+            budget = 28 - len(f" +{extra}")
+            label = f"{label[: max(4, budget)]} +{extra}"
+        current = (
+            f"{'current':<8} [{_bar(cur_frac)}] {100.0 * cur_frac:5.1f}% "
+            f"{label} {_fmt_size(cur_wrote)}/{_fmt_size(cur_size)}"
+        )
+    else:
+        current = (
+            f"{'current':<8} [{_bar(1.0 if n_all and n_done == n_all else 0.0)}] "
+            f"{'idle' if n_done < n_all or not n_all else 'done'}"
+        )
+    return [group, current]
+
+
 def _redraw_file_bars(lines: list[str], prev_rows: int) -> int:
     n = len(lines)
     parts: list[str] = []
@@ -638,13 +700,16 @@ def consume_object_stream(
             if file_progress:
                 inst = sample_rate(now, sink.decoded)
                 if tty and now - last_draw >= 0.05:
-                    lines = [
-                        _file_bar_line(name, wrote, size, done, inst)
-                        for name, wrote, size, done in sink.all_bars()
-                    ]
-                    if lines:
-                        bar_rows = _redraw_file_bars(lines, bar_rows)
-                        last_draw = now
+                    bar_rows = _redraw_file_bars(
+                        mux_progress_lines(
+                            sink.all_bars(),
+                            inst,
+                            blocks_done=len(done),
+                            total_blocks=total_blocks,
+                        ),
+                        bar_rows,
+                    )
+                    last_draw = now
                 elif not tty:
                     for name, size in sink.just_finished:
                         print(
@@ -679,12 +744,15 @@ def consume_object_stream(
         _burst(sock, server, BlockFin(session_id, total_blocks or 0).pack(), 16)
         if file_progress and tty:
             inst = sample_rate(time.monotonic(), sink.decoded)
-            lines = [
-                _file_bar_line(name, wrote, size, done, inst)
-                for name, wrote, size, done in sink.all_bars()
-            ]
-            if lines:
-                _redraw_file_bars(lines, bar_rows)
+            _redraw_file_bars(
+                mux_progress_lines(
+                    sink.all_bars(),
+                    inst,
+                    blocks_done=len(done),
+                    total_blocks=total_blocks,
+                ),
+                bar_rows,
+            )
     finally:
         for slot in slots.values():
             slot.close()

@@ -178,6 +178,26 @@ def test_split_packs_micros_keeps_larges():
     assert restored == {n: d for n, d in micros} | {"big.bin": big[1]}
 
 
+def test_mux_progress_is_group_plus_current():
+    from tetrys_nc.object_xfer import mux_progress_lines
+
+    rows = [
+        ("a.bin", 1000, 1000, True),
+        ("b.bin", 400, 1000, False),
+        ("c.bin", 100, 1000, False),
+    ]
+    total, current = mux_progress_lines(rows, inst_bps=2 * 1048576)
+    assert total.startswith("total")
+    assert "1/3 files" in total
+    assert "2.0MiB/s" in total
+    assert current.startswith("current")
+    assert "b.bin +1" in current
+    packed = mux_progress_lines([("__pack_0", 50, 100, False)])
+    assert "pack" in packed[1]
+    idle = mux_progress_lines([("z.bin", 10, 10, True)])
+    assert "done" in idle[1]
+
+
 def test_split_pack_start_avoids_name_collision():
     a = split_for_session([("a.bin", b"x" * 10)], pack_max=100)
     b = split_for_session([("b.bin", b"y" * 10)], pack_max=100, pack_start=1)

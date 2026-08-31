@@ -88,7 +88,7 @@ def main_objclient(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--progress",
         action="store_true",
-        help="per-file progress bars (TTY)",
+        help="TTY bars: group + current in-flight files",
     )
     args = p.parse_args(argv)
     print(f"connecting object-mux to udp://{args.host}:{args.port}", flush=True)
