@@ -233,7 +233,7 @@ def run_object_server(
     rate_mbit: float = 400.0,
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
-    _, max_bps, start_bps = _pace_limits(rate_mbit)
+    _, _, start_bps = _pace_limits(rate_mbit)
     sock = _udp(host, port, snd=8 << 20, rcv=8 << 20)
     print(
         f"object-mux server udp://{host}:{port} K={block_k} T={symbol_size} "
@@ -264,7 +264,6 @@ def run_object_server(
         sock, client, session_id, session,
         geometry=geometry,
         initial_repair_pct=initial_repair_pct,
-        max_bps=max_bps,
         start_bps=start_bps,
         close_sock=True,
     )
@@ -287,13 +286,12 @@ def run_object_session(
     *,
     geometry: BlockGeometry,
     initial_repair_pct: int,
-    max_bps: float,
     start_bps: float,
     close_sock: bool = False,
 ) -> int:
     block_k = geometry.block_k
     symbol_size = geometry.symbol_size
-    limiter = RateLimiter(max_bps, start_bps=start_bps)
+    limiter = RateLimiter(start_bps)
     feedback = SenderFeedbackState(session_id)
     stop, client_fin = threading.Event(), threading.Event()
     t0 = time.monotonic()

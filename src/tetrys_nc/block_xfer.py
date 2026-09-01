@@ -363,10 +363,9 @@ class BlockSender:
         self.feedback = SenderFeedbackState(session_id)
         self.stop = threading.Event()
         self.client_fin = threading.Event()
+        pace = start_bps if not cc_on else start_bps * _SEED_FRAC
         self.limiter = RateLimiter(
-            max_bps,
-            start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
-            burst_s=_env_float("TETRYS_BURST_S", 0.008),
+            pace, burst_s=_env_float("TETRYS_BURST_S", 0.008)
         )
         self.cc = (
             BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
@@ -1070,7 +1069,6 @@ def run_block_server(
                     obj_session,
                     geometry=geometry,
                     initial_repair_pct=initial_repair_pct,
-                    max_bps=max_bps,
                     start_bps=start_bps,
                     close_sock=False,
                 )

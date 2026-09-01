@@ -1,4 +1,4 @@
-"""Token-bucket pacing. Rate search lives in BlastCc; this only meters."""
+"""Token-bucket pacing. Caller sets the rate (--rate lock or BlastCc)."""
 
 from __future__ import annotations
 
@@ -14,23 +14,20 @@ _SPIN_AFTER_S = 0.0004
 
 
 class RateLimiter:
-    def __init__(
-        self,
-        max_bps: float,
-        start_bps: float | None = None,
-        burst_s: float = _BURST_S,
-    ) -> None:
-        self.max_rate = max(max_bps, 1.0)
-        self.rate = min(self.max_rate, max(start_bps or self.max_rate, 1.0))
+    def __init__(self, rate_bps: float, burst_s: float = _BURST_S) -> None:
         self._burst_s = max(0.001, min(burst_s, 0.050))
-        self.burst = max(self.rate * self._burst_s, _MIN_BURST)
-        self.tokens = self.burst
-        self.updated = time.monotonic()
         self._sleep_debt = 0.0
+        self.updated = time.monotonic()
+        self.rate = 1.0
+        self.burst = _MIN_BURST
+        self.tokens = 0.0
+        self.set_rate(rate_bps)
+        self.tokens = self.burst
 
     def set_rate(self, rate_bps: float) -> None:
-        self.rate = min(self.max_rate, max(rate_bps, 1.0))
+        self.rate = max(rate_bps, 1.0)
         self.burst = max(self.rate * self._burst_s, _MIN_BURST)
+        self.tokens = min(self.tokens, self.burst)
 
     def consume(self, nbytes: int) -> float:
         now = time.monotonic()
