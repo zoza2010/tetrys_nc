@@ -29,6 +29,8 @@ from .block_state import (
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
     REPAIR_INTERVAL_S,
+    TAIL_REPAIR_COOLDOWN_S,
+    TAIL_REPAIR_TICK_PER_BLOCK,
     BlockGeometry,
     SenderBlockState,
     SenderFeedbackState,
@@ -344,19 +346,22 @@ def run_object_session(
             limiter.consume(sum(map(len, batch)))
             send_datagrams(sock, client, batch, chunk=_SEND_CHUNK)
 
-    def repair_tick(opened, now: float) -> None:
+    def repair_tick(opened, now: float, tail: bool) -> None:
+        cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
         candidates = select_repair_candidates(
-            active, opened, now, block_k=block_k, tail=session.idle(current),
-            age_s=REPAIR_AGE_S, cooldown_s=REPAIR_COOLDOWN_S,
+            active, opened, now, block_k=block_k, tail=tail,
+            age_s=REPAIR_AGE_S, cooldown_s=cooldown_s,
         )
-        budget, tick_s = repair_tick_limits(sum(n for n, *_ in candidates), tail=session.idle(current))
-        t0, sent = time.perf_counter(), 0
+        budget, tick_s = repair_tick_limits(sum(n for n, *_ in candidates), tail=tail)
+        per_block = TAIL_REPAIR_TICK_PER_BLOCK if tail else budget
+        t_r, sent = time.perf_counter(), 0
         for need, _age, block_id in candidates:
-            if sent >= budget or (time.perf_counter() - t0) >= tick_s:
+            if sent >= budget or (time.perf_counter() - t_r) >= tick_s:
                 break
             encoder, state = enc_cache[block_id], active[block_id]
             prev = encoder.packet_count
-            new_packets = encoder.ensure_repair(state.repair_emitted + min(need, budget - sent))
+            n = min(need, budget - sent, per_block)
+            new_packets = encoder.ensure_repair(state.repair_emitted + n)
             if not new_packets:
                 continue
             stamp = int(now * 1_000_000) & 0xFFFFFFFF
@@ -367,6 +372,7 @@ def run_object_session(
 
     try:
         aborted = False
+        fin_sent_at: float | None = None
         while not client_fin.is_set():
             completed, opened, *_ = feedback.snapshot()
             now = time.monotonic()
@@ -395,17 +401,19 @@ def run_object_session(
                 )
                 next_block += 1
                 admitted = True
-            if now - last_repair >= REPAIR_INTERVAL_S and active:
-                repair_tick(opened, now)
+            tail = session.idle(current)
+            if active and (tail or now - last_repair >= REPAIR_INTERVAL_S):
+                repair_tick(opened, now, tail)
                 last_repair = now
-            if session.idle(current) and not active and next_block > 0:
-                _burst(sock, client, BlockFin(session_id, next_block).pack(), 8)
-                grace = time.monotonic() + 2.0
-                while not client_fin.is_set() and time.monotonic() < grace:
-                    time.sleep(0.02)
-                break
-            if not admitted and not active:
-                time.sleep(0.002)
+            if tail and next_block > 0:
+                sock.sendto(BlockFin(session_id, next_block).pack(), client)
+            if tail and not active and next_block > 0:
+                if fin_sent_at is None:
+                    fin_sent_at = now
+                if now - fin_sent_at >= 2.0:
+                    break
+            if not admitted:
+                time.sleep(0.001 if tail else 0.002)
     finally:
         stop.set()
         fb_thread.join(timeout=1.0)
@@ -436,6 +444,7 @@ class _Sink:
         self.last_oid: int | None = None
         self._bar_name = ""
         self._bar_frac = 0.0
+        self._bar_snap: tuple[str, int, int, bool] | None = None
 
     def _mark_finished(self, obj_id: int) -> None:
         if obj_id in self.finished:
@@ -505,8 +514,6 @@ class _Sink:
         self.sizes[obj_id] = size
         if self.written.get(obj_id, 0) >= size:
             self._mark_finished(obj_id)
-        else:
-            self.finished.add(obj_id)
         self._maybe_close(obj_id)
 
     def ingest(self, payload: bytes) -> None:
@@ -525,7 +532,27 @@ class _Sink:
         return rows
 
     def current_progress(self) -> tuple[str, int, int, bool] | None:
-        """Oldest incomplete object so the current bar only advances."""
+        """In-flight object whose bar never rewinds (hold last peak across files)."""
+        def row(oid: int) -> tuple[str, int, int, bool, float]:
+            name = self.names.get(oid, f"obj_{oid}")
+            size = self.sizes.get(oid, 0)
+            wrote = self.written.get(oid, 0)
+            done = oid in self.finished or (size > 0 and wrote >= size)
+            cap = size if size > 0 else max(wrote, 1)
+            frac = 1.0 if done else min(1.0, wrote / cap)
+            show = cap if frac >= 1.0 else int(frac * cap)
+            return name, show, size, done, frac
+
+        if self._bar_name:
+            for prev_oid, prev_name in self.names.items():
+                if prev_name != self._bar_name:
+                    continue
+                _n, _w, size, done, frac = row(prev_oid)
+                if done:
+                    self._bar_frac = 1.0
+                    cap = size if size > 0 else 1
+                    self._bar_snap = (prev_name, cap, size, True)
+                break
         oid = None
         for cand in self.names:
             size = self.sizes.get(cand, 0)
@@ -539,19 +566,15 @@ class _Sink:
             if not self.names:
                 return None
             oid = max(self.names)
-        name = self.names.get(oid, f"obj_{oid}")
-        size = self.sizes.get(oid, 0)
-        wrote = self.written.get(oid, 0)
-        done = oid in self.finished or (size > 0 and wrote >= size)
-        cap = size if size > 0 else max(wrote, 1)
-        frac = 1.0 if done else min(1.0, wrote / cap)
-        if name != self._bar_name:
-            self._bar_name = name
-            self._bar_frac = frac
-        else:
-            self._bar_frac = max(self._bar_frac, frac)
-        show = cap if self._bar_frac >= 1.0 else int(self._bar_frac * cap)
-        return name, show, size, done
+        name, show, size, done, frac = row(oid)
+        if self._bar_snap is not None and frac + 1e-9 < self._bar_frac:
+            return self._bar_snap
+        self._bar_name = name
+        self._bar_frac = max(self._bar_frac, frac)
+        if self._bar_frac >= 1.0 and size:
+            show = size
+        self._bar_snap = (name, show, size, done)
+        return self._bar_snap
 
     def explode_packs(self) -> None:
         for path in list(self.dir.iterdir()):
@@ -667,7 +690,8 @@ def consume_object_stream(
             return
         feedback_id += 1
         opened = [
-            OpenBlock(bid, slot.symbols_rx, False, 0) for bid, slot in sorted(slots.items())
+            OpenBlock(bid, slot.symbols_rx, slot.decode_failed, 0)
+            for bid, slot in sorted(slots.items())
         ][:64]
         sock.sendto(
             BlockFeedback(

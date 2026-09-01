@@ -235,8 +235,42 @@ def test_current_progress_stays_on_oldest_incomplete(tmp_path: Path):
     assert name == "a.bin" and wrote == 400
     sink.finished.add(1)
     sink.written[1] = 1000
-    name, wrote, _, _ = sink.current_progress()
-    assert name == "b.bin" and wrote == 900
+    name, wrote, size, done = sink.current_progress()
+    assert name == "a.bin" and wrote == 1000 and done is True
+    sink.written[2] = 1000
+    sink.finished.add(2)
+    name, wrote, _, done = sink.current_progress()
+    assert name == "b.bin" and wrote == 1000 and done is True
+
+
+def test_current_progress_does_not_rewind_to_empty_next_file(tmp_path: Path):
+    from tetrys_nc.object_xfer import _Sink
+
+    sink = _Sink(tmp_path)
+    sink.open(1, "pack_a", 1000)
+    sink.written[1] = 1000
+    sink.finished.add(1)
+    sink.current_progress()
+    sink.open(2, "pack_b", 1000)
+    name, wrote, size, done = sink.current_progress()
+    assert name == "pack_a"
+    assert wrote == 1000
+    assert done is True
+    sink.written[2] = 1000
+    sink.finished.add(2)
+    name, wrote, _, done = sink.current_progress()
+    assert name == "pack_b" and wrote == 1000
+
+
+def test_object_fin_does_not_mark_unread_file_done(tmp_path: Path):
+    from tetrys_nc.object_xfer import _Sink
+
+    sink = _Sink(tmp_path)
+    sink.open(1, "tiny.bin", 80)
+    sink.fin(1, "tiny.bin", 80)
+    assert 1 not in sink.finished
+    name, wrote, size, done = sink.current_progress()
+    assert name == "tiny.bin" and wrote == 0 and done is False
 
 
 def test_split_pack_start_avoids_name_collision():
