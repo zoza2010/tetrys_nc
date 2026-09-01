@@ -329,6 +329,654 @@ def _resolve_ready(
     return "mux", files
 
 
+class BlockSender:
+    """One file blast: encode window, repair, pace, abort on silent client."""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        client,
+        session_id: int,
+        file_path: Path,
+        geometry: BlockGeometry,
+        *,
+        initial_repair_pct: int,
+        min_bps: float,
+        max_bps: float,
+        start_bps: float,
+        ramp_s: float,
+        cc_on: bool,
+        encode_pool,
+        prefetch_depth: int,
+    ) -> None:
+        self.sock = sock
+        self.client = client
+        self.session_id = session_id
+        self.file_path = file_path
+        self.file_path_str = str(file_path)
+        self.file_size = file_path.stat().st_size
+        self.geometry = geometry
+        self.block_k = geometry.block_k
+        self.symbol_size = geometry.symbol_size
+        self.total_blocks = geometry.total_blocks(self.file_size)
+        self.ramp_s = ramp_s
+        self.min_bps = min_bps
+        self.start_bps = start_bps
+        self.encode_pool = encode_pool
+        self.prefetch_depth = prefetch_depth
+        self.feedback = SenderFeedbackState(session_id)
+        self.stop = threading.Event()
+        self.client_fin = threading.Event()
+        self.limiter = RateLimiter(
+            max_bps,
+            start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
+            min_frac=min_bps / max_bps,
+        )
+        self.limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
+        self.cc = (
+            BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
+            if cc_on
+            else None
+        )
+        fec_floor = float(initial_repair_pct)
+        self.repair_ctl = RepairDebtController(
+            fec_floor, min_pct=fec_floor, max_pct=max(28.0, fec_floor)
+        )
+        self.active: dict[int, SenderBlockState] = {}
+        self.enc_cache: dict[int, GenEncoder] = {}
+        self.enc_order: list[int] = []
+        self.ready: dict[int, tuple[list[bytes], int]] = {}
+        self.inflight: dict[int, Future] = {}
+        self.next_block = 0
+        self.timers = LoopTimers()
+        self.t0 = 0.0
+        self.aborted = False
+        self.tail_idle_start: float | None = None
+        self.tail_started: float | None = None
+        self.first_close = 0
+        self.first_close_seen = 0
+        self.extra_blocks = 0
+        self.extra_win = ExtraRepairWindow()
+        self.loss_samples: list[float] = []
+        self.extra_frac_samples: list[float] = []
+        self.pace_samples: list[float] = []
+        self.last_unique = 0
+        self.source_wire_total = 0
+        self.repair_wire_total = 0
+        self.last_repair_loop = 0.0
+        self.last_log = 0.0
+        self.mm: mmap.mmap | None = None
+
+    def _feedback_loop(self) -> None:
+        sock = self.sock
+        while not self.stop.is_set():
+            readable, _, _ = select.select([sock], [], [], 0.05)
+            if not readable:
+                continue
+            while True:
+                try:
+                    raw, _ = sock.recvfrom(4096)
+                except BlockingIOError:
+                    break
+                try:
+                    packet = parse_packet(raw)
+                except ValueError:
+                    continue
+                if isinstance(packet, BlockFeedback):
+                    self.feedback.apply(packet)
+                elif (
+                    isinstance(packet, BlockFin)
+                    and packet.session_id == self.session_id
+                    and packet.ok
+                ):
+                    self.client_fin.set()
+
+    def _send_wires(self, wires: list[bytes], *, repair: bool) -> None:
+        limiter = self.limiter
+        cc = self.cc
+        timers = self.timers
+        if self.ramp_s > 0 and cc is None:
+            elapsed = time.monotonic() - self.t0
+            if elapsed < self.ramp_s:
+                limiter.set_rate(
+                    max(self.min_bps, self.start_bps * max(0.05, elapsed / self.ramp_s))
+                )
+        for pos in range(0, len(wires), _SEND_CHUNK):
+            if cc is not None:
+                limiter.set_rate(cc.on_timer(time.monotonic()))
+            batch = wires[pos : pos + _SEND_CHUNK]
+            t_pace = time.perf_counter()
+            limiter.consume(sum(map(len, batch)))
+            timers.pace_s += time.perf_counter() - t_pace
+            stamp_data_wires(batch, int(time.monotonic() * 1_000_000) & 0xFFFFFFFF)
+            t_send = time.perf_counter()
+            send_datagrams(self.sock, self.client, batch, chunk=_SEND_CHUNK)
+            timers.send_s += time.perf_counter() - t_send
+        amount = sum(map(len, wires))
+        if repair:
+            timers.repair_bytes += amount
+            timers.repair_pkts += len(wires)
+            self.repair_wire_total += amount
+        else:
+            timers.source_bytes += amount
+            timers.source_pkts += len(wires)
+            self.source_wire_total += amount
+
+    def _encoder_for(self, block_id: int) -> GenEncoder:
+        encoder = self.enc_cache.get(block_id)
+        if encoder is not None:
+            if block_id in self.enc_order:
+                self.enc_order.remove(block_id)
+            self.enc_order.append(block_id)
+            return encoder
+        state = self.active[block_id]
+        encoder = rebuild_block_encoder(
+            self.mm, self.file_size, block_id, self.geometry, state.repair_emitted
+        )
+        self.enc_cache[block_id] = encoder
+        self.enc_order.append(block_id)
+        cache_limit = max(_ENCODER_CACHE, self.geometry.active_blocks)
+        while len(self.enc_order) > cache_limit:
+            drop = self.enc_order.pop(0)
+            if drop != block_id:
+                self.enc_cache.pop(drop, None)
+        return encoder
+
+    def _reap_completed(self, completed: set[int], *, tail: bool) -> None:
+        for block_id in list(self.active):
+            if block_id not in completed:
+                continue
+            state = self.active.pop(block_id)
+            extra = max(0, state.repair_emitted - state.initial_repair)
+            if not tail:
+                self.repair_ctl.observe(extra, self.block_k)
+                self.extra_win.observe(extra > 0)
+                self.extra_frac_samples.append(extra / max(1, self.block_k))
+                if extra == 0:
+                    self.loss_samples.append(0.0)
+                else:
+                    frac = block_loss_frac(state, self.block_k)
+                    if frac is not None:
+                        self.loss_samples.append(frac)
+            self.first_close_seen += 1
+            if extra == 0:
+                self.first_close += 1
+            else:
+                self.extra_blocks += 1
+            self.enc_cache.pop(block_id, None)
+            if block_id in self.enc_order:
+                self.enc_order.remove(block_id)
+
+    def _repair_tick(self, opened: dict[int, OpenBlock], now: float, tail: bool) -> int:
+        t_r = time.perf_counter()
+        cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
+        candidates = select_repair_candidates(
+            self.active,
+            opened,
+            now,
+            block_k=self.block_k,
+            tail=tail,
+            age_s=REPAIR_AGE_S,
+            cooldown_s=cooldown_s,
+        )
+        total_need = sum(need for need, _age, _bid in candidates)
+        budget, tick_s = repair_tick_limits(total_need, tail=tail)
+        per_block = TAIL_REPAIR_TICK_PER_BLOCK if tail else budget
+        sent = 0
+        for need, _age, block_id in candidates:
+            if sent >= budget or (time.perf_counter() - t_r) >= tick_s:
+                break
+            encoder = self._encoder_for(block_id)
+            state = self.active[block_id]
+            n = min(need, budget - sent, per_block)
+            previous_count = encoder.packet_count
+            t_pack = time.perf_counter()
+            new_packets = encoder.ensure_repair(state.repair_emitted + n)
+            if not new_packets:
+                continue
+            stamp = int(now * 1_000_000) & 0xFFFFFFFF
+            wires = pack_data_packets(
+                self.session_id, block_id, new_packets, previous_count, stamp
+            )
+            self.timers.pack_s += time.perf_counter() - t_pack
+            self._send_wires(wires, repair=True)
+            state.repair_emitted += len(new_packets)
+            state.last_repair_ts = now
+            sent += len(new_packets)
+        self.timers.repair_s += time.perf_counter() - t_r
+        return sent
+
+    def _pump_ready(self) -> None:
+        finished = [bid for bid, fut in self.inflight.items() if fut.done()]
+        for bid in finished:
+            fut = self.inflight.pop(bid)
+            try:
+                block_id, wires, budget, encode_s = fut.result()
+            except Exception:
+                t_enc = time.perf_counter()
+                block_id, wires, budget, encode_s = encode_block_job(
+                    self.file_path_str,
+                    bid,
+                    self.geometry.block_bytes,
+                    self.file_size,
+                    self.symbol_size,
+                    self.repair_ctl.current,
+                    self.session_id,
+                )
+                encode_s += time.perf_counter() - t_enc
+            self.ready[block_id] = (wires, budget)
+            self.timers.encode_s += encode_s
+
+    def _submit_ahead(self) -> None:
+        self._pump_ready()
+        queued = 0
+        bid = self.next_block
+        while bid < self.total_blocks and queued < self.prefetch_depth:
+            if bid in self.active:
+                bid += 1
+                continue
+            queued += 1
+            if bid not in self.ready and bid not in self.inflight:
+                self.inflight[bid] = self.encode_pool.submit(
+                    encode_block_job,
+                    self.file_path_str,
+                    bid,
+                    self.geometry.block_bytes,
+                    self.file_size,
+                    self.symbol_size,
+                    self.repair_ctl.current,
+                    self.session_id,
+                )
+            bid += 1
+
+    def _log_progress(
+        self, now: float, completed: set[int], opened: dict, unique_rx: int, decoded: int
+    ) -> None:
+        elapsed = max(now - self.t0, 1e-6)
+        snap = self.timers.take()
+        sys_s, blk_s, calls, blocks = take_send_stats()
+        inst_unique = unique_rx - self.last_unique
+        self.last_unique = unique_rx
+        close_pct = (
+            100.0 * self.first_close / self.first_close_seen
+            if self.first_close_seen
+            else 0.0
+        )
+        self.pace_samples.append(self.limiter.rate * 8 / 1e6)
+        cc = self.cc
+        print(
+            f"progress sent={self.next_block}/{self.total_blocks} "
+            f"done={len(completed)} active={len(self.active)} "
+            f"ready={len(self.ready)} inflight={len(self.inflight)} "
+            f"open={len(opened)} fec={self.repair_ctl.current}% "
+            f"close={close_pct:.0f}% "
+            f"pace={self.limiter.rate * 8 / 1e6:.0f}Mbit "
+            f"cc={cc.phase if cc is not None else 'off'} "
+            f"xfrac={self.extra_win.frac * 100:.0f}% "
+            f"loss_p50={((percentile(self.loss_samples, 50) or 0.0) * 100):.1f}% "
+            f"ack={unique_rx / elapsed / 1048576:.1f} "
+            f"inst={inst_unique / 1048576:.1f} "
+            f"app={decoded / elapsed / 1048576:.1f}MiB/s "
+            f"enc={snap.encode_s * 1e3:.0f}ms "
+            f"pack={snap.pack_s * 1e3:.0f}ms "
+            f"pace_wait={snap.pace_s * 1e3:.0f}ms "
+            f"send={snap.send_s * 1e3:.0f}ms "
+            f"repair={snap.repair_s * 1e3:.0f}ms "
+            f"sys={sys_s * 1e3:.0f}ms calls={calls} blk={blocks} "
+            f"src={snap.source_pkts}pkt "
+            f"rpr={snap.repair_pkts}pkt "
+            f"wire={(snap.source_bytes + snap.repair_bytes) / 1048576:.1f}MiB",
+            flush=True,
+        )
+
+    def run(self) -> bool:
+        self.t0 = time.monotonic()
+        self.last_log = self.t0
+        fb_thread = threading.Thread(target=self._feedback_loop, daemon=True)
+        fb_thread.start()
+        fh = self.file_path.open("rb")
+        self.mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            self._submit_ahead()
+            while not self.client_fin.is_set():
+                completed, opened, unique_rx, decoded, echo_ts, fb_id = (
+                    self.feedback.snapshot()
+                )
+                now = time.monotonic()
+                if self.feedback.client_lost(now, self.t0):
+                    self.aborted = True
+                    print(
+                        f"abort — client silent "
+                        f"sent={self.next_block}/{self.total_blocks} "
+                        f"done={len(completed)}",
+                        flush=True,
+                    )
+                    break
+                if self.cc is not None:
+                    self.limiter.set_rate(
+                        self.cc.on_feedback(
+                            now,
+                            feedback_id=fb_id,
+                            unique_bytes=unique_rx,
+                            decoded_bytes=decoded,
+                            echo_ts_us=echo_ts,
+                            extra_frac=self.extra_win.frac,
+                            window_full=len(self.active) >= self.geometry.active_blocks,
+                        )
+                    )
+                tail = self.next_block >= self.total_blocks
+                if tail and self.tail_started is None:
+                    self.tail_started = now
+                self._reap_completed(completed, tail=tail)
+                self._submit_ahead()
+
+                admitted = False
+                while (
+                    self.next_block < self.total_blocks
+                    and len(self.active) < self.geometry.active_blocks
+                ):
+                    self._pump_ready()
+                    item = self.ready.pop(self.next_block, None)
+                    if item is None:
+                        self._submit_ahead()
+                        break
+                    wires, budget = item
+                    self.active[self.next_block] = SenderBlockState(
+                        self.next_block,
+                        initial_repair=budget,
+                        repair_emitted=budget,
+                        sent_at=time.monotonic(),
+                    )
+                    self._send_wires(wires, repair=False)
+                    self.next_block += 1
+                    admitted = True
+                    self._submit_ahead()
+
+                window_full = len(self.active) >= self.geometry.active_blocks
+                if tail or (
+                    window_full and now - self.last_repair_loop >= REPAIR_INTERVAL_S
+                ):
+                    self._repair_tick(opened, now, tail)
+                    self.last_repair_loop = now
+
+                if now - self.last_log >= 1.0:
+                    self._log_progress(now, completed, opened, unique_rx, decoded)
+                    self.last_log = now
+
+                if self.next_block >= self.total_blocks:
+                    self.sock.sendto(
+                        BlockFin(self.session_id, self.total_blocks).pack(), self.client
+                    )
+                if len(completed) >= self.total_blocks:
+                    fin = BlockFin(self.session_id, self.total_blocks).pack()
+                    for _ in range(16):
+                        self.sock.sendto(fin, self.client)
+                    break
+                if self.next_block >= self.total_blocks and not self.active:
+                    if self.tail_idle_start is None:
+                        self.tail_idle_start = now
+                    elif now - self.tail_idle_start > _TAIL_IDLE_S:
+                        break
+                else:
+                    self.tail_idle_start = None
+                if not admitted and not tail:
+                    t_wait = time.perf_counter()
+                    time.sleep(0.001)
+                    self.timers.wait_s += time.perf_counter() - t_wait
+        finally:
+            self.stop.set()
+            for fut in list(self.inflight.values()):
+                fut.cancel()
+            fb_thread.join(timeout=1.0)
+            self.mm.close()
+            fh.close()
+            self.mm = None
+        return self.aborted
+
+    def print_done(self) -> None:
+        elapsed = max(time.monotonic() - self.t0, 1e-6)
+        close_pct = (
+            100.0 * self.first_close / self.first_close_seen
+            if self.first_close_seen
+            else 0.0
+        )
+        tail_s = (time.monotonic() - self.tail_started) if self.tail_started else 0.0
+        pace_sorted = sorted(self.pace_samples)
+        if pace_sorted:
+            pace_p10 = pace_sorted[max(0, int(0.1 * (len(pace_sorted) - 1)))]
+            pace_med = pace_sorted[len(pace_sorted) // 2]
+            pace_max = pace_sorted[-1]
+            pace_txt = f"pace_p10={pace_p10:.0f} med={pace_med:.0f} max={pace_max:.0f}Mbit"
+        else:
+            pace_txt = "pace_p10=n/a"
+
+        def _pct(val: float | None) -> str:
+            return "n/a" if val is None else f"{val * 100:.1f}%"
+
+        print(
+            f"done in {elapsed:.2f}s — goodput "
+            f"{self.file_size / elapsed / 1048576:.2f} MiB/s — "
+            f"source_wire={self.source_wire_total / 1048576:.1f}MiB "
+            f"repair_wire={self.repair_wire_total / 1048576:.1f}MiB "
+            f"first_close={close_pct:.0f}% extra_blocks={self.extra_blocks} "
+            f"xfrac={self.extra_win.frac * 100:.0f}% "
+            f"loss_p50={_pct(percentile(self.loss_samples, 50))} "
+            f"p90={_pct(percentile(self.loss_samples, 90))} "
+            f"p99={_pct(percentile(self.loss_samples, 99))} "
+            f"extra_p50={_pct(percentile(self.extra_frac_samples, 50))} "
+            f"p90={_pct(percentile(self.extra_frac_samples, 90))} "
+            f"fec={self.repair_ctl.current}% tail={tail_s:.2f}s {pace_txt}",
+            flush=True,
+        )
+
+
+class BlockReceiver:
+    def __init__(
+        self,
+        sock: socket.socket,
+        server: tuple[str, int],
+        session_id: int,
+        meta: BlockMeta,
+        output: Path,
+        *,
+        file_progress: bool,
+    ) -> None:
+        self.sock = sock
+        self.server = server
+        self.session_id = session_id
+        self.meta = meta
+        self.output = output
+        self.file_progress = file_progress
+        self.geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
+        self.total_blocks = self.geometry.total_blocks(meta.file_size)
+        self.slots: dict[int, GenReceiveSlot] = {}
+        self.done: set[int] = set()
+        self.unique_payload_bytes = 0
+        self.decoded_bytes = 0
+        self.feedback_id = 0
+        self.last_feedback = 0.0
+        self.last_echo = 0
+        self.t0 = 0.0
+        self.last_log = 0.0
+        self.bar_shown = False
+        self.rate_t = 0.0
+        self.rate_b = 0
+        self.inst_bps = 0.0
+        self.fin_seen = False
+        self.dup_esi = 0
+        self.slot_seen: dict[int, float] = {}
+        self.fd = -1
+
+    def _send_feedback(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_feedback < _FEEDBACK_S:
+            return
+        self.feedback_id += 1
+        opened = [
+            OpenBlock(
+                block_id,
+                slot.symbols_rx,
+                slot.decode_failed,
+                min(255, int((now - self.slot_seen.get(block_id, now)) / 0.020)),
+            )
+            for block_id, slot in sorted(self.slots.items())
+            if block_id not in self.done
+        ][:64]
+        packet = BlockFeedback(
+            self.session_id,
+            self.feedback_id,
+            self.unique_payload_bytes,
+            self.decoded_bytes,
+            self.last_echo,
+            sorted(self.done),
+            opened,
+        )
+        self.sock.sendto(packet.pack(), self.server)
+        self.last_feedback = now
+
+    def _on_data(self, packet: BlockData, raw: bytes) -> None:
+        block_id = packet.block_id
+        if block_id >= self.total_blocks or block_id in self.done:
+            return
+        off = block_id * self.geometry.block_bytes
+        tlen = min(self.geometry.block_bytes, self.meta.file_size - off)
+        slot = self.slots.get(block_id)
+        if slot is None:
+            slot = GenReceiveSlot(
+                block_id,
+                gen_k=self.meta.block_k,
+                symbol_size=self.meta.symbol_size,
+                block_bytes=self.geometry.block_bytes,
+                tlen=tlen,
+            )
+            self.slots[block_id] = slot
+            self.slot_seen[block_id] = time.monotonic()
+        before = slot.symbols_rx
+        decoded = slot.add_packet(packet.payload, packet.esi)
+        if slot.symbols_rx == before:
+            self.dup_esi += 1
+            return
+        self.unique_payload_bytes += len(raw)
+        self.last_echo = packet.send_ts_us
+        if decoded is not None:
+            os.pwrite(self.fd, decoded[:tlen], off)
+            self.decoded_bytes += tlen
+            self.done.add(block_id)
+            slot.close()
+            self.slots.pop(block_id, None)
+            self.slot_seen.pop(block_id, None)
+
+    def _log(self, now: float) -> None:
+        meta = self.meta
+        dt = now - self.rate_t
+        if dt >= 0.2:
+            self.inst_bps = (self.decoded_bytes - self.rate_b) / dt
+            self.rate_t, self.rate_b = now, self.decoded_bytes
+        elif now > self.t0:
+            self.inst_bps = self.decoded_bytes / (now - self.t0)
+        if self.file_progress:
+            name = Path(meta.file_name).name or self.output.name
+            line = (
+                f"{name[:36]:<36} [{_client_bar(self.decoded_bytes / max(1, meta.file_size))}] "
+                f"{100.0 * self.decoded_bytes / max(1, meta.file_size):5.1f}% "
+                f"{_client_size(self.decoded_bytes)}/{_client_size(meta.file_size)}  "
+                f"{len(self.done)}/{self.total_blocks}  {_client_rate(self.inst_bps)}"
+            )
+            if sys.stdout.isatty() and now - self.last_log >= 0.05:
+                if self.bar_shown:
+                    sys.stdout.write("\x1b[1A\x1b[2K")
+                print(line, flush=True)
+                self.bar_shown = True
+                self.last_log = now
+            elif not sys.stdout.isatty() and now - self.last_log >= 1.0:
+                print(line, flush=True)
+                self.last_log = now
+        elif now - self.last_log >= 1.0:
+            elapsed = max(now - self.t0, 1e-6)
+            print(
+                f"progress {len(self.done)}/{self.total_blocks} "
+                f"({100.0 * len(self.done) / self.total_blocks:.1f}%) "
+                f"open={len(self.slots)} unique={self.unique_payload_bytes / elapsed / 1048576:.1f} "
+                f"app={self.decoded_bytes / elapsed / 1048576:.1f}MiB/s "
+                f"inst={_client_rate(self.inst_bps)} "
+                f"dup_esi={self.dup_esi}",
+                flush=True,
+            )
+            self.last_log = now
+
+    def _print_complete_bar(self) -> None:
+        if not self.file_progress:
+            return
+        name = Path(self.meta.file_name).name or self.output.name
+        line = (
+            f"{name[:36]:<36} [{_client_bar(1.0)}] 100.0% "
+            f"{_client_size(self.meta.file_size)}/{_client_size(self.meta.file_size)}  "
+            f"{self.total_blocks}/{self.total_blocks}  {_client_rate(self.inst_bps)}"
+        )
+        if sys.stdout.isatty() and self.bar_shown:
+            sys.stdout.write("\x1b[1A\x1b[2K")
+        print(line, flush=True)
+
+    def run(self) -> int:
+        meta = self.meta
+        output = self.output
+        print(
+            f"META name={meta.file_name} size={meta.file_size} "
+            f"blocks={self.total_blocks} K={meta.block_k} T={meta.symbol_size} "
+            f"fec={meta.initial_repair_pct}%",
+            flush=True,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(output, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o644)
+        os.ftruncate(self.fd, meta.file_size)
+        self.t0 = time.monotonic()
+        self.rate_t = self.t0
+        sock = self.sock
+        try:
+            while len(self.done) < self.total_blocks:
+                readable, _, _ = select.select([sock], [], [], 0.01)
+                if readable:
+                    try:
+                        batch = recv_datagrams(sock, 64)
+                    except BlockingIOError:
+                        batch = []
+                    for raw in batch:
+                        try:
+                            packet = parse_packet(raw)
+                        except ValueError:
+                            continue
+                        if getattr(packet, "session_id", None) != self.session_id:
+                            continue
+                        if isinstance(packet, BlockData):
+                            self._on_data(packet, raw)
+                        elif isinstance(packet, BlockFin):
+                            self.fin_seen = True
+                self._send_feedback()
+                self._log(time.monotonic())
+            self._send_feedback(force=True)
+            self._print_complete_bar()
+            for _ in range(16):
+                sock.sendto(BlockFin(self.session_id, self.total_blocks).pack(), self.server)
+                time.sleep(0.005)
+        finally:
+            for slot in self.slots.values():
+                slot.close()
+            os.close(self.fd)
+            sock.close()
+
+        elapsed = max(time.monotonic() - self.t0, 1e-6)
+        if meta.sha256_hex:
+            got = _hash_file(output)
+            if got != meta.sha256_hex:
+                raise ValueError("output hash mismatch")
+        print(
+            f"OK: wrote {output} ({meta.file_size} bytes) in {elapsed:.2f}s "
+            f"({meta.file_size / elapsed / 1048576:.2f} MiB/s) fin={self.fin_seen}",
+            flush=True,
+        )
+        return 0
+
+
 def run_block_server(
     host: str,
     port: int,
@@ -440,8 +1088,6 @@ def run_block_server(
             file_size = file_path.stat().st_size
             total_blocks = geometry.total_blocks(file_size)
             digest = "" if skip_hash else _hash_file(file_path)
-            file_path_str = str(file_path)
-            prefetch_depth = min(64, max(geometry.active_blocks, 32))
             print(
                 f"serve {rel} size={file_size} blocks={total_blocks} "
                 f"from {client[0]}:{client[1]}",
@@ -461,401 +1107,28 @@ def run_block_server(
             for _ in range(8):
                 sock.sendto(meta, client)
 
-            feedback = SenderFeedbackState(session_id)
-            stop = threading.Event()
-            client_fin = threading.Event()
-            limiter = RateLimiter(
-                max_bps, start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
-                min_frac=min_bps / max_bps,
+            sender = BlockSender(
+                sock,
+                client,
+                session_id,
+                file_path,
+                geometry,
+                initial_repair_pct=initial_repair_pct,
+                min_bps=min_bps,
+                max_bps=max_bps,
+                start_bps=start_bps,
+                ramp_s=ramp_s,
+                cc_on=cc_on,
+                encode_pool=encode_pool,
+                prefetch_depth=prefetch_depth,
             )
-            limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
-            cc = (
-                BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
-                if cc_on
-                else None
-            )
-
-            def feedback_loop() -> None:
-                while not stop.is_set():
-                    readable, _, _ = select.select([sock], [], [], 0.05)
-                    if not readable:
-                        continue
-                    while True:
-                        try:
-                            raw, _ = sock.recvfrom(4096)
-                        except BlockingIOError:
-                            break
-                        try:
-                            packet = parse_packet(raw)
-                        except ValueError:
-                            continue
-                        if isinstance(packet, BlockFeedback):
-                            feedback.apply(packet)
-                        elif (
-                            isinstance(packet, BlockFin)
-                            and packet.session_id == session_id
-                            and packet.ok
-                        ):
-                            client_fin.set()
-
-            fb_thread = threading.Thread(target=feedback_loop, daemon=True)
-            fb_thread.start()
-
-            active: dict[int, SenderBlockState] = {}
-            enc_cache: dict[int, GenEncoder] = {}
-            enc_order: list[int] = []
-            next_block = 0
-            timers = LoopTimers()
-            fec_floor = float(initial_repair_pct)
-            repair_ctl = RepairDebtController(
-                fec_floor,
-                min_pct=fec_floor,
-                max_pct=max(28.0, fec_floor),
-            )
-            t0 = time.monotonic()
-            last_log = t0
-            aborted = False
-            tail_idle_start: float | None = None
-            first_close = 0
-            first_close_seen = 0
-            extra_blocks = 0
-            extra_win = ExtraRepairWindow()
-            loss_samples: list[float] = []
-            extra_frac_samples: list[float] = []
-            last_unique = 0
-            source_wire_total = 0
-            repair_wire_total = 0
-            ready: dict[int, tuple[list[bytes], int]] = {}
-            inflight: dict[int, Future] = {}
-            last_repair_loop = 0.0
-            tail_started: float | None = None
-            pace_samples: list[float] = []
-
-            def send_wires(wires: list[bytes], *, repair: bool) -> None:
-                nonlocal source_wire_total, repair_wire_total
-                if ramp_s > 0 and cc is None:
-                    elapsed = time.monotonic() - t0
-                    if elapsed < ramp_s:
-                        limiter.set_rate(max(min_bps, start_bps * max(0.05, elapsed / ramp_s)))
-                for pos in range(0, len(wires), _SEND_CHUNK):
-                    if cc is not None:
-                        limiter.set_rate(cc.on_timer(time.monotonic()))
-                    batch = wires[pos : pos + _SEND_CHUNK]
-                    t_pace = time.perf_counter()
-                    limiter.consume(sum(map(len, batch)))
-                    timers.pace_s += time.perf_counter() - t_pace
-                    stamp_data_wires(batch, int(time.monotonic() * 1_000_000) & 0xFFFFFFFF)
-                    t_send = time.perf_counter()
-                    send_datagrams(sock, client, batch, chunk=_SEND_CHUNK)
-                    timers.send_s += time.perf_counter() - t_send
-                amount = sum(map(len, wires))
-                if repair:
-                    timers.repair_bytes += amount
-                    timers.repair_pkts += len(wires)
-                    repair_wire_total += amount
-                else:
-                    timers.source_bytes += amount
-                    timers.source_pkts += len(wires)
-                    source_wire_total += amount
-
-            def encoder_for(block_id: int) -> GenEncoder:
-                encoder = enc_cache.get(block_id)
-                if encoder is not None:
-                    if block_id in enc_order:
-                        enc_order.remove(block_id)
-                    enc_order.append(block_id)
-                    return encoder
-                state = active[block_id]
-                encoder = rebuild_block_encoder(
-                    mm, file_size, block_id, geometry, state.repair_emitted
-                )
-                enc_cache[block_id] = encoder
-                enc_order.append(block_id)
-                cache_limit = max(_ENCODER_CACHE, geometry.active_blocks)
-                while len(enc_order) > cache_limit:
-                    drop = enc_order.pop(0)
-                    if drop != block_id:
-                        enc_cache.pop(drop, None)
-                return encoder
-
-            def reap_completed(completed: set[int], *, tail: bool) -> None:
-                nonlocal first_close, first_close_seen, extra_blocks
-                for block_id in list(active):
-                    if block_id not in completed:
-                        continue
-                    state = active.pop(block_id)
-                    extra = max(0, state.repair_emitted - state.initial_repair)
-                    # Tail repair storms must not train primary FEC for later blocks.
-                    if not tail:
-                        repair_ctl.observe(extra, block_k)
-                        extra_win.observe(extra > 0)
-                        extra_frac_samples.append(extra / max(1, block_k))
-                        if extra == 0:
-                            loss_samples.append(0.0)
-                        else:
-                            frac = block_loss_frac(state, block_k)
-                            if frac is not None:
-                                loss_samples.append(frac)
-                    first_close_seen += 1
-                    if extra == 0:
-                        first_close += 1
-                    else:
-                        extra_blocks += 1
-                    enc_cache.pop(block_id, None)
-                    if block_id in enc_order:
-                        enc_order.remove(block_id)
-
-            def repair_tick(opened: dict[int, OpenBlock], now: float, tail: bool) -> int:
-                t_r = time.perf_counter()
-                cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
-                candidates = select_repair_candidates(
-                    active,
-                    opened,
-                    now,
-                    block_k=block_k,
-                    tail=tail,
-                    age_s=REPAIR_AGE_S,
-                    cooldown_s=cooldown_s,
-                )
-                total_need = sum(need for need, _age, _bid in candidates)
-                budget, tick_s = repair_tick_limits(total_need, tail=tail)
-                per_block = TAIL_REPAIR_TICK_PER_BLOCK if tail else budget
-                sent = 0
-                for need, _age, block_id in candidates:
-                    if sent >= budget or (time.perf_counter() - t_r) >= tick_s:
-                        break
-                    encoder = encoder_for(block_id)
-                    state = active[block_id]
-                    n = min(need, budget - sent, per_block)
-                    previous_count = encoder.packet_count
-                    t_pack = time.perf_counter()
-                    new_packets = encoder.ensure_repair(state.repair_emitted + n)
-                    if not new_packets:
-                        continue
-                    stamp = int(now * 1_000_000) & 0xFFFFFFFF
-                    wires = pack_data_packets(
-                        session_id, block_id, new_packets, previous_count, stamp
-                    )
-                    timers.pack_s += time.perf_counter() - t_pack
-                    send_wires(wires, repair=True)
-                    state.repair_emitted += len(new_packets)
-                    state.last_repair_ts = now
-                    sent += len(new_packets)
-                timers.repair_s += time.perf_counter() - t_r
-                return sent
-
-            def pump_ready() -> None:
-                finished = [bid for bid, fut in inflight.items() if fut.done()]
-                for bid in finished:
-                    fut = inflight.pop(bid)
-                    try:
-                        block_id, wires, budget, encode_s = fut.result()
-                    except Exception:
-                        t_enc = time.perf_counter()
-                        block_id, wires, budget, encode_s = encode_block_job(
-                            file_path_str,
-                            bid,
-                            geometry.block_bytes,
-                            file_size,
-                            symbol_size,
-                            repair_ctl.current,
-                            session_id,
-                        )
-                        encode_s += time.perf_counter() - t_enc
-                    ready[block_id] = (wires, budget)
-                    timers.encode_s += encode_s
-
-            def submit_ahead() -> None:
-                pump_ready()
-                queued = 0
-                bid = next_block
-                while bid < total_blocks and queued < prefetch_depth:
-                    if bid in active:
-                        bid += 1
-                        continue
-                    queued += 1
-                    if bid not in ready and bid not in inflight:
-                        inflight[bid] = encode_pool.submit(
-                            encode_block_job,
-                            file_path_str,
-                            bid,
-                            geometry.block_bytes,
-                            file_size,
-                            symbol_size,
-                            repair_ctl.current,
-                            session_id,
-                        )
-                    bid += 1
-
-            fh = file_path.open("rb")
-            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
-            try:
-                submit_ahead()
-                while not client_fin.is_set():
-                            completed, opened, unique_rx, decoded, echo_ts, fb_id = (
-                                feedback.snapshot()
-                            )
-                            now = time.monotonic()
-                            if feedback.client_lost(now, t0):
-                                aborted = True
-                                print(
-                                    f"abort — client silent "
-                                    f"sent={next_block}/{total_blocks} "
-                                    f"done={len(completed)}",
-                                    flush=True,
-                                )
-                                break
-                            if cc is not None:
-                                limiter.set_rate(
-                                    cc.on_feedback(
-                                        now,
-                                        feedback_id=fb_id,
-                                        unique_bytes=unique_rx,
-                                        decoded_bytes=decoded,
-                                        echo_ts_us=echo_ts,
-                                        extra_frac=extra_win.frac,
-                                        window_full=len(active) >= geometry.active_blocks,
-                                    )
-                                )
-                            tail = next_block >= total_blocks
-                            if tail and tail_started is None:
-                                tail_started = now
-                            reap_completed(completed, tail=tail)
-                            submit_ahead()
-
-                            admitted = False
-                            while (
-                                next_block < total_blocks
-                                and len(active) < geometry.active_blocks
-                            ):
-                                pump_ready()
-                                item = ready.pop(next_block, None)
-                                if item is None:
-                                    submit_ahead()
-                                    break
-                                wires, budget = item
-                                state = SenderBlockState(
-                                    next_block,
-                                    initial_repair=budget,
-                                    repair_emitted=budget,
-                                    sent_at=time.monotonic(),
-                                )
-                                active[next_block] = state
-                                send_wires(wires, repair=False)
-                                next_block += 1
-                                admitted = True
-                                submit_ahead()
-
-                            # Repair is a side budget: never spin it while waiting on encode,
-                            # and at most one tick per REPAIR_INTERVAL_S once the window is full.
-                            window_full = len(active) >= geometry.active_blocks
-                            if tail or (
-                                window_full
-                                and now - last_repair_loop >= REPAIR_INTERVAL_S
-                            ):
-                                repair_tick(opened, now, tail)
-                                last_repair_loop = now
-
-                            if now - last_log >= 1.0:
-                                elapsed = max(now - t0, 1e-6)
-                                snap = timers.take()
-                                sys_s, blk_s, calls, blocks = take_send_stats()
-                                inst_unique = unique_rx - last_unique
-                                last_unique = unique_rx
-                                close_pct = (
-                                    100.0 * first_close / first_close_seen
-                                    if first_close_seen
-                                    else 0.0
-                                )
-                                pace_samples.append(limiter.rate * 8 / 1e6)
-                                print(
-                                    f"progress sent={next_block}/{total_blocks} "
-                                    f"done={len(completed)} active={len(active)} "
-                                    f"ready={len(ready)} inflight={len(inflight)} "
-                                    f"open={len(opened)} fec={repair_ctl.current}% "
-                                    f"close={close_pct:.0f}% "
-                                    f"pace={limiter.rate * 8 / 1e6:.0f}Mbit "
-                                    f"cc={cc.phase if cc is not None else 'off'} "
-                                    f"xfrac={extra_win.frac * 100:.0f}% "
-                                    f"loss_p50={((percentile(loss_samples, 50) or 0.0) * 100):.1f}% "
-                                    f"ack={unique_rx / elapsed / 1048576:.1f} "
-                                    f"inst={inst_unique / 1048576:.1f} "
-                                    f"app={decoded / elapsed / 1048576:.1f}MiB/s "
-                                    f"enc={snap.encode_s * 1e3:.0f}ms "
-                                    f"pack={snap.pack_s * 1e3:.0f}ms "
-                                    f"pace_wait={snap.pace_s * 1e3:.0f}ms "
-                                    f"send={snap.send_s * 1e3:.0f}ms "
-                                    f"repair={snap.repair_s * 1e3:.0f}ms "
-                                    f"sys={sys_s * 1e3:.0f}ms calls={calls} blk={blocks} "
-                                    f"src={snap.source_pkts}pkt "
-                                    f"rpr={snap.repair_pkts}pkt "
-                                    f"wire={(snap.source_bytes + snap.repair_bytes) / 1048576:.1f}MiB",
-                                    flush=True,
-                                )
-                                last_log = now
-
-                            if next_block >= total_blocks:
-                                sock.sendto(BlockFin(session_id, total_blocks).pack(), client)
-                            if len(completed) >= total_blocks:
-                                for _ in range(16):
-                                    sock.sendto(
-                                        BlockFin(session_id, total_blocks).pack(), client
-                                    )
-                                break
-                            if next_block >= total_blocks and not active:
-                                if tail_idle_start is None:
-                                    tail_idle_start = now
-                                elif now - tail_idle_start > _TAIL_IDLE_S:
-                                    break
-                            else:
-                                tail_idle_start = None
-                            if not admitted and not tail:
-                                t_wait = time.perf_counter()
-                                time.sleep(0.001)
-                                timers.wait_s += time.perf_counter() - t_wait
-            finally:
-                stop.set()
-                for fut in list(inflight.values()):
-                    fut.cancel()
-                fb_thread.join(timeout=1.0)
-                mm.close()
-                fh.close()
-
-            elapsed = max(time.monotonic() - t0, 1e-6)
+            aborted = sender.run()
             if aborted:
                 if once:
                     break
                 print("idle — waiting for READY", flush=True)
                 continue
-            close_pct = 100.0 * first_close / first_close_seen if first_close_seen else 0.0
-            tail_s = (time.monotonic() - tail_started) if tail_started else 0.0
-            pace_sorted = sorted(pace_samples)
-            if pace_sorted:
-                pace_p10 = pace_sorted[max(0, int(0.1 * (len(pace_sorted) - 1)))]
-                pace_med = pace_sorted[len(pace_sorted) // 2]
-                pace_max = pace_sorted[-1]
-                pace_txt = f"pace_p10={pace_p10:.0f} med={pace_med:.0f} max={pace_max:.0f}Mbit"
-            else:
-                pace_txt = "pace_p10=n/a"
-            loss_p50 = percentile(loss_samples, 50)
-            loss_p90 = percentile(loss_samples, 90)
-            loss_p99 = percentile(loss_samples, 99)
-            extra_p50 = percentile(extra_frac_samples, 50)
-            extra_p90 = percentile(extra_frac_samples, 90)
-            def _pct(val: float | None) -> str:
-                return "n/a" if val is None else f"{val * 100:.1f}%"
-            print(
-                f"done in {elapsed:.2f}s — goodput "
-                f"{file_size / elapsed / 1048576:.2f} MiB/s — "
-                f"source_wire={source_wire_total / 1048576:.1f}MiB "
-                f"repair_wire={repair_wire_total / 1048576:.1f}MiB "
-                f"first_close={close_pct:.0f}% extra_blocks={extra_blocks} "
-                f"xfrac={extra_win.frac * 100:.0f}% "
-                f"loss_p50={_pct(loss_p50)} p90={_pct(loss_p90)} p99={_pct(loss_p99)} "
-                f"extra_p50={_pct(extra_p50)} p90={_pct(extra_p90)} "
-                f"fec={repair_ctl.current}% tail={tail_s:.2f}s {pace_txt}",
-                flush=True,
-            )
+            sender.print_done()
             if once:
                 break
             print("idle — waiting for READY", flush=True)
@@ -920,176 +1193,6 @@ def run_block_client(
             close_sock=True, file_progress=file_progress,
         )
 
-    geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
-    total_blocks = geometry.total_blocks(meta.file_size)
-    print(
-        f"META name={meta.file_name} size={meta.file_size} "
-        f"blocks={total_blocks} K={meta.block_k} T={meta.symbol_size} "
-        f"fec={meta.initial_repair_pct}%",
-        flush=True,
-    )
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(output, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o644)
-    os.ftruncate(fd, meta.file_size)
-    slots: dict[int, GenReceiveSlot] = {}
-    done: set[int] = set()
-    unique_payload_bytes = 0
-    decoded_bytes = 0
-    feedback_id = 0
-    last_feedback = 0.0
-    last_echo = 0
-    t0 = time.monotonic()
-    last_log = 0.0
-    bar_shown = False
-    rate_t = t0
-    rate_b = 0
-    inst_bps = 0.0
-    fin_seen = False
-    dup_esi = 0
-    slot_seen: dict[int, float] = {}
-
-    def send_feedback(force: bool = False) -> None:
-        nonlocal feedback_id, last_feedback
-        now = time.monotonic()
-        if not force and now - last_feedback < _FEEDBACK_S:
-            return
-        feedback_id += 1
-        opened = [
-            OpenBlock(
-                block_id,
-                slot.symbols_rx,
-                slot.decode_failed,
-                min(255, int((now - slot_seen.get(block_id, now)) / 0.020)),
-            )
-            for block_id, slot in sorted(slots.items())
-            if block_id not in done
-        ][:64]
-        packet = BlockFeedback(
-            session_id,
-            feedback_id,
-            unique_payload_bytes,
-            decoded_bytes,
-            last_echo,
-            sorted(done),
-            opened,
-        )
-        sock.sendto(packet.pack(), server)
-        last_feedback = now
-
-    try:
-        while len(done) < total_blocks:
-            readable, _, _ = select.select([sock], [], [], 0.01)
-            if readable:
-                try:
-                    batch = recv_datagrams(sock, 64)
-                except BlockingIOError:
-                    batch = []
-                for raw in batch:
-                    try:
-                        packet = parse_packet(raw)
-                    except ValueError:
-                        continue
-                    if getattr(packet, "session_id", None) != session_id:
-                        continue
-                    if isinstance(packet, BlockData):
-                        block_id = packet.block_id
-                        if block_id >= total_blocks or block_id in done:
-                            continue
-                        off = block_id * geometry.block_bytes
-                        tlen = min(geometry.block_bytes, meta.file_size - off)
-                        slot = slots.get(block_id)
-                        if slot is None:
-                            slot = GenReceiveSlot(
-                                block_id,
-                                gen_k=meta.block_k,
-                                symbol_size=meta.symbol_size,
-                                block_bytes=geometry.block_bytes,
-                                tlen=tlen,
-                            )
-                            slots[block_id] = slot
-                            slot_seen[block_id] = time.monotonic()
-                        before = slot.symbols_rx
-                        decoded = slot.add_packet(packet.payload, packet.esi)
-                        if slot.symbols_rx == before:
-                            dup_esi += 1
-                            continue
-                        unique_payload_bytes += len(raw)
-                        last_echo = packet.send_ts_us
-                        if decoded is not None:
-                            os.pwrite(fd, decoded[:tlen], off)
-                            decoded_bytes += tlen
-                            done.add(block_id)
-                            slot.close()
-                            slots.pop(block_id, None)
-                            slot_seen.pop(block_id, None)
-                    elif isinstance(packet, BlockFin):
-                        fin_seen = True
-            send_feedback()
-            now = time.monotonic()
-            dt = now - rate_t
-            if dt >= 0.2:
-                inst_bps = (decoded_bytes - rate_b) / dt
-                rate_t, rate_b = now, decoded_bytes
-            elif now > t0:
-                inst_bps = decoded_bytes / (now - t0)
-            if file_progress:
-                name = Path(meta.file_name).name or output.name
-                line = (
-                    f"{name[:36]:<36} [{_client_bar(decoded_bytes / max(1, meta.file_size))}] "
-                    f"{100.0 * decoded_bytes / max(1, meta.file_size):5.1f}% "
-                    f"{_client_size(decoded_bytes)}/{_client_size(meta.file_size)}  "
-                    f"{len(done)}/{total_blocks}  {_client_rate(inst_bps)}"
-                )
-                if sys.stdout.isatty() and now - last_log >= 0.05:
-                    if bar_shown:
-                        sys.stdout.write("\x1b[1A\x1b[2K")
-                    print(line, flush=True)
-                    bar_shown = True
-                    last_log = now
-                elif not sys.stdout.isatty() and now - last_log >= 1.0:
-                    print(line, flush=True)
-                    last_log = now
-            elif now - last_log >= 1.0:
-                elapsed = max(now - t0, 1e-6)
-                print(
-                    f"progress {len(done)}/{total_blocks} "
-                    f"({100.0 * len(done) / total_blocks:.1f}%) "
-                    f"open={len(slots)} unique={unique_payload_bytes / elapsed / 1048576:.1f} "
-                    f"app={decoded_bytes / elapsed / 1048576:.1f}MiB/s "
-                    f"inst={_client_rate(inst_bps)} "
-                    f"dup_esi={dup_esi}",
-                    flush=True,
-                )
-                last_log = now
-        send_feedback(force=True)
-        if file_progress:
-            name = Path(meta.file_name).name or output.name
-            line = (
-                f"{name[:36]:<36} [{_client_bar(1.0)}] 100.0% "
-                f"{_client_size(meta.file_size)}/{_client_size(meta.file_size)}  "
-                f"{total_blocks}/{total_blocks}  {_client_rate(inst_bps)}"
-            )
-            if sys.stdout.isatty() and bar_shown:
-                sys.stdout.write("\x1b[1A\x1b[2K")
-            print(line, flush=True)
-        for _ in range(16):
-            sock.sendto(BlockFin(session_id, total_blocks).pack(), server)
-            time.sleep(0.005)
-    finally:
-        for slot in slots.values():
-            slot.close()
-        os.close(fd)
-        sock.close()
-
-    elapsed = max(time.monotonic() - t0, 1e-6)
-    if meta.sha256_hex:
-        got = _hash_file(output)
-        if got != meta.sha256_hex:
-            raise ValueError("output hash mismatch")
-    print(
-        f"OK: wrote {output} ({meta.file_size} bytes) in {elapsed:.2f}s "
-        f"({meta.file_size / elapsed / 1048576:.2f} MiB/s) fin={fin_seen}",
-        flush=True,
-    )
-    return 0
+    return BlockReceiver(
+        sock, server, session_id, meta, output, file_progress=file_progress
+    ).run()
