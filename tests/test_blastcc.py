@@ -78,8 +78,7 @@ def test_startup_climbs_to_cap_without_delivery_plateau():
         unique += int(_CAP * 0.20)
         _feed(cc, now, i, unique, 0.080)
     assert cc.rate >= _CAP * 0.98
-    assert cc.phase == CRUISE
-    assert cc.rate <= _CAP * 1.26
+    assert cc.phase in (CRUISE, PROBE)
 
 
 def test_single_jitter_does_not_drain():
@@ -193,8 +192,6 @@ def test_probe_can_raise_above_start_without_channel_cap():
     cc.rtt.srtt = 0.08
     cc.rtt.n = 20
     cc.cruise_ts = 0.0
-    for bps in (start, start, start * 1.05):
-        cc.bw.observe(bps)
     _feed(cc, 3.0, 1, 1_000_000, 0.08)
     assert cc.phase == PROBE
     assert cc.rate > start
@@ -216,6 +213,18 @@ def test_short_ack_interval_does_not_raise_bw():
     _feed(cc, 1.00, 1, 0, 0.08)
     _feed(cc, 1.01, 2, 50_000_000, 0.08)
     assert cc.bw.max_bw is None
+    assert cc.last_ts == pytest.approx(1.00)
+
+
+def test_short_acks_accumulate_until_min_rtt_window():
+    cc = _cc()
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    _feed(cc, 1.00, 1, 0, 0.08)
+    _feed(cc, 1.01, 2, 1_000_000, 0.08)
+    _feed(cc, 1.05, 3, 4_000_000, 0.08)
+    assert cc.last_ts == pytest.approx(1.05)
+    assert cc.bw.samples
 
 
 def test_stamp_overwrites_encode_age():

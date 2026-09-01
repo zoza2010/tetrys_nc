@@ -30,7 +30,8 @@ _CRUISE_CUT = 0.93
 _GOOD_FLOOR = 0.90
 _SEED_FRAC = 0.90
 _ABS_MIN_MBIT = 80.0
-_DELIVERY_HEADROOM = 1.25
+# Unique-byte rate is goodput, not wire; 1.25 sat below the 850 start and blocked probe.
+_DELIVERY_HEADROOM = 1.42
 _STEP_MAX = 1.25
 _INFLIGHT_GAIN = 1.25
 _BW_WINDOW = 16
@@ -141,11 +142,13 @@ class BlastCc:
         return max(self.min_bps, self.active_bytes / (rtt * _INFLIGHT_GAIN))
 
     def _rate_ceiling(self) -> float:
-        ceil = min(self.max_bps, self._inflight_ceiling())
+        hard = min(self.max_bps, self._inflight_ceiling())
+        if self.phase == STARTUP:
+            return min(hard, self.start_bps)
         bw = self.bw.max_bw
         if bw is None:
-            return min(ceil, self.start_bps)
-        return min(ceil, max(self.start_bps, bw * _DELIVERY_HEADROOM))
+            return hard
+        return min(hard, max(self.start_bps, bw * _DELIVERY_HEADROOM))
 
     def _clip(self, rate: float) -> float:
         floor = max(self.min_bps, self.last_good * _GOOD_FLOOR)
@@ -197,12 +200,14 @@ class BlastCc:
             return
         dt = now - self.last_ts
         min_dt = 0.5 * (self.min_rtt or 0.08)
+        if dt < min_dt:
+            return
         du = unique_bytes - self.last_unique
         dd = decoded_bytes - self.last_decoded
         self.last_unique = unique_bytes
         self.last_decoded = decoded_bytes
         self.last_ts = now
-        if dt < min_dt or du <= 0:
+        if du <= 0:
             return
         unique_rate = du / dt
         decoded_rate = max(0.0, dd) / dt if dd > 0 else 0.0
