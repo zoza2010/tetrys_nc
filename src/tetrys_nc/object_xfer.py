@@ -31,6 +31,7 @@ from .block_state import (
     REPAIR_INTERVAL_S,
     TAIL_REPAIR_COOLDOWN_S,
     TAIL_REPAIR_TICK_PER_BLOCK,
+    WAN_ACTIVE_BYTES,
     BlockGeometry,
     SenderBlockState,
     SenderFeedbackState,
@@ -597,12 +598,10 @@ def run_object_client(
     port: int,
     output_dir: Path,
     *,
-    wan: bool = False,
-    active_bytes: int = 4 << 20,
+    active_bytes: int = WAN_ACTIVE_BYTES,
     timeout_s: float = 180.0,
     file_progress: bool = False,
 ) -> int:
-    del wan
     sock = _udp(None, None, snd=8 << 20, rcv=32 << 20)
     server = (host, port)
     session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)

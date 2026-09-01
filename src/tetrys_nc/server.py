@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .block_state import WAN_INITIAL_REPAIR_PCT, WAN_PACE_CAP_MBIT
+from .block_state import (
+    WAN_BLOCK_K,
+    WAN_INITIAL_REPAIR_PCT,
+    WAN_PACE_CAP_MBIT,
+    WAN_SYMBOL_SIZE,
+)
 from .block_xfer import run_block_server
 
 
@@ -26,14 +31,10 @@ def _root_and_default(dir_arg: Path | None, file_arg: Path | None) -> tuple[Path
     return root, default
 
 
-def _cli_pace(wan: bool, rate_mbit: float | None) -> tuple[float, bool]:
+def _cli_pace(rate_mbit: float | None) -> tuple[float, bool]:
     """Explicit --rate locks pace (CC off). Omitted --rate keeps CC on."""
     locked = rate_mbit is not None
-    rate = float(rate_mbit) if locked else 0.0
-    if wan and rate <= 0:
-        rate = WAN_PACE_CAP_MBIT
-    elif rate <= 0:
-        rate = 1500.0
+    rate = float(rate_mbit) if locked else WAN_PACE_CAP_MBIT
     return rate, not locked
 
 
@@ -55,15 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--skip-hash", action="store_true")
     p.add_argument(
-        "--wan",
-        action="store_true",
-        help="WAN: symbol size 1350, 64 MiB active block window",
-    )
-    p.add_argument(
         "--payload-size",
         type=int,
-        default=32768,
-        help="symbol size T (ignored when --wan; default 1350 on WAN)",
+        default=WAN_SYMBOL_SIZE,
+        help=f"symbol size T (default {WAN_SYMBOL_SIZE})",
     )
     p.add_argument(
         "--rate-mbit",
@@ -72,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="rate_mbit",
         help="lock UDP send rate in Mbit/s (disables rate search). "
-        "Omit to search (WAN start 850, cap 1600)",
+        "Omit to search (start 850, cap 1600)",
     )
     p.add_argument(
         "--ramp-s",
@@ -85,39 +81,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="exit after one transfer (default: stay idle and wait for the next client)",
     )
-    p.add_argument(
-        "--gen-k",
-        type=int,
-        default=None,
-        help="symbols per independent coding block (default 768)",
-    )
+    p.add_argument("--gen-k", type=int, default=WAN_BLOCK_K)
     p.add_argument(
         "--gen-overhead",
         type=int,
-        default=None,
-        help="initial RaptorQ repair percent (WAN default 24)",
+        default=WAN_INITIAL_REPAIR_PCT,
+        help=f"initial RaptorQ repair percent (default {WAN_INITIAL_REPAIR_PCT})",
     )
     args = p.parse_args(argv)
-
-    symbol = 1350 if args.wan or args.payload_size >= 8000 else args.payload_size
-    rate, rate_cc = _cli_pace(args.wan, args.rate_mbit)
-    if args.gen_overhead is not None:
-        overhead_pct = args.gen_overhead
-    elif args.wan:
-        overhead_pct = WAN_INITIAL_REPAIR_PCT
-    else:
-        overhead_pct = 0
-    gen_k = args.gen_k if args.gen_k is not None else 768
+    rate, rate_cc = _cli_pace(args.rate_mbit)
     root, default_file = _root_and_default(args.dir, args.file)
-
     return run_block_server(
         args.host,
         args.port,
         root,
         default_file=default_file,
-        symbol_size=symbol,
-        block_k=gen_k,
-        initial_repair_pct=overhead_pct,
+        symbol_size=args.payload_size,
+        block_k=args.gen_k,
+        initial_repair_pct=args.gen_overhead,
         rate_mbit=rate,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,

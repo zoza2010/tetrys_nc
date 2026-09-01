@@ -9,10 +9,10 @@ def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
             "usage:\n"
-            "  python -m tetrys_nc server --dir DIR [--port 9000] [--wan]\n"
+            "  python -m tetrys_nc server --dir DIR [--port 9000]\n"
             "  python -m tetrys_nc client --file REL [--file REL ...] [--output PATH]\n"
-            "  python -m tetrys_nc objserver --early DIR [--late DIR] [--wan] [--port 7494]\n"
-            "  python -m tetrys_nc objclient --output DIR [--host HOST --port 7494] [--wan]\n"
+            "  python -m tetrys_nc objserver --early DIR [--late DIR] [--port 7494]\n"
+            "  python -m tetrys_nc objclient --output DIR [--host HOST --port 7494]\n"
         )
         return 0
     cmd = sys.argv[1]

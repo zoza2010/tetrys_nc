@@ -981,7 +981,7 @@ def run_block_server(
     block_k: int = WAN_BLOCK_K,
     initial_repair_pct: int = WAN_INITIAL_REPAIR_PCT,
     active_bytes: int = WAN_ACTIVE_BYTES,
-    rate_mbit: float = 1150.0,
+    rate_mbit: float = WAN_PACE_CAP_MBIT,
     ramp_s: float = 0.0,
     skip_hash: bool = False,
     rate_cc: bool | None = None,
@@ -1138,11 +1138,9 @@ def run_block_client(
     output: Path,
     *,
     remote: str = "",
-    wan: bool = False,
     active_bytes: int = WAN_ACTIVE_BYTES,
     file_progress: bool = False,
 ) -> int:
-    del wan
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
     try_set_buffer(sock, socket.SO_SNDBUF, 8 * 1024 * 1024)

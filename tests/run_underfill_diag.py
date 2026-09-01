@@ -106,7 +106,6 @@ def run_xfer(
             str(blob),
             "--port",
             str(port),
-            "--wan",
             "--skip-hash",
             "--rate",
             "900",
@@ -147,7 +146,6 @@ def run_xfer(
                 "127.0.0.1",
                 "--port",
                 str(cli_port),
-                "--wan",
                 "--output",
                 str(out),
             ],
@@ -204,7 +202,7 @@ def main() -> int:
     blob = ROOT / "testdata" / "blob_256m.bin"
     if not blob.is_file():
         blob = ROOT / "testdata" / "blob_64m.bin"
-    print(f"\n--- transfer {blob.name}  --wan --rate 900 --gen-k 96 ---")
+    print(f"\n--- transfer {blob.name}  --rate 900 --gen-k 96 ---")
     cases = [
         ("loopback", None),
         ("none", "none"),

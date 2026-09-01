@@ -40,12 +40,6 @@ def _put_dir(session: ObjectSession, folder: Path, pack_start: int) -> tuple[int
     return len(files), _next_pack(objects, pack_start)
 
 
-def _wan_defaults(wan: bool, fec: int, rate: float):
-    if wan:
-        return WAN_SYMBOL_SIZE, WAN_BLOCK_K, fec or WAN_INITIAL_REPAIR_PCT, WAN_ACTIVE_BYTES, rate or WAN_PACE_CAP_MBIT
-    return 256, 64, fec or 14, 4 << 20, rate or 400.0
-
-
 def main_objserver(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Object-mux UDP server")
     p.add_argument("--host", default="0.0.0.0")
@@ -53,11 +47,9 @@ def main_objserver(argv: list[str] | None = None) -> int:
     p.add_argument("--early", type=Path, required=True)
     p.add_argument("--late", type=Path, default=None)
     p.add_argument("--late-delay", type=float, default=0.4)
-    p.add_argument("--wan", action="store_true")
-    p.add_argument("--fec", type=int, default=0)
-    p.add_argument("--rate-mbit", type=float, default=0.0)
+    p.add_argument("--fec", type=int, default=WAN_INITIAL_REPAIR_PCT)
+    p.add_argument("--rate-mbit", type=float, default=WAN_PACE_CAP_MBIT)
     args = p.parse_args(argv)
-    symbol, block_k, fec, active, rate = _wan_defaults(args.wan, args.fec, args.rate_mbit)
     session = ObjectSession()
 
     def feed() -> None:
@@ -73,8 +65,11 @@ def main_objserver(argv: list[str] | None = None) -> int:
     threading.Thread(target=feed, daemon=True).start()
     return run_object_server(
         args.host, args.port, session,
-        symbol_size=symbol, block_k=block_k, initial_repair_pct=fec,
-        active_bytes=active, rate_mbit=rate,
+        symbol_size=WAN_SYMBOL_SIZE,
+        block_k=WAN_BLOCK_K,
+        initial_repair_pct=args.fec,
+        active_bytes=WAN_ACTIVE_BYTES,
+        rate_mbit=args.rate_mbit,
     )
 
 
@@ -83,7 +78,6 @@ def main_objclient(argv: list[str] | None = None) -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--wan", action="store_true")
     p.add_argument("--timeout", type=float, default=180.0)
     p.add_argument(
         "--progress",
@@ -94,8 +88,7 @@ def main_objclient(argv: list[str] | None = None) -> int:
     print(f"connecting object-mux to udp://{args.host}:{args.port}", flush=True)
     return run_object_client(
         args.host, args.port, args.output,
-        wan=args.wan,
-        active_bytes=WAN_ACTIVE_BYTES if args.wan else 4 << 20,
+        active_bytes=WAN_ACTIVE_BYTES,
         timeout_s=args.timeout,
         file_progress=args.progress,
     )

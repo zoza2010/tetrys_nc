@@ -260,16 +260,13 @@ def test_rate_cc_defaults_on(monkeypatch):
 def test_cli_explicit_rate_locks_cc():
     from tetrys_nc.server import _cli_pace
 
-    wan_rate, wan_cc = _cli_pace(True, None)
-    assert wan_rate == pytest.approx(850.0)
-    assert wan_cc is True
-    lock_rate, lock_cc = _cli_pace(True, 850.0)
+    open_rate, open_cc = _cli_pace(None)
+    assert open_rate == pytest.approx(850.0)
+    assert open_cc is True
+    lock_rate, lock_cc = _cli_pace(850.0)
     assert lock_rate == pytest.approx(850.0)
     assert lock_cc is False
-    lan_rate, lan_cc = _cli_pace(False, None)
-    assert lan_rate == pytest.approx(1500.0)
-    assert lan_cc is True
-    assert _cli_pace(False, 80.0) == (80.0, False)
+    assert _cli_pace(80.0) == (80.0, False)
 
 
 def test_feedback_client_lost_after_silence():

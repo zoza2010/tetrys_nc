@@ -12,13 +12,12 @@ def run_client(
     host: str,
     port: int,
     output: Path,
-    wan: bool = False,
     remote: str = "",
     file_progress: bool = False,
 ) -> int:
-    print(f"connecting to udp://{host}:{port}" + (" (wan buffers)" if wan else ""))
+    print(f"connecting to udp://{host}:{port}")
     return run_block_client(
-        host, port, output, wan=wan, remote=remote, file_progress=file_progress
+        host, port, output, remote=remote, file_progress=file_progress
     )
 
 
@@ -35,11 +34,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--output", type=Path, default=None)
     p.add_argument(
-        "--wan",
-        action="store_true",
-        help="WAN: enlarge socket buffers",
-    )
-    p.add_argument(
         "--progress",
         action="store_true",
         help="TTY bars: mux shows group total plus the in-flight file",
@@ -50,7 +44,6 @@ def main(argv: list[str] | None = None) -> int:
     output = args.output
     if output is None:
         if len(files) == 1 and "/" not in files[0].rstrip("/") and not files[0].endswith("\\"):
-            # directory vs file unknown until META; default to basename (file) or recv/
             output = Path(Path(files[0]).name)
         elif len(files) > 1:
             output = Path("recv")
@@ -60,8 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             output = Path("received.bin")
     return run_client(
-        args.host, args.port, output, wan=args.wan, remote=remote,
-        file_progress=args.progress,
+        args.host, args.port, output, remote=remote, file_progress=args.progress
     )
 
 
