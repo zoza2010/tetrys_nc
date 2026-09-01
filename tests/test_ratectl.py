@@ -62,3 +62,11 @@ def test_large_debt_skips_sleep_instead_of_dumping_tokens(monkeypatch):
     assert sleeps == []
     assert lim.tokens == 0.0
     assert lim.burst == _CAP * 0.016
+
+
+def test_set_rate_clips_only_to_cap():
+    lim = RateLimiter(_CAP, start_bps=_CAP)
+    lim.set_rate(_CAP * 0.10)
+    assert lim.rate == pytest.approx(_CAP * 0.10)
+    lim.set_rate(_CAP * 2)
+    assert lim.rate == pytest.approx(_CAP)

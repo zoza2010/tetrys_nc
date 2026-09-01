@@ -87,15 +87,13 @@ def run_xfer(
     *,
     profile: str | None,
     port: int,
-    delay_cc: bool,
     timeout: int = 90,
 ) -> tuple[dict, str]:
     env = os.environ.copy()
     env["TETRYS_GSO"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
-    env["TETRYS_DELAY_CC"] = "1" if delay_cc else "0"
     py = [sys.executable, "-u", "-m", "tetrys_nc"]
-    tag = f"{profile or 'loop'}_{'cc' if delay_cc else 'nocc'}_{port}"
+    tag = f"{profile or 'loop'}_{port}"
     srv_log = Path(f"/tmp/ufill_srv_{tag}.log")
     emu_log = Path(f"/tmp/ufill_emu_{tag}.log")
     out = Path(f"/tmp/ufill_out_{tag}.bin")
@@ -208,14 +206,12 @@ def main() -> int:
         blob = ROOT / "testdata" / "blob_64m.bin"
     print(f"\n--- transfer {blob.name}  --wan --rate 900 --gen-k 96 ---")
     cases = [
-        ("loopback", None, False),
-        ("loopback+delaycc", None, True),
-        ("none", "none", False),
-        ("wan-fast", "wan-fast", False),
-        ("wan-fast+delaycc", "wan-fast", True),
-        ("wan-underfill", "wan-underfill", False),
-        ("wan-underfill-wenc", "wan-underfill-wenc", False),
-        ("wan-good", "wan-good", False),
+        ("loopback", None),
+        ("none", "none"),
+        ("wan-fast", "wan-fast"),
+        ("wan-underfill", "wan-underfill"),
+        ("wan-underfill-wenc", "wan-underfill-wenc"),
+        ("wan-good", "wan-good"),
     ]
     print(
         f"{'case':<22} {'ok':<4} {'app':>6} {'wire':>6} {'fill%':>6} "
@@ -224,8 +220,8 @@ def main() -> int:
     )
     port = 19100
     rc = 0
-    for name, profile, cc in cases:
-        stats, tail = run_xfer(blob, profile=profile, port=port, delay_cc=cc)
+    for name, profile in cases:
+        stats, tail = run_xfer(blob, profile=profile, port=port)
         port += 2
         fill = None
         if stats["wire_med"] is not None:

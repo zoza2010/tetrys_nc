@@ -232,7 +232,6 @@ def test_extra_repair_window_busy_on_sliding_fraction():
 def test_pace_limits_floor_equals_start(monkeypatch):
     monkeypatch.delenv("TETRYS_START_MBIT", raising=False)
     monkeypatch.delenv("TETRYS_PACE_CAP_MBIT", raising=False)
-    monkeypatch.delenv("TETRYS_PACE_MIN_FRAC", raising=False)
     min_bps, max_bps, start_bps = _pace_limits(2500.0)
     assert start_bps == pytest.approx(850_000_000 / 8)
     assert min_bps == pytest.approx(start_bps)

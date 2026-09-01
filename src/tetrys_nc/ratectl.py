@@ -1,4 +1,4 @@
-"""Token-bucket pacing for gen RaptorQ blast sends."""
+"""Token-bucket pacing for blast sends. Floor/search live in BlastCc, not here."""
 
 from __future__ import annotations
 
@@ -6,25 +6,18 @@ import time
 
 
 class RateLimiter:
-    """Token-bucket pacing in bytes/sec with a hard ceiling (target rate)."""
+    """Pace at the current rate, never above max_bps."""
 
     def __init__(
         self,
         max_bps: float,
         start_bps: float | None = None,
         burst: float | None = None,
-        min_frac: float = 0.90,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        # Default floor is high so a fixed --rate blast stays full. Delay CC
-        # passes a lower min_frac so it can start low and probe upward.
-        abs_floor = min(1_000_000.0, self.max_rate * 0.05)
-        self.min_rate = min(
-            self.max_rate, max(self.max_rate * min_frac, abs_floor, 1_000_000.0)
-        )
         if start_bps is None:
             start_bps = self.max_rate
-        self.rate = min(self.max_rate, max(start_bps, self.min_rate))
+        self.rate = min(self.max_rate, max(start_bps, 1.0))
         # ~16ms of the target rate: enough for one K=192 generation (~290 KiB)
         # so we do not sleep after every 64-packet GSO burst. 2ms was starving
         # the 1000 Mbit ceiling; 250ms used to overflow shallow WAN queues.
@@ -38,7 +31,7 @@ class RateLimiter:
         self._sleep_debt = 0.0
 
     def set_rate(self, rate_bps: float) -> None:
-        self.rate = min(self.max_rate, max(rate_bps, self.min_rate))
+        self.rate = min(self.max_rate, max(rate_bps, 1.0))
         self.burst = max(self.rate * self._burst_s, 256_000.0)
 
     def set_burst_s(self, burst_s: float) -> None:

@@ -227,11 +227,7 @@ def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, f
     max_bps = cap_mbit * 1_000_000 / 8
     start_mbit = _env_float("TETRYS_START_MBIT", WAN_START_MBIT)
     start_bps = min(max_bps, start_mbit * 1_000_000 / 8)
-    # Floor at start. 0.85×start (595 Mbit) was the lock that made 2 GiB
-    # runs drop to ~60 MiB/s after a few noisy ACK samples.
-    min_frac = min(1.0, max(0.50, _env_float("TETRYS_PACE_MIN_FRAC", 1.0)))
-    min_bps = max(1_000_000.0, min(max_bps, start_bps * min_frac))
-    return min_bps, max_bps, start_bps
+    return start_bps, max_bps, start_bps
 
 
 def _encode_workers() -> int:
@@ -370,7 +366,6 @@ class BlockSender:
         self.limiter = RateLimiter(
             max_bps,
             start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
-            min_frac=min_bps / max_bps,
         )
         self.limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
         self.cc = (
@@ -439,7 +434,7 @@ class BlockSender:
             elapsed = time.monotonic() - self.t0
             if elapsed < self.ramp_s:
                 limiter.set_rate(
-                    max(self.min_bps, self.start_bps * max(0.05, elapsed / self.ramp_s))
+                    self.start_bps * max(0.05, elapsed / self.ramp_s)
                 )
         for pos in range(0, len(wires), _SEND_CHUNK):
             if cc is not None:
@@ -1075,7 +1070,6 @@ def run_block_server(
                     obj_session,
                     geometry=geometry,
                     initial_repair_pct=initial_repair_pct,
-                    min_bps=min_bps,
                     max_bps=max_bps,
                     start_bps=start_bps,
                     close_sock=False,
