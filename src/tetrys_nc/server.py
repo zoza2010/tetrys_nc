@@ -8,7 +8,6 @@ from pathlib import Path
 from .block_state import (
     WAN_BLOCK_K,
     WAN_INITIAL_REPAIR_PCT,
-    WAN_PACE_CAP_MBIT,
     WAN_SYMBOL_SIZE,
 )
 from .block_xfer import run_block_server
@@ -29,13 +28,6 @@ def _root_and_default(dir_arg: Path | None, file_arg: Path | None) -> tuple[Path
     if Path(default).is_absolute():
         default = Path(default).name
     return root, default
-
-
-def _cli_pace(rate_mbit: float | None) -> tuple[float, bool]:
-    """Explicit --rate locks pace (CC off). Omitted --rate keeps CC on."""
-    locked = rate_mbit is not None
-    rate = float(rate_mbit) if locked else WAN_PACE_CAP_MBIT
-    return rate, not locked
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,7 +81,6 @@ def main(argv: list[str] | None = None) -> int:
         help=f"initial RaptorQ repair percent (default {WAN_INITIAL_REPAIR_PCT})",
     )
     args = p.parse_args(argv)
-    rate, rate_cc = _cli_pace(args.rate_mbit)
     root, default_file = _root_and_default(args.dir, args.file)
     return run_block_server(
         args.host,
@@ -99,10 +90,9 @@ def main(argv: list[str] | None = None) -> int:
         symbol_size=args.payload_size,
         block_k=args.gen_k,
         initial_repair_pct=args.gen_overhead,
-        rate_mbit=rate,
+        rate_mbit=args.rate_mbit,
         ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
-        rate_cc=rate_cc,
         once=args.once,
     )
 

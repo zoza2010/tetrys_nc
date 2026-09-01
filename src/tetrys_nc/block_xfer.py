@@ -195,19 +195,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _rate_cc_enabled(flag: bool | None) -> bool:
-    if flag is True:
-        return True
-    if flag is False:
-        return False
-    env = os.environ.get("TETRYS_CC", "").strip().lower()
-    if env in {"0", "off", "false", "no"}:
-        return False
-    if env in {"1", "on", "true", "blast", "yes"}:
-        return True
-    return True
-
-
 def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, float]:
     if cc:
         cap_mbit = max(
@@ -986,18 +973,19 @@ def run_block_server(
     block_k: int = WAN_BLOCK_K,
     initial_repair_pct: int = WAN_INITIAL_REPAIR_PCT,
     active_bytes: int = WAN_ACTIVE_BYTES,
-    rate_mbit: float = WAN_PACE_CAP_MBIT,
+    rate_mbit: float | None = None,
     ramp_s: float = 0.0,
     skip_hash: bool = False,
-    rate_cc: bool | None = None,
     once: bool = True,
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
     root = root.resolve()
     workers = _encode_workers()
     prefetch_depth = min(64, max(geometry.active_blocks, 32))
-    cc_on = _rate_cc_enabled(rate_cc)
-    min_bps, max_bps, start_bps = _pace_limits(rate_mbit, cc=cc_on)
+    cc_on = rate_mbit is None
+    min_bps, max_bps, start_bps = _pace_limits(
+        WAN_START_MBIT if cc_on else rate_mbit, cc=cc_on
+    )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)

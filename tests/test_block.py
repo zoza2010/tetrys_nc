@@ -43,7 +43,6 @@ from tetrys_nc.block_state import (
 )
 from tetrys_nc.block_xfer import (
     _pace_limits,
-    _rate_cc_enabled,
     _safe_join,
     encode_block_job,
     rebuild_block_encoder,
@@ -244,29 +243,6 @@ def test_pace_limits_cc_uses_search_cap(monkeypatch):
     assert start_bps == pytest.approx(850_000_000 / 8)
     assert max_bps == pytest.approx(10000_000_000 / 8)
     assert min_bps < start_bps
-
-
-def test_rate_cc_defaults_on(monkeypatch):
-    monkeypatch.delenv("TETRYS_CC", raising=False)
-    assert _rate_cc_enabled(None) is True
-    assert _rate_cc_enabled(True) is True
-    assert _rate_cc_enabled(False) is False
-    monkeypatch.setenv("TETRYS_CC", "0")
-    assert _rate_cc_enabled(None) is False
-    monkeypatch.setenv("TETRYS_CC", "1")
-    assert _rate_cc_enabled(None) is True
-
-
-def test_cli_explicit_rate_locks_cc():
-    from tetrys_nc.server import _cli_pace
-
-    open_rate, open_cc = _cli_pace(None)
-    assert open_rate == pytest.approx(850.0)
-    assert open_cc is True
-    lock_rate, lock_cc = _cli_pace(850.0)
-    assert lock_rate == pytest.approx(850.0)
-    assert lock_cc is False
-    assert _cli_pace(80.0) == (80.0, False)
 
 
 def test_feedback_client_lost_after_silence():
