@@ -24,7 +24,7 @@ def test_sleep_debt_shortens_next_wait_without_growing_burst(monkeypatch):
 
     monkeypatch.setattr(time, "sleep", fake_sleep)
 
-    lim = RateLimiter(_CAP, burst=_CAP * 0.016)
+    lim = RateLimiter(_CAP, burst_s=0.016)
     burst0 = lim.burst
     lim.tokens = 0.0
     lim.updated = clock[0]
@@ -52,7 +52,7 @@ def test_large_debt_skips_sleep_instead_of_dumping_tokens(monkeypatch):
         time, "sleep", lambda s: sleeps.append(s) or clock.__setitem__(0, clock[0] + s)
     )
 
-    lim = RateLimiter(_CAP, burst=_CAP * 0.016)
+    lim = RateLimiter(_CAP, burst_s=0.016)
     lim.tokens = 0.0
     lim.updated = 0.0
     lim._sleep_debt = 0.020

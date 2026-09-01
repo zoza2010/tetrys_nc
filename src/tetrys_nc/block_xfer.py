@@ -366,8 +366,8 @@ class BlockSender:
         self.limiter = RateLimiter(
             max_bps,
             start_bps=start_bps if not cc_on else start_bps * _SEED_FRAC,
+            burst_s=_env_float("TETRYS_BURST_S", 0.008),
         )
-        self.limiter.set_burst_s(_env_float("TETRYS_BURST_S", 0.008))
         self.cc = (
             BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
             if cc_on

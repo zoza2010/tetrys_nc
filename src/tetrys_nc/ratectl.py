@@ -1,79 +1,62 @@
-"""Token-bucket pacing for blast sends. Floor/search live in BlastCc, not here."""
+"""Token-bucket pacing. Rate search lives in BlastCc; this only meters."""
 
 from __future__ import annotations
 
 import time
 
+# Short enough not to dump into a shallow WAN queue (250ms did); long enough
+# that we do not sleep after every 64-packet GSO burst (2ms starved ~1 Gbit).
+_BURST_S = 0.008
+# At CC floor (~80 Mbit) rate×burst_s is smaller than one send chunk.
+_MIN_BURST = 256_000.0
+_MAX_SLEEP_S = 0.05
+_SPIN_AFTER_S = 0.0004
+
 
 class RateLimiter:
-    """Pace at the current rate, never above max_bps."""
-
     def __init__(
         self,
         max_bps: float,
         start_bps: float | None = None,
-        burst: float | None = None,
+        burst_s: float = _BURST_S,
     ) -> None:
         self.max_rate = max(max_bps, 1.0)
-        if start_bps is None:
-            start_bps = self.max_rate
-        self.rate = min(self.max_rate, max(start_bps, 1.0))
-        # ~16ms of the target rate: enough for one K=192 generation (~290 KiB)
-        # so we do not sleep after every 64-packet GSO burst. 2ms was starving
-        # the 1000 Mbit ceiling; 250ms used to overflow shallow WAN queues.
-        self._burst_s = 0.016
-        self.burst = burst if burst is not None else max(self.rate * self._burst_s, 256_000.0)
+        self.rate = min(self.max_rate, max(start_bps or self.max_rate, 1.0))
+        self._burst_s = max(0.001, min(burst_s, 0.050))
+        self.burst = max(self.rate * self._burst_s, _MIN_BURST)
         self.tokens = self.burst
         self.updated = time.monotonic()
-        # Seconds already waited beyond the intended sleep. Applied to the
-        # *next* sleep (shorter wait) instead of extra tokens, so catch-up
-        # does not enlarge the burst into a policer.
         self._sleep_debt = 0.0
 
     def set_rate(self, rate_bps: float) -> None:
         self.rate = min(self.max_rate, max(rate_bps, 1.0))
-        self.burst = max(self.rate * self._burst_s, 256_000.0)
-
-    def set_burst_s(self, burst_s: float) -> None:
-        self._burst_s = max(0.001, min(burst_s, 0.050))
-        self.burst = max(self.rate * self._burst_s, 256_000.0)
+        self.burst = max(self.rate * self._burst_s, _MIN_BURST)
 
     def consume(self, nbytes: int) -> float:
-        """Spend tokens. Returns seconds slept waiting for the bucket."""
         now = time.monotonic()
-        elapsed = max(0.0, now - self.updated)
+        self.tokens = min(self.burst, self.tokens + max(0.0, now - self.updated) * self.rate)
         self.updated = now
-        self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
         self.tokens -= nbytes
         if self.tokens >= 0:
             return 0.0
 
-        need_s = (-self.tokens) / self.rate
-        if need_s > 0.05:
-            need_s = 0.05
-
-        debt = self._sleep_debt
-        if debt > 0.0:
-            if debt >= need_s:
-                self._sleep_debt = min(self._burst_s, debt - need_s)
-                self.tokens = 0.0
-                return 0.0
-            need_s -= debt
-            self._sleep_debt = 0.0
+        need_s = min(_MAX_SLEEP_S, (-self.tokens) / self.rate)
+        self.tokens = 0.0
+        if self._sleep_debt >= need_s:
+            self._sleep_debt = min(self._burst_s, self._sleep_debt - need_s)
+            return 0.0
+        need_s -= self._sleep_debt
+        self._sleep_debt = 0.0
 
         t0 = time.monotonic()
-        deadline = t0 + need_s
-        # Sleep the full wait when it is above timer granularity; spin only
-        # sub-ms remainders. Bound the spin so a frozen test clock cannot hang.
-        if need_s >= 0.0004:
+        if need_s >= _SPIN_AFTER_S:
             time.sleep(need_s)
+        deadline = t0 + need_s
         spins = 0
         while time.monotonic() < deadline and spins < 2_000_000:
             spins += 1
         now2 = time.monotonic()
         self.updated = now2
-        overslept = now2 - deadline
-        if overslept > 0.0:
-            self._sleep_debt = min(self._burst_s, self._sleep_debt + overslept)
-        self.tokens = 0.0
+        if now2 > deadline:
+            self._sleep_debt = min(self._burst_s, now2 - deadline)
         return need_s
