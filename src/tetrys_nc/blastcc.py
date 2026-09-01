@@ -1,8 +1,11 @@
-"""Rate search for RaptorQ blast: BBR-like startup, delay drain, no loss backoff."""
+"""Rate search: BBR-like phases, filtered delivery, no channel cap."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+
+from .block_state import WAN_ACTIVE_BYTES
 
 STARTUP = "startup"
 DRAIN = "drain"
@@ -17,20 +20,24 @@ _QDELAY_HOLD = 4
 _MIN_RTT_HOLD_S = 10.0
 _MIN_RTT_SAMPLES = 8
 _SRTT_ALPHA = 0.125
-_STARTUP_GAIN = 1.25
-_PROBE_GAIN = 1.03
-_PROBE_WAIT_S = 2.0
-_DRAIN_GAIN = 1.0 / _STARTUP_GAIN
+_STARTUP_GAIN = 2.0 / math.log(2)
+_PROBE_GAIN = 1.10
+_PROBE_WAIT_S = 1.0
+_DRAIN_GAIN = 0.75
 _DRAIN_MAX_CUTS = 3
 _DRAIN_MAX_S = 1.5
 _CRUISE_CUT = 0.93
 _GOOD_FLOOR = 0.90
 _SEED_FRAC = 0.90
 _ABS_MIN_MBIT = 80.0
-# WAN at 984 Mbit was still first_close=100%; 1139+ blew extra-repair.
-_DELIVERY_HEADROOM = 1.42
+_DELIVERY_HEADROOM = 1.25
+_STEP_MAX = 1.25
+_INFLIGHT_GAIN = 1.25
+_BW_WINDOW = 16
+_BW_MIN_SAMPLES = 3
 _EXTRA_OK = 0.04
 _EXTRA_CUT = 0.08
+_DECODE_KEEPUP = 0.70
 
 
 def rtt_from_echo(now_s: float, echo_us: int) -> float | None:
@@ -74,10 +81,33 @@ class RttFilter:
 
 
 @dataclass
+class BwFilter:
+    """Delivery samples; max_bw is second-highest so one ACK spike is ignored."""
+
+    samples: list[float] = field(default_factory=list)
+    window: int = _BW_WINDOW
+
+    def observe(self, bps: float) -> None:
+        if bps <= 0:
+            return
+        self.samples.append(bps)
+        if len(self.samples) > self.window:
+            del self.samples[0]
+
+    @property
+    def max_bw(self) -> float | None:
+        if len(self.samples) < _BW_MIN_SAMPLES:
+            return None
+        xs = sorted(self.samples)
+        return xs[-2]
+
+
+@dataclass
 class BlastCc:
     max_bps: float
     start_bps: float
     min_bps: float = 0.0
+    active_bytes: int = WAN_ACTIVE_BYTES
     rate: float = 0.0
     last_good: float = 0.0
     phase: str = STARTUP
@@ -86,7 +116,9 @@ class BlastCc:
     last_decoded: int = 0
     last_ts: float | None = None
     last_delivery: float = 0.0
+    recv_lag: bool = False
     rtt: RttFilter = field(default_factory=RttFilter)
+    bw: BwFilter = field(default_factory=BwFilter)
     high_delay_n: int = 0
     low_delay_n: int = 0
     last_step_ts: float = 0.0
@@ -104,21 +136,24 @@ class BlastCc:
         self.rate = seed
         self.last_good = seed
 
+    def _inflight_ceiling(self) -> float:
+        rtt = self.min_rtt if self.min_rtt and self.min_rtt > 0 else 0.08
+        return max(self.min_bps, self.active_bytes / (rtt * _INFLIGHT_GAIN))
+
+    def _rate_ceiling(self) -> float:
+        ceil = min(self.max_bps, self._inflight_ceiling())
+        bw = self.bw.max_bw
+        if bw is None:
+            return min(ceil, self.start_bps)
+        return min(ceil, max(self.start_bps, bw * _DELIVERY_HEADROOM))
+
     def _clip(self, rate: float) -> float:
         floor = max(self.min_bps, self.last_good * _GOOD_FLOOR)
-        return min(self.max_bps, max(floor, rate))
+        return min(self._rate_ceiling(), max(floor, rate))
 
-    def _climb_ceiling(self) -> float:
-        """Startup only fills the hint; probes search up to safety cap."""
-        return min(self.max_bps, self.start_bps)
-
-    def _path_ceiling(self) -> float:
-        if self.last_delivery <= 1_000_000.0:
-            return self.max_bps
-        return min(
-            self.max_bps,
-            max(self.start_bps, self.last_delivery * _DELIVERY_HEADROOM),
-        )
+    def _nudge(self, gain: float) -> float:
+        target = min(self.rate * gain, self.rate * _STEP_MAX)
+        return self._clip(target)
 
     def _enter_cruise(self, now: float) -> None:
         self.phase = CRUISE
@@ -138,7 +173,7 @@ class BlastCc:
         """Startup can climb while send_wires blocks the feedback snapshot."""
         if self.phase != STARTUP:
             return self.rate
-        ceiling = self._climb_ceiling()
+        ceiling = self._rate_ceiling()
         if self.rate >= ceiling * 0.98:
             qdelay = 0.0
             if self.rtt.n >= _MIN_RTT_SAMPLES:
@@ -148,8 +183,34 @@ class BlastCc:
             return self.rate
         if now - self.last_step_ts >= self._step_s():
             self.last_step_ts = now
-            self.rate = min(ceiling, self.rate * _STARTUP_GAIN)
+            self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
         return self.rate
+
+    def _observe_delivery(
+        self, now: float, unique_bytes: int, decoded_bytes: int
+    ) -> None:
+        self.recv_lag = False
+        if self.last_ts is None:
+            self.last_unique = unique_bytes
+            self.last_decoded = decoded_bytes
+            self.last_ts = now
+            return
+        dt = now - self.last_ts
+        min_dt = 0.5 * (self.min_rtt or 0.08)
+        du = unique_bytes - self.last_unique
+        dd = decoded_bytes - self.last_decoded
+        self.last_unique = unique_bytes
+        self.last_decoded = decoded_bytes
+        self.last_ts = now
+        if dt < min_dt or du <= 0:
+            return
+        unique_rate = du / dt
+        decoded_rate = max(0.0, dd) / dt if dd > 0 else 0.0
+        self.last_delivery = unique_rate
+        if decoded_rate <= 0 or decoded_rate < unique_rate * _DECODE_KEEPUP:
+            self.recv_lag = True
+            return
+        self.bw.observe(min(unique_rate, decoded_rate))
 
     def on_feedback(
         self,
@@ -168,20 +229,8 @@ class BlastCc:
         raw_rtt = rtt_from_echo(now, echo_ts_us)
         qdelay = self.rtt.observe(now, raw_rtt)
         self.min_rtt = self.rtt.min_rtt
-
-        dt = 0.0 if self.last_ts is None else max(1e-3, now - self.last_ts)
-        delivery = 0.0
-        decoded_rate = 0.0
-        if self.last_ts is not None:
-            delivery = max(0.0, unique_bytes - self.last_unique) / dt
-            decoded_rate = max(0.0, decoded_bytes - self.last_decoded) / dt
-        self.last_unique = unique_bytes
-        self.last_decoded = decoded_bytes
-        self.last_ts = now
-        if delivery > 0:
-            self.last_delivery = delivery
-
-        recv_lag = window_full and decoded_rate > 0 and delivery > decoded_rate * 1.35
+        self._observe_delivery(now, unique_bytes, decoded_bytes)
+        recv_lag = bool(window_full and self.recv_lag)
         step_s = 0.16 if self.min_rtt is None else max(0.12, min(0.40, 2.0 * self.min_rtt))
 
         if qdelay >= _QDELAY_CUT_S:
@@ -194,7 +243,7 @@ class BlastCc:
             self.high_delay_n = 0
 
         if self.phase == STARTUP:
-            ceiling = self._climb_ceiling()
+            ceiling = self._rate_ceiling()
             at_cap = self.rate >= ceiling * 0.98
             if qdelay >= _QDELAY_STOP_S:
                 if self.high_delay_n >= _QDELAY_HOLD:
@@ -207,7 +256,7 @@ class BlastCc:
                 self._enter_cruise(now)
             elif now - self.last_step_ts >= step_s:
                 self.last_step_ts = now
-                self.rate = min(ceiling, self.rate * _STARTUP_GAIN)
+                self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
         elif self.phase == DRAIN:
             drained_long = now - self.drain_ts >= _DRAIN_MAX_S
             if self.low_delay_n >= 2 or drained_long:
@@ -233,15 +282,14 @@ class BlastCc:
                 and extra_frac < _EXTRA_OK
                 and qdelay < _QDELAY_STOP_S
                 and now - self.cruise_ts >= _PROBE_WAIT_S
-                and self.rate < self.max_bps * 0.98
+                and self.rate < self._rate_ceiling() * 0.98
             ):
                 self.phase = PROBE
                 self.probe_base = self.rate
-                ceiling = self._path_ceiling()
-                self.rate = min(self.max_bps, ceiling, self.rate * _PROBE_GAIN)
+                self.rate = min(self._rate_ceiling(), self._nudge(_PROBE_GAIN))
                 self.probe_until = now + max(0.32, 4.0 * (self.min_rtt or 0.08))
         elif self.phase == PROBE:
-            if extra_frac >= _EXTRA_OK or self.high_delay_n >= _QDELAY_HOLD:
+            if extra_frac >= _EXTRA_OK or self.high_delay_n >= _QDELAY_HOLD or recv_lag:
                 self.rate = self.probe_base
                 self._enter_cruise(now)
             elif now >= self.probe_until:
@@ -249,6 +297,7 @@ class BlastCc:
                     qdelay < _QDELAY_STOP_S
                     and self.high_delay_n == 0
                     and extra_frac < _EXTRA_OK
+                    and not recv_lag
                 )
                 if better:
                     self.last_good = self.rate
@@ -256,7 +305,5 @@ class BlastCc:
                     self.rate = self.probe_base
                 self._enter_cruise(now)
 
-        if self.phase != STARTUP:
-            self.rate = min(self.rate, self._path_ceiling())
-        self.rate = min(self.max_bps, max(self.min_bps, self.rate))
+        self.rate = self._clip(self.rate)
         return self.rate

@@ -218,7 +218,7 @@ def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, f
         max_bps = cap_mbit * 1_000_000 / 8
         start_mbit = min(cap_mbit, max(rate_mbit, 1.0))
         start_bps = start_mbit * 1_000_000 / 8
-        min_bps = min(start_bps, max(80_000_000 / 8, max_bps * 0.10))
+        min_bps = 80_000_000 / 8
         return min_bps, max_bps, start_bps
     cap_mbit = min(
         max(rate_mbit, 1.0),
@@ -368,7 +368,12 @@ class BlockSender:
             pace, burst_s=_env_float("TETRYS_BURST_S", 0.008)
         )
         self.cc = (
-            BlastCc(max_bps=max_bps, start_bps=start_bps, min_bps=min_bps)
+            BlastCc(
+                max_bps=max_bps,
+                start_bps=start_bps,
+                min_bps=min_bps,
+                active_bytes=geometry.active_bytes,
+            )
             if cc_on
             else None
         )

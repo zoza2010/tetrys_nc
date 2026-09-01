@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="rate_mbit",
         help="lock UDP send rate in Mbit/s (disables rate search). "
-        "Omit to search (start 850, cap 1600)",
+        "Omit to search from 850 Mbit (CC; no channel cap)",
     )
     p.add_argument(
         "--ramp-s",

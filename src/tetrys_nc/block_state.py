@@ -19,8 +19,8 @@ WAN_INITIAL_REPAIR_PCT = 24
 # Fixed 850 Mbit beat 880/920 on this path: extra-repair stays in check.
 WAN_START_MBIT = 850.0
 WAN_PACE_CAP_MBIT = 850.0
-# Safety ceiling while CC searches; explicit --rate locks WAN_PACE_CAP.
-WAN_CC_CAP_MBIT = 1600.0
+# Sanity clip for CC output (not a path estimate). --rate locks WAN_PACE_CAP.
+WAN_CC_CAP_MBIT = 10000.0
 # Sliding extra-repair fraction over recent non-tail completions.
 EXTRA_FRAC_WINDOW = 32
 EXTRA_FRAC_MIN_SAMPLES = 8

@@ -10,6 +10,7 @@ from tetrys_nc.blastcc import (
     PROBE,
     STARTUP,
     BlastCc,
+    BwFilter,
     rtt_from_echo,
 )
 from tetrys_nc.block_packets import pack_data_packets, parse_packet, stamp_data_wires
@@ -76,8 +77,9 @@ def test_startup_climbs_to_cap_without_delivery_plateau():
         now += 0.20
         unique += int(_CAP * 0.20)
         _feed(cc, now, i, unique, 0.080)
-    assert cc.rate == pytest.approx(_CAP)
+    assert cc.rate >= _CAP * 0.98
     assert cc.phase == CRUISE
+    assert cc.rate <= _CAP * 1.26
 
 
 def test_single_jitter_does_not_drain():
@@ -129,7 +131,7 @@ def test_extra_repair_without_delay_does_not_cut_cruise():
     cc.phase = CRUISE
     cc.rate = _CAP * 0.9
     cc.last_good = cc.rate
-    cc.cruise_ts = 100.0
+    cc.cruise_ts = 100.5
     cc.rtt.n = 20
     cc.rtt.min_rtt = 0.08
     cc.rtt.srtt = 0.081
@@ -180,10 +182,9 @@ def test_probe_then_revert_if_filtered_delay_rises():
     assert cc.rate == base
 
 
-def test_probe_can_raise_toward_safety_cap():
-    cap = 1600_000_000 / 8
+def test_probe_can_raise_above_start_without_channel_cap():
     start = 850_000_000 / 8
-    cc = BlastCc(max_bps=cap, start_bps=start)
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start)
     cc.phase = CRUISE
     cc.rate = start
     cc.last_good = start
@@ -192,10 +193,29 @@ def test_probe_can_raise_toward_safety_cap():
     cc.rtt.srtt = 0.08
     cc.rtt.n = 20
     cc.cruise_ts = 0.0
+    for bps in (start, start, start * 1.05):
+        cc.bw.observe(bps)
     _feed(cc, 3.0, 1, 1_000_000, 0.08)
     assert cc.phase == PROBE
     assert cc.rate > start
-    assert cc.rate <= cap
+    assert cc.rate <= start * 1.25
+
+
+def test_bw_filter_ignores_single_spike():
+    bw = BwFilter()
+    bw.observe(100.0)
+    bw.observe(110.0)
+    bw.observe(10_000.0)
+    assert bw.max_bw == pytest.approx(110.0)
+
+
+def test_short_ack_interval_does_not_raise_bw():
+    cc = _cc()
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    _feed(cc, 1.00, 1, 0, 0.08)
+    _feed(cc, 1.01, 2, 50_000_000, 0.08)
+    assert cc.bw.max_bw is None
 
 
 def test_stamp_overwrites_encode_age():

@@ -242,7 +242,7 @@ def test_pace_limits_cc_uses_search_cap(monkeypatch):
     monkeypatch.delenv("TETRYS_CC_CAP_MBIT", raising=False)
     min_bps, max_bps, start_bps = _pace_limits(850.0, cc=True)
     assert start_bps == pytest.approx(850_000_000 / 8)
-    assert max_bps == pytest.approx(1600_000_000 / 8)
+    assert max_bps == pytest.approx(10000_000_000 / 8)
     assert min_bps < start_bps
 
 
