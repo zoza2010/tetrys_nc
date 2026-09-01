@@ -28,7 +28,6 @@ def test_sleep_debt_shortens_next_wait_without_growing_burst(monkeypatch):
     burst0 = lim.burst
     lim.tokens = 0.0
     lim.updated = clock[0]
-    lim.oversleep_credit = 0.0
 
     lim.consume(_BATCH)
     assert sleeps, "first consume must sleep"
@@ -56,7 +55,6 @@ def test_large_debt_skips_sleep_instead_of_dumping_tokens(monkeypatch):
     lim = RateLimiter(_CAP, burst=_CAP * 0.016)
     lim.tokens = 0.0
     lim.updated = 0.0
-    lim.oversleep_credit = 0.0
     lim._sleep_debt = 0.020
 
     slept = lim.consume(_BATCH)

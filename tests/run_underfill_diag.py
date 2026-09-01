@@ -33,7 +33,7 @@ def bench_pacer(seconds: float = 2.0, batch: int = 1400 * 64) -> dict:
         "mib": mib,
         "fill": mib / CAP_MIB,
         "pace_frac": slept / dt,
-        "oversleep": lim.oversleep_credit,
+        "sleep_debt": lim._sleep_debt,
     }
 
 

@@ -2,16 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import time
-
-
-def _oversleep_credit() -> float:
-    try:
-        v = float(os.environ.get("TETRYS_PACE_OVERSLEEP", "0") or "0")
-    except ValueError:
-        return 0.0
-    return min(1.0, max(0.0, v))
 
 
 class RateLimiter:
@@ -41,7 +32,6 @@ class RateLimiter:
         self.burst = burst if burst is not None else max(self.rate * self._burst_s, 256_000.0)
         self.tokens = self.burst
         self.updated = time.monotonic()
-        self.oversleep_credit = _oversleep_credit()
         # Seconds already waited beyond the intended sleep. Applied to the
         # *next* sleep (shorter wait) instead of extra tokens, so catch-up
         # does not enlarge the burst into a policer.
@@ -93,8 +83,4 @@ class RateLimiter:
         if overslept > 0.0:
             self._sleep_debt = min(self._burst_s, self._sleep_debt + overslept)
         self.tokens = 0.0
-        if overslept > 0.0 and self.oversleep_credit > 0:
-            self.tokens = min(
-                self.burst, overslept * self.rate * self.oversleep_credit
-            )
         return need_s
