@@ -6,6 +6,7 @@ import hashlib
 import mmap
 import multiprocessing
 import os
+import queue
 import random
 import select
 import socket
@@ -312,6 +313,11 @@ def _resolve_ready(
     return "mux", files
 
 
+def _send_copies(sock: socket.socket, addr, payload: bytes, n: int = 8) -> None:
+    for _ in range(n):
+        sock.sendto(payload, addr)
+
+
 class BlockSender:
     """One file blast: encode window, repair, pace, abort on silent client."""
 
@@ -372,7 +378,8 @@ class BlockSender:
         self.enc_cache: dict[int, GenEncoder] = {}
         self.enc_order: list[int] = []
         self.ready: dict[int, tuple[list[bytes], int]] = {}
-        self.inflight: dict[int, Future] = {}
+        self.pending: dict[int, Future] = {}
+        self._encoded: queue.SimpleQueue[int] = queue.SimpleQueue()
         self.next_block = 0
         self.timers = LoopTimers()
         self.t0 = 0.0
@@ -532,10 +539,15 @@ class BlockSender:
         self.timers.repair_s += time.perf_counter() - t_r
         return sent
 
-    def _pump_ready(self) -> None:
-        finished = [bid for bid, fut in self.inflight.items() if fut.done()]
-        for bid in finished:
-            fut = self.inflight.pop(bid)
+    def _take_encoded(self) -> None:
+        while True:
+            try:
+                bid = self._encoded.get_nowait()
+            except queue.Empty:
+                return
+            fut = self.pending.pop(bid, None)
+            if fut is None:
+                continue
             try:
                 block_id, wires, budget, encode_s = fut.result()
             except Exception:
@@ -553,8 +565,22 @@ class BlockSender:
             self.ready[block_id] = (wires, budget)
             self.timers.encode_s += encode_s
 
+    def _submit_encode(self, bid: int) -> None:
+        fut = self.encode_pool.submit(
+            encode_block_job,
+            self.file_path_str,
+            bid,
+            self.geometry.block_bytes,
+            self.file_size,
+            self.symbol_size,
+            self.repair_ctl.current,
+            self.session_id,
+        )
+        self.pending[bid] = fut
+        fut.add_done_callback(lambda _f, block_id=bid: self._encoded.put(block_id))
+
     def _submit_ahead(self) -> None:
-        self._pump_ready()
+        self._take_encoded()
         queued = 0
         bid = self.next_block
         while bid < self.total_blocks and queued < self.prefetch_depth:
@@ -562,18 +588,33 @@ class BlockSender:
                 bid += 1
                 continue
             queued += 1
-            if bid not in self.ready and bid not in self.inflight:
-                self.inflight[bid] = self.encode_pool.submit(
-                    encode_block_job,
-                    self.file_path_str,
-                    bid,
-                    self.geometry.block_bytes,
-                    self.file_size,
-                    self.symbol_size,
-                    self.repair_ctl.current,
-                    self.session_id,
-                )
+            if bid not in self.ready and bid not in self.pending:
+                self._submit_encode(bid)
             bid += 1
+
+    def _admit_source(self) -> bool:
+        admitted = False
+        while (
+            self.next_block < self.total_blocks
+            and len(self.active) < self.geometry.active_blocks
+        ):
+            self._take_encoded()
+            item = self.ready.pop(self.next_block, None)
+            if item is None:
+                self._submit_ahead()
+                return admitted
+            wires, budget = item
+            self.active[self.next_block] = SenderBlockState(
+                self.next_block,
+                initial_repair=budget,
+                repair_emitted=budget,
+                sent_at=time.monotonic(),
+            )
+            self._send_wires(wires, repair=False)
+            self.next_block += 1
+            admitted = True
+            self._submit_ahead()
+        return admitted
 
     def _log_progress(
         self, now: float, completed: set[int], opened: dict, unique_rx: int, decoded: int
@@ -593,7 +634,7 @@ class BlockSender:
         print(
             f"progress sent={self.next_block}/{self.total_blocks} "
             f"done={len(completed)} active={len(self.active)} "
-            f"ready={len(self.ready)} inflight={len(self.inflight)} "
+            f"ready={len(self.ready)} inflight={len(self.pending)} "
             f"open={len(opened)} fec={self.repair_ctl.current}% "
             f"close={close_pct:.0f}% "
             f"pace={self.limiter.rate * 8 / 1e6:.0f}Mbit "
@@ -655,28 +696,7 @@ class BlockSender:
                     self.tail_started = now
                 self._reap_completed(completed, tail=tail)
                 self._submit_ahead()
-
-                admitted = False
-                while (
-                    self.next_block < self.total_blocks
-                    and len(self.active) < self.geometry.active_blocks
-                ):
-                    self._pump_ready()
-                    item = self.ready.pop(self.next_block, None)
-                    if item is None:
-                        self._submit_ahead()
-                        break
-                    wires, budget = item
-                    self.active[self.next_block] = SenderBlockState(
-                        self.next_block,
-                        initial_repair=budget,
-                        repair_emitted=budget,
-                        sent_at=time.monotonic(),
-                    )
-                    self._send_wires(wires, repair=False)
-                    self.next_block += 1
-                    admitted = True
-                    self._submit_ahead()
+                admitted = self._admit_source()
 
                 window_full = len(self.active) >= self.geometry.active_blocks
                 if tail or (
@@ -711,7 +731,7 @@ class BlockSender:
                     self.timers.wait_s += time.perf_counter() - t_wait
         finally:
             self.stop.set()
-            for fut in list(self.inflight.values()):
+            for fut in list(self.pending.values()):
                 fut.cancel()
             fb_thread.join(timeout=1.0)
             self.mm.close()
@@ -1029,8 +1049,7 @@ def run_block_server(
                     geometry.active_bytes,
                     "",
                 ).pack()
-                for _ in range(8):
-                    sock.sendto(nak, client)
+                _send_copies(sock, client, nak)
                 continue
             kind, target = asked
             if kind == "mux":
@@ -1053,8 +1072,7 @@ def run_block_server(
                     geometry.active_bytes,
                     f"n={obj_session.nobj}",
                 ).pack()
-                for _ in range(8):
-                    sock.sendto(meta, client)
+                _send_copies(sock, client, meta)
                 run_object_session(
                     sock,
                     client,
@@ -1089,8 +1107,7 @@ def run_block_server(
                 geometry.active_bytes,
                 digest,
             ).pack()
-            for _ in range(8):
-                sock.sendto(meta, client)
+            _send_copies(sock, client, meta)
 
             sender = BlockSender(
                 sock,
@@ -1141,8 +1158,7 @@ def run_block_client(
     server = (host, port)
     session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
     ready = BlockReady(session_id, active_bytes, remote).pack()
-    for _ in range(8):
-        sock.sendto(ready, server)
+    _send_copies(sock, server, ready)
 
     meta: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
