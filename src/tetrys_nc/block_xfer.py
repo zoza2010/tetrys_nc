@@ -40,7 +40,7 @@ from .block_state import (
     FEC_FLOOR_PCT,
     FEC_MAX_PCT,
     FEC_RAPTORQ_MARGIN,
-    adaptive_start_pct,
+    resolve_fec_cli,
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
     REPAIR_INTERVAL_S,
@@ -50,7 +50,6 @@ from .block_state import (
     SenderFeedbackState,
     WAN_ACTIVE_BYTES,
     WAN_BLOCK_K,
-    WAN_INITIAL_REPAIR_PCT,
     WAN_CC_CAP_MBIT,
     WAN_START_MBIT,
     WAN_SYMBOL_SIZE,
@@ -346,6 +345,7 @@ class BlockSender:
         geometry: BlockGeometry,
         *,
         initial_repair_pct: int,
+        fec_mode: str | None = None,
         min_bps: float,
         max_bps: float,
         start_bps: float,
@@ -386,7 +386,9 @@ class BlockSender:
             if cc_on
             else None
         )
-        fec_mode = _env_str("TETRYS_FEC_MODE", "quantile").lower()
+        fec_mode = (fec_mode or _env_str("TETRYS_FEC_MODE", "quantile")).lower()
+        if fec_mode not in ("fixed", "quantile", "hmm"):
+            fec_mode = "quantile"
         fec_floor = int(_env_float("TETRYS_FEC_FLOOR", FEC_FLOOR_PCT))
         fec_max = int(_env_float("TETRYS_FEC_MAX", FEC_MAX_PCT))
         self.repair_ctl = make_fec_controller(
@@ -394,7 +396,7 @@ class BlockSender:
             mode=fec_mode,
             floor_pct=fec_floor,
             max_pct=fec_max,
-            clamp_cold=True,
+            clamp_cold=fec_mode != "fixed",
         )
         self.active: dict[int, SenderBlockState] = {}
         self.enc_cache: dict[int, GenEncoder] = {}
@@ -1128,7 +1130,7 @@ def run_block_server(
     default_file: str = "",
     symbol_size: int = WAN_SYMBOL_SIZE,
     block_k: int = WAN_BLOCK_K,
-    initial_repair_pct: int = WAN_INITIAL_REPAIR_PCT,
+    initial_repair_pct: int | None = None,
     active_bytes: int = WAN_ACTIVE_BYTES,
     rate_mbit: float | None = None,
     ramp_s: float = 0.0,
@@ -1142,6 +1144,10 @@ def run_block_server(
     cc_on = rate_mbit is None
     min_bps, max_bps, start_bps = _pace_limits(
         WAN_START_MBIT if cc_on else rate_mbit, cc=cc_on
+    )
+    fec_mode, fec_start = resolve_fec_cli(
+        initial_repair_pct,
+        env_mode=_env_str("TETRYS_FEC_MODE", "quantile"),
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1157,8 +1163,8 @@ def run_block_server(
         f"start={start_bps * 8 / 1e6:.0f}Mbit min={min_bps * 8 / 1e6:.0f}Mbit "
         f"cap={max_bps * 8 / 1e6:.0f}Mbit "
         f"cc={'blast' if cc_on else 'off'} "
-        f"fec={adaptive_start_pct(initial_repair_pct, _env_str('TETRYS_FEC_MODE', 'quantile'))}% "
-        f"mode={_env_str('TETRYS_FEC_MODE', 'quantile')} "
+        f"fec={fec_start}% "
+        f"mode={fec_mode} "
         f"enc_workers={workers} prefetch={prefetch_depth}",
         flush=True,
     )
@@ -1184,7 +1190,7 @@ def run_block_server(
                     f"!not found: {rel}",
                     symbol_size,
                     block_k,
-                    initial_repair_pct,
+                    fec_start,
                     geometry.active_bytes,
                     "",
                 ).pack()
@@ -1207,7 +1213,7 @@ def run_block_server(
                     MUX_META_NAME,
                     symbol_size,
                     block_k,
-                    initial_repair_pct,
+                    fec_start,
                     geometry.active_bytes,
                     f"n={obj_session.nobj}",
                 ).pack()
@@ -1218,7 +1224,7 @@ def run_block_server(
                     session_id,
                     obj_session,
                     geometry=geometry,
-                    initial_repair_pct=initial_repair_pct,
+                    initial_repair_pct=fec_start,
                     start_bps=start_bps,
                     close_sock=False,
                 )
@@ -1242,7 +1248,7 @@ def run_block_server(
                 rel.replace("\\", "/"),
                 symbol_size,
                 block_k,
-                initial_repair_pct,
+                fec_start,
                 geometry.active_bytes,
                 digest,
             ).pack()
@@ -1254,7 +1260,8 @@ def run_block_server(
                 session_id,
                 file_path,
                 geometry,
-                initial_repair_pct=initial_repair_pct,
+                initial_repair_pct=fec_start,
+                fec_mode=fec_mode,
                 min_bps=min_bps,
                 max_bps=max_bps,
                 start_bps=start_bps,

@@ -22,8 +22,8 @@ BLOB = ROOT / "testdata" / "blob_256m.bin"
 MODES = (
     ("fixed-24", "fixed", "24"),
     ("fixed-8", "fixed", "8"),
-    ("quantile", "quantile", "24"),
-    ("hmm", "hmm", "24"),
+    ("quantile", "quantile", None),
+    ("hmm", "hmm", None),
 )
 PROFILES = ("clean-rtt", "lossy", "spain")
 REPEATS = 2
@@ -33,7 +33,7 @@ TIMEOUT = 90
 BASE_PORT = 18200
 
 
-def _run(profile: str, mode: str, overhead: str, port: int, work: Path) -> dict:
+def _run(profile: str, mode: str, overhead: str | None, port: int, work: Path) -> dict:
     out = work / "recv.bin"
     srv_log = work / "srv.log"
     emu_log = work / "emu.log"
@@ -43,24 +43,24 @@ def _run(profile: str, mode: str, overhead: str, port: int, work: Path) -> dict:
     env.setdefault("TETRYS_CC", "0")
     env["TETRYS_FEC_MODE"] = mode
     py = [sys.executable, "-u", "-m", "tetrys_nc"]
+    srv_cmd = py + [
+        "server",
+        "--file",
+        str(BLOB),
+        "--port",
+        str(port),
+        "--skip-hash",
+        "--rate",
+        RATE,
+        "--ramp-s",
+        "0",
+        "--gen-k",
+        GEN_K,
+    ]
+    if overhead is not None:
+        srv_cmd.extend(["--gen-overhead", overhead])
     srv = subprocess.Popen(
-        py
-        + [
-            "server",
-            "--file",
-            str(BLOB),
-            "--port",
-            str(port),
-            "--skip-hash",
-            "--rate",
-            RATE,
-            "--ramp-s",
-            "0",
-            "--gen-k",
-            GEN_K,
-            "--gen-overhead",
-            overhead,
-        ],
+        srv_cmd,
         cwd=ROOT,
         env=env,
         stdout=srv_log.open("w"),

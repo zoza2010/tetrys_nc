@@ -196,7 +196,6 @@ def test_adaptive_fec_clean_and_burst_complete(tmp_path: Path, profile: str) -> 
         timeout=35,
         rate="200",
         extra_env={"TETRYS_FEC_MODE": "quantile"},
-        gen_overhead="24",
     )
     valid = "valid=True" in emu or (
         "queue_drop=0" in emu and "jumbo_drop=0" in emu

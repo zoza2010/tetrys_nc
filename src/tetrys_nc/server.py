@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .block_state import (
     WAN_BLOCK_K,
-    WAN_INITIAL_REPAIR_PCT,
     WAN_SYMBOL_SIZE,
 )
 from .block_xfer import run_block_server
@@ -77,10 +76,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--gen-overhead",
         type=int,
-        default=WAN_INITIAL_REPAIR_PCT,
+        default=None,
         help=(
-            f"cold-start RaptorQ repair percent (default {WAN_INITIAL_REPAIR_PCT}). "
-            "Adaptive floor is 4 percent unless TETRYS_FEC_MODE=fixed"
+            "lock RaptorQ repair percent (disables auto FEC). "
+            "Omit to run adaptive FEC from 12 percent, floor 4, cap 32"
         ),
     )
     args = p.parse_args(argv)

@@ -44,10 +44,9 @@ FLIGHT_AGE_BUCKETS = max(1, int(REPAIR_AGE_S / 0.020))
 # WAN loss bursts; never-heard waits longer for the first RTT.
 CLIENT_GONE_S = 2.0
 CLIENT_NEVER_S = 8.0
-# Discrete adaptive FEC. 4% stays listed for explicit TETRYS_FEC_FLOOR=4;
-# default floor is 8% (0–4% filled the window and collapsed pace).
+# Discrete adaptive FEC. Floor 4%; `--gen-overhead` locks a single level.
 FEC_LEVELS = (4, 8, 12, 18, 24, 28, 32)
-FEC_FLOOR_PCT = 8
+FEC_FLOOR_PCT = 4
 FEC_MAX_PCT = 32
 # Measurement cap above cover so a 50%+ blackout does not look "coverable".
 FEC_NEED_CAP = 48
@@ -63,8 +62,7 @@ FEC_MIN_TRAIN = 8
 FEC_CLEAN_DOWN = 24
 FEC_CLEAN_DOWN_LOW = 48
 FEC_SOFT_FLOOR = 18
-# Adaptive ignores --gen-overhead 24: 24% for the first ~200 blocks was
-# most of the 17% average overhead vs a file that cruises at 8%.
+# Omit `--gen-overhead` to search; cold start is 12%, not the old 24% lock.
 FEC_COLD_PCT = 12
 FEC_PROBE_PERIOD = 16
 FEC_RAPTORQ_MARGIN = 2
@@ -723,10 +721,24 @@ class QuantileFecController:
 
 
 def adaptive_start_pct(initial: int, mode: str, floor: int = FEC_FLOOR_PCT) -> int:
-    """CLI --gen-overhead 24 is the fixed-mode floor; adaptive starts at 12%."""
+    """Fixed mode keeps the lock; adaptive cold-start is min(initial, 12%)."""
     if (mode or "").strip().lower() == "fixed":
         return int(initial)
     return max(int(floor), min(int(initial), FEC_COLD_PCT))
+
+
+def resolve_fec_cli(
+    overhead: int | None,
+    *,
+    env_mode: str | None = None,
+) -> tuple[str, int]:
+    """`--gen-overhead N` locks FEC; omit it to run adaptive quantile/hmm."""
+    if overhead is not None:
+        return "fixed", int(overhead)
+    mode = (env_mode or "quantile").strip().lower()
+    if mode not in ("quantile", "hmm"):
+        mode = "quantile"
+    return mode, FEC_COLD_PCT
 
 
 def make_fec_controller(

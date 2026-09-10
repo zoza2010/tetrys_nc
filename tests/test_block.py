@@ -56,6 +56,7 @@ from tetrys_nc.block_state import (
     FecRunMetrics,
     adaptive_gate_failures,
     adaptive_start_pct,
+    resolve_fec_cli,
     block_loss_frac,
     dir_lightweight,
     fec_level_ceil_index,
@@ -863,10 +864,10 @@ def test_quantile_fec_uses_discrete_levels_and_floor():
     ctl = make_fec_controller(24, mode="quantile")
     assert ctl.current == 24
     assert ctl.current in FEC_LEVELS
-    assert FEC_FLOOR_PCT == 8
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 2 + FEC_CLEAN_DOWN_LOW * 3):
+    assert FEC_FLOOR_PCT == 4
+    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 2 + FEC_CLEAN_DOWN_LOW * 4):
         ctl.observe_block(make_block_sample(_fec_state(940), 768, tail=False))
-    assert ctl.current == 8
+    assert ctl.current == 4
     assert ctl.current in FEC_LEVELS
 
 
@@ -1005,10 +1006,24 @@ def test_adaptive_cold_start_clamps_cli_24_to_12():
     assert adaptive_start_pct(24, "quantile") == 12
     assert adaptive_start_pct(24, "fixed") == 24
     assert adaptive_start_pct(8, "quantile") == 8
+    assert adaptive_start_pct(4, "quantile") == 4
     ctl = make_fec_controller(24, mode="quantile", clamp_cold=True)
     assert ctl.current == 12
     live = make_fec_controller(24, mode="quantile")
     assert live.current == 24
+
+
+def test_gen_overhead_locks_fec_omit_runs_autofec():
+    assert resolve_fec_cli(24) == ("fixed", 24)
+    assert resolve_fec_cli(8) == ("fixed", 8)
+    assert resolve_fec_cli(None) == ("quantile", 12)
+    assert resolve_fec_cli(None, env_mode="hmm") == ("hmm", 12)
+    assert resolve_fec_cli(None, env_mode="fixed") == ("quantile", 12)
+    locked = make_fec_controller(24, mode="fixed")
+    assert locked.current == 24
+    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
+        locked.observe_block(make_block_sample(_fec_state(940), 768, tail=False))
+    assert locked.current == 24
 
 
 def test_quantile_fec_isolated_dir_does_not_up():
