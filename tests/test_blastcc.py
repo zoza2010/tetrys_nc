@@ -181,6 +181,32 @@ def test_probe_then_revert_if_filtered_delay_rises():
     assert cc.rate == base
 
 
+def test_busy_extra_repair_cuts_startup_without_delay():
+    cc = _cc()
+    now = 10.0
+    unique = 0
+    for i in range(1, 6):
+        now += 0.20
+        unique += int(_CAP * 0.20)
+        _feed(cc, now, i, unique, 0.080, extra=0.20)
+    assert cc.phase == DRAIN
+    assert cc.rate < _START * 0.90
+
+
+def test_cruise_ceiling_does_not_repin_to_start_after_cut():
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.rate = 400_000_000 / 8
+    cc.last_good = cc.rate
+    cc.min_bps = 250_000_000 / 8
+    cc.bw.observe(10 * 1048576)
+    cc.bw.observe(11 * 1048576)
+    cc.bw.observe(12 * 1048576)
+    ceiling = cc._rate_ceiling()
+    assert ceiling < _START
+    assert ceiling >= cc.rate
+
+
 def test_probe_can_raise_above_start_without_channel_cap():
     start = 850_000_000 / 8
     cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start)

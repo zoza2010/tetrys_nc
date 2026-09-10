@@ -29,7 +29,9 @@ _DRAIN_MAX_S = 1.5
 _CRUISE_CUT = 0.93
 _GOOD_FLOOR = 0.90
 _SEED_FRAC = 0.90
-_ABS_MIN_MBIT = 80.0
+# Dirty-hour bulk TCP on this WAN was ~23 MiB/s. Cruising at 80 Mbit
+# (13 MiB/s) lost to TCP; keep a send floor above that goodput.
+_ABS_MIN_MBIT = 250.0
 # Unique-byte rate is goodput, not wire; 1.25 sat below the 850 start and blocked probe.
 _DELIVERY_HEADROOM = 1.42
 _STEP_MAX = 1.25
@@ -148,7 +150,17 @@ class BlastCc:
         bw = self.bw.max_bw
         if bw is None:
             return hard
-        return min(hard, max(self.start_bps, bw * _DELIVERY_HEADROOM))
+        # Raise ceiling with delivery; never use a low unique-bw sample to
+        # yank the rate down (that re-locks a dirty path to 850 via start,
+        # or collapses a clean probe on one thin ACK). Cuts are extra/delay.
+        return min(
+            hard,
+            max(
+                self.min_bps,
+                self.rate,
+                bw * _DELIVERY_HEADROOM,
+            ),
+        )
 
     def _clip(self, rate: float) -> float:
         floor = max(self.min_bps, self.last_good * _GOOD_FLOOR)
@@ -250,13 +262,15 @@ class BlastCc:
         if self.phase == STARTUP:
             ceiling = self._rate_ceiling()
             at_cap = self.rate >= ceiling * 0.98
-            if qdelay >= _QDELAY_STOP_S:
-                if self.high_delay_n >= _QDELAY_HOLD:
-                    self.phase = DRAIN
-                    self.drain_ts = now
-                    self.drain_cuts = 1
-                    self.rate = self._clip(self.rate * _DRAIN_GAIN)
-                    self.last_step_ts = now
+            congested = extra_frac >= _EXTRA_CUT or (
+                qdelay >= _QDELAY_STOP_S and self.high_delay_n >= _QDELAY_HOLD
+            )
+            if congested:
+                self.phase = DRAIN
+                self.drain_ts = now
+                self.drain_cuts = 1
+                self.rate = self._clip(self.rate * _DRAIN_GAIN)
+                self.last_step_ts = now
             elif at_cap:
                 self._enter_cruise(now)
             elif now - self.last_step_ts >= step_s:
@@ -264,7 +278,13 @@ class BlastCc:
                 self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
         elif self.phase == DRAIN:
             drained_long = now - self.drain_ts >= _DRAIN_MAX_S
-            if self.low_delay_n >= 2 or drained_long:
+            storm = extra_frac >= _EXTRA_CUT
+            if storm and not drained_long:
+                if now - self.last_step_ts >= step_s and self.drain_cuts < _DRAIN_MAX_CUTS:
+                    self.last_step_ts = now
+                    self.drain_cuts += 1
+                    self.rate = self._clip(self.rate * _DRAIN_GAIN)
+            elif self.low_delay_n >= 2 or drained_long:
                 self._enter_cruise(now)
             elif now - self.last_step_ts >= step_s and self.drain_cuts < _DRAIN_MAX_CUTS:
                 self.last_step_ts = now

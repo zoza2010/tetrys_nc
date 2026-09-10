@@ -65,6 +65,15 @@ PROFILES: dict[str, PathSpec] = {
     "none": PathSpec(),
     "clean-rtt": PathSpec(delay_s=0.050, seed=1),
     "lossy": PathSpec(delay_s=0.050, loss=0.08, seed=1),
+    # Today's dirty WAN hour: ~23% UDP loss at 850 Mbit + heavy reorder.
+    "dirty-wan": PathSpec(
+        delay_s=0.080,
+        jitter_s=0.012,
+        loss=0.23,
+        reorder_p=0.20,
+        reorder_extra_s=0.025,
+        seed=7,
+    ),
     "spain": PathSpec(
         delay_s=0.050,
         jitter_s=0.008,

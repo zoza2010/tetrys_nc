@@ -22,6 +22,7 @@ from .block_packets import (
     OpenBlock,
     ObjectFin,
     ObjectOpen,
+    merge_open_feedback,
     pack_data_packets,
     parse_packet,
 )
@@ -655,6 +656,7 @@ def consume_object_stream(
         except ValueError:
             expected_files = 0
     slots: dict[int, GenReceiveSlot] = {}
+    slot_seen: dict[int, float] = {}
     done: set[int] = set()
     unique = feedback_id = last_echo = 0
     last_fb = 0.0
@@ -684,10 +686,22 @@ def consume_object_stream(
         if not force and now - last_fb < _FEEDBACK_S:
             return
         feedback_id += 1
-        opened = [
-            OpenBlock(bid, slot.symbols_rx, slot.decode_failed, 0)
-            for bid, slot in sorted(slots.items())
-        ][:64]
+
+        def _open(bid: int, slot) -> OpenBlock:
+            return OpenBlock(
+                bid,
+                slot.symbols_rx,
+                slot.decode_failed,
+                min(255, int((now - slot_seen.get(bid, now)) / 0.020)),
+            )
+
+        incomplete = [
+            _open(bid, slot) for bid, slot in sorted(slots.items()) if bid not in done
+        ]
+        ghosts = [
+            _open(bid, slot) for bid, slot in sorted(slots.items()) if bid in done
+        ]
+        opened = merge_open_feedback(incomplete, ghosts)
         sock.sendto(
             BlockFeedback(
                 session_id, feedback_id, unique, sink.decoded, last_echo, sorted(done), opened
@@ -695,6 +709,15 @@ def consume_object_stream(
             server,
         )
         last_fb = now
+        for bid in list(slots):
+            if bid not in done:
+                continue
+            if now - slot_seen.get(bid, now) < REPAIR_AGE_S:
+                continue
+            slot = slots.pop(bid, None)
+            if slot is not None:
+                slot.close()
+            slot_seen.pop(bid, None)
 
     try:
         while True:
@@ -715,9 +738,15 @@ def consume_object_stream(
                     elif isinstance(packet, ObjectFin):
                         sink.fin(packet.obj_id, packet.name, packet.size)
                     elif isinstance(packet, BlockData):
-                        if packet.block_id in done:
-                            continue
                         slot = slots.get(packet.block_id)
+                        if packet.block_id in done:
+                            if slot is None:
+                                continue
+                            before = slot.symbols_rx
+                            slot.add_packet(packet.payload, packet.esi)
+                            if slot.symbols_rx > before:
+                                unique += len(raw)
+                            continue
                         if slot is None:
                             slot = GenReceiveSlot(
                                 packet.block_id,
@@ -727,6 +756,7 @@ def consume_object_stream(
                                 tlen=geometry.block_bytes,
                             )
                             slots[packet.block_id] = slot
+                            slot_seen[packet.block_id] = time.monotonic()
                         before = slot.symbols_rx
                         decoded = slot.add_packet(packet.payload, packet.esi)
                         if slot.symbols_rx == before:
@@ -736,8 +766,6 @@ def consume_object_stream(
                         if decoded is not None:
                             sink.ingest(decoded[: geometry.block_bytes])
                             done.add(packet.block_id)
-                            slot.close()
-                            slots.pop(packet.block_id, None)
                     elif isinstance(packet, BlockFin):
                         total_blocks = packet.total_blocks
             send_feedback()

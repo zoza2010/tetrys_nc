@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="rate_mbit",
         help="lock UDP send rate in Mbit/s (disables rate search). "
-        "Omit to search from 850 Mbit (CC; no channel cap)",
+        "Omit to search from 850 Mbit, cap 10000 Mbit",
     )
     p.add_argument(
         "--ramp-s",
@@ -78,7 +78,10 @@ def main(argv: list[str] | None = None) -> int:
         "--gen-overhead",
         type=int,
         default=WAN_INITIAL_REPAIR_PCT,
-        help=f"initial RaptorQ repair percent (default {WAN_INITIAL_REPAIR_PCT})",
+        help=(
+            f"cold-start RaptorQ repair percent (default {WAN_INITIAL_REPAIR_PCT}). "
+            "Adaptive floor is 4 percent unless TETRYS_FEC_MODE=fixed"
+        ),
     )
     args = p.parse_args(argv)
     root, default_file = _root_and_default(args.dir, args.file)

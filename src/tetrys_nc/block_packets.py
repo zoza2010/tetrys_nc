@@ -10,7 +10,9 @@ MAGIC = 0x54
 VERSION = 2
 MAX_DATAGRAM = 1400
 MAX_DONE_RANGES = 48
-MAX_OPEN_BLOCKS = 64
+# 64 incomplete (DIR) + 16 first-flight ghosts. 80×8 + 48 ranges still < 1400.
+MAX_OPEN_BLOCKS = 80
+MAX_GHOST_OPEN = 16
 MAX_RANGE_SPAN = 1_000_000
 
 _HDR = struct.Struct("!BBBBI")
@@ -36,6 +38,19 @@ class OpenBlock:
     unique_esi: int
     decode_failed: bool = False
     age_bucket: int = 0
+
+
+def merge_open_feedback(
+    incomplete: list[OpenBlock],
+    ghosts: list[OpenBlock],
+    *,
+    limit: int = MAX_OPEN_BLOCKS,
+    ghost_limit: int = MAX_GHOST_OPEN,
+) -> list[OpenBlock]:
+    """Keep first-flight ghosts in ACK even when the active window is full."""
+    kept_ghosts = list(ghosts[: max(0, min(ghost_limit, limit))])
+    room = max(0, limit - len(kept_ghosts))
+    return kept_ghosts + list(incomplete[:room])
 
 
 @dataclass(slots=True)

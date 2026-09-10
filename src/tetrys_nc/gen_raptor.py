@@ -156,6 +156,7 @@ class GenReceiveSlot:
         "_decoder",
         "_decoder_ready",
         "_pkts",
+        "_decoded",
     )
 
     def __init__(
@@ -182,6 +183,7 @@ class GenReceiveSlot:
         self._decoder: GenDecoder | None = None
         self._decoder_ready = False
         self._pkts: list[tuple[int, bytes]] = []
+        self._decoded: bytes | None = None
 
     def close(self) -> None:
         self._pkts.clear()
@@ -191,6 +193,8 @@ class GenReceiveSlot:
     @property
     def decode_failed(self) -> bool:
         """Enough unique ESI to decode, but the slot is still open."""
+        if self._decoded is not None:
+            return False
         if self.symbols_rx < self.gen_k + 2:
             return False
         full = _source_full_mask(self.gen_k)
@@ -211,12 +215,22 @@ class GenReceiveSlot:
                     break
         return out
 
+    def _finish(self, data: bytes) -> bytes:
+        out = data[: self.tlen] if len(data) >= self.tlen else data
+        self._decoded = out
+        self._pkts.clear()
+        self._decoder = None
+        self._decoder_ready = False
+        return out
+
     def add_packet(self, rq_blob: bytes, esi: int) -> bytes | None:
         if esi in self._seen:
             self.dup_esi += 1
             return None
         self._seen.add(esi)
         self.symbols_rx += 1
+        if self._decoded is not None:
+            return self._decoded
         self._pkts.append((esi, rq_blob))
         if esi < self.gen_k:
             self._source_mask |= 1 << esi
@@ -225,7 +239,8 @@ class GenReceiveSlot:
 
         full = _source_full_mask(self.gen_k)
         if self._source_mask == full and not self._has_repair:
-            return self._finalize_all_systematic()
+            got = self._finalize_all_systematic()
+            return self._finish(got) if got is not None else None
 
         if self._has_repair:
             if not self._decoder_ready:
@@ -235,9 +250,9 @@ class GenReceiveSlot:
                 assert self._decoder is not None
                 out = self._decoder.add_packet(rq_blob, esi)
                 if out is not None:
-                    return out[: self.tlen]
+                    return self._finish(out)
             if self._decoder is not None and self._decoder.done is not None:
-                return self._decoder.done[: self.tlen]
+                return self._finish(self._decoder.done)
         return None
 
     def _finalize_all_systematic(self) -> bytes | None:
