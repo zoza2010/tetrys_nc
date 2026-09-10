@@ -1,4 +1,4 @@
-"""Local netem A/B: fixed-24 / fixed-8 / quantile / hmm on clean, iid, burst."""
+"""Local netem A/B: fixed-24 / fixed-8 / quantile on clean, iid, burst."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ MODES = (
     ("fixed-24", "fixed", "24"),
     ("fixed-8", "fixed", "8"),
     ("quantile", "quantile", None),
-    ("hmm", "hmm", None),
 )
 PROFILES = ("clean-rtt", "lossy", "spain")
 REPEATS = 2
@@ -235,7 +234,7 @@ def main() -> int:
                 tail_s=f24["tail_med"] or 0.0,
                 pace_p10=200.0,
             )
-            for name in ("fixed-8", "quantile", "hmm"):
+            for name in ("fixed-8", "quantile"):
                 m = by_mode[name]
                 if m["goodput_med"] is None:
                     gates[name] = ["no metrics"]

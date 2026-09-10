@@ -51,7 +51,6 @@ from tetrys_nc.block_state import (
     WAN_BLOCK_K,
     WAN_INITIAL_REPAIR_PCT,
     WAN_SYMBOL_SIZE,
-    ChannelHmm,
     ExtraRepairWindow,
     FecRunMetrics,
     adaptive_gate_failures,
@@ -1017,7 +1016,7 @@ def test_gen_overhead_locks_fec_omit_runs_autofec():
     assert resolve_fec_cli(24) == ("fixed", 24)
     assert resolve_fec_cli(8) == ("fixed", 8)
     assert resolve_fec_cli(None) == ("quantile", 12)
-    assert resolve_fec_cli(None, env_mode="hmm") == ("hmm", 12)
+    assert resolve_fec_cli(None, env_mode="hmm") == ("quantile", 12)
     assert resolve_fec_cli(None, env_mode="fixed") == ("quantile", 12)
     locked = make_fec_controller(24, mode="fixed")
     assert locked.current == 24
@@ -1215,34 +1214,6 @@ def test_quantile_fec_does_not_down_below_p95_need():
     assert ctl.current <= 18
 
 
-def test_hmm_falls_back_until_confident():
-    hmm = ChannelHmm()
-    hmm.observe(True)
-    hmm.observe(True)
-    hmm.observe(True)
-    assert hmm.confident is False
-    assert hmm.shift_levels() == 0
-    for _ in range(12):
-        hmm.observe(True)
-    assert hmm.confident is True
-    assert hmm.shift_levels() >= 1
-
-
-def test_hmm_shifts_quantile_level_not_free_percent():
-    ctl = make_fec_controller(8, mode="hmm")
-    mild = _fec_state(770, initial_repair=62, extra=30, rounds=2)
-    need = needed_repair_pct(mild, 768)
-    assert 4 < need < 14
-    for _ in range(FEC_MIN_TRAIN + 4):
-        ctl.observe_block(make_block_sample(mild, 768, tail=False))
-    assert ctl.current in FEC_LEVELS
-    assert ctl.current >= 12
-    quant = make_fec_controller(8, mode="quantile")
-    for _ in range(FEC_MIN_TRAIN + 4):
-        quant.observe_block(make_block_sample(mild, 768, tail=False))
-    assert ctl.current >= quant.current
-
-
 def test_adaptive_gate_accepts_clean_wire_cut_and_rejects_wan_drop():
     fixed = FecRunMetrics(
         goodput_mib=79.0,
@@ -1278,7 +1249,7 @@ def test_parse_done_metrics_from_sender_log():
         "done in 26.10s — goodput 78.90 MiB/s — source_wire=2587.1MiB "
         "repair_wire=12.4MiB first_close=98% extra_blocks=4 dir_rounds=7 "
         "xfrac=3% loss_p50=1.0% p90=2.0% p99=4.0% flight_p95=2.5% "
-        "extra_p50=0.5% p90=1.0% fec=12% why=hold_p95=6.1_12%_clean=4_hmm=0.12 "
+        "extra_p50=0.5% p90=1.0% fec=12% why=hold_p95=6.1_12%_clean=4 "
         "tail=0.80s pace_p10=850 med=850 max=850Mbit"
     )
     got = parse_done_metrics(log)

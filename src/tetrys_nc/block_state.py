@@ -66,9 +66,6 @@ FEC_SOFT_FLOOR = 18
 FEC_COLD_PCT = 12
 FEC_PROBE_PERIOD = 16
 FEC_RAPTORQ_MARGIN = 2
-HMM_MIN_OBS = 8
-HMM_SHIFT1 = 0.55
-HMM_SHIFT2 = 0.85
 DIR_LIGHT_SLACK = 8
 # WAN A/B gates for quantile-only vs locked 24%.
 ADAPTIVE_CLEAN_WIRE_MAX = 0.90
@@ -461,45 +458,6 @@ class RepairDebtController:
 
 
 @dataclass
-class ChannelHmm:
-    """Two-state GOOD/BAD predictor. Shifts FEC; does not pick a free percent."""
-
-    p_bad: float = 0.25
-    n: int = 0
-    a_gb: float = 0.35
-    a_bg: float = 0.04
-    p_dirty_good: float = 0.08
-    p_dirty_bad: float = 0.70
-
-    def observe(self, dirty: bool) -> float:
-        self.n += 1
-        p_bad = min(1.0, max(0.0, self.p_bad))
-        p_good = 1.0 - p_bad
-        p_bad_pred = p_good * self.a_gb + p_bad * (1.0 - self.a_bg)
-        p_good_pred = max(0.0, 1.0 - p_bad_pred)
-        like_bad = self.p_dirty_bad if dirty else (1.0 - self.p_dirty_bad)
-        like_good = self.p_dirty_good if dirty else (1.0 - self.p_dirty_good)
-        post_bad = p_bad_pred * like_bad
-        post_good = p_good_pred * like_good
-        total = post_bad + post_good
-        self.p_bad = post_bad / total if total > 0 else p_bad_pred
-        return self.p_bad
-
-    @property
-    def confident(self) -> bool:
-        return self.n >= HMM_MIN_OBS
-
-    def shift_levels(self) -> int:
-        if not self.confident:
-            return 0
-        if self.p_bad >= HMM_SHIFT2:
-            return 2
-        if self.p_bad >= HMM_SHIFT1:
-            return 1
-        return 0
-
-
-@dataclass
 class QuantileFecController:
     """Discrete FEC from first-flight need. Slow down, bulk-undercover up.
 
@@ -513,7 +471,6 @@ class QuantileFecController:
     start_pct: int = WAN_INITIAL_REPAIR_PCT
     min_pct: int = FEC_FLOOR_PCT
     max_pct: int = FEC_MAX_PCT
-    hmm_on: bool = False
     level_idx: int = 0
     clean_n: int = 0
     probe_fail_at: int = -1
@@ -521,13 +478,11 @@ class QuantileFecController:
     dir_rounds: int = 0
     needed: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
     repair_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
-    hmm: ChannelHmm = field(default_factory=ChannelHmm)
 
     def __post_init__(self) -> None:
         self.mode = (self.mode or "quantile").strip().lower()
-        if self.mode not in ("fixed", "quantile", "hmm"):
+        if self.mode not in ("fixed", "quantile"):
             self.mode = "quantile"
-        self.hmm_on = self.hmm_on or self.mode == "hmm"
         if self.mode == "fixed":
             locked = int(self.start_pct)
             self.min_pct = self.max_pct = locked
@@ -642,11 +597,6 @@ class QuantileFecController:
         )
         self.needed.append(needed_pct)
         self.repair_loss.append(loss)
-        dirty = sample.rank_known and (
-            sample.dir_pressure() or sample.repair_rounds >= 2 or sample.qdelay_high
-        )
-        if self.hmm_on:
-            self.hmm.observe(dirty)
         if len(self.needed) < FEC_MIN_TRAIN:
             self.reason = f"warm n={len(self.needed)} hold={self.current}"
             return self.current
@@ -666,14 +616,6 @@ class QuantileFecController:
             q_up = max(q_up, needed_pct)
         target_idx = fec_level_index(q, min_pct=self.min_pct, max_pct=cover)
         up_idx = fec_level_ceil_index(q_up, min_pct=self.min_pct, max_pct=cover)
-        shift = self.hmm.shift_levels() if self.hmm_on else 0
-        if shift:
-            target_idx = min(len(FEC_LEVELS) - 1, target_idx + shift)
-            up_idx = min(len(FEC_LEVELS) - 1, up_idx + shift)
-            while FEC_LEVELS[target_idx] > cover and target_idx > 0:
-                target_idx -= 1
-            while FEC_LEVELS[up_idx] > cover and up_idx > 0:
-                up_idx -= 1
         saw_repair = (
             sample.extra_symbols > 0
             or sample.repair_rounds >= 1
@@ -687,17 +629,13 @@ class QuantileFecController:
         if up_idx > self.level_idx:
             # Isolated DIR is delay/reorder (p75 stays ~0). Jump on a storm
             # or when most first-flights in the window needed more FEC.
-            if (
-                ((storm or (self.hmm_on and shift)) and sample.dir_pressure())
-                or undercover
-            ):
+            if (storm and sample.dir_pressure()) or undercover:
                 self.level_idx = up_idx
                 self.clean_n = 0
                 self.probe_fail_at = -1
                 why = "up-storm" if storm else "up-undercover"
                 self.reason = (
-                    f"{why} p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current} "
-                    f"hmm_shift={shift}"
+                    f"{why} p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current}"
                 )
                 return self.current
         # Storm already zeroed clean_n on the way up. One-round DIR (pad,
@@ -715,7 +653,7 @@ class QuantileFecController:
             return self.current
         self.reason = (
             f"hold p{FEC_QUANTILE:.0f}={q:.1f} {self.current}% "
-            f"clean={self.clean_n} hmm={self.hmm.p_bad:.2f}"
+            f"clean={self.clean_n}"
         )
         return self.current
 
@@ -732,13 +670,11 @@ def resolve_fec_cli(
     *,
     env_mode: str | None = None,
 ) -> tuple[str, int]:
-    """`--gen-overhead N` locks FEC; omit it to run adaptive quantile/hmm."""
+    """`--gen-overhead N` locks FEC; omit it to run adaptive quantile."""
     if overhead is not None:
         return "fixed", int(overhead)
-    mode = (env_mode or "quantile").strip().lower()
-    if mode not in ("quantile", "hmm"):
-        mode = "quantile"
-    return mode, FEC_COLD_PCT
+    _ = env_mode
+    return "quantile", FEC_COLD_PCT
 
 
 def make_fec_controller(
@@ -750,6 +686,8 @@ def make_fec_controller(
     clamp_cold: bool = False,
 ) -> QuantileFecController:
     chosen = (mode or "quantile").strip().lower()
+    if chosen not in ("fixed", "quantile"):
+        chosen = "quantile"
     if chosen == "fixed":
         return QuantileFecController(
             mode="fixed",
@@ -767,7 +705,6 @@ def make_fec_controller(
         start_pct=start,
         min_pct=floor,
         max_pct=top,
-        hmm_on=chosen == "hmm",
     )
 
 

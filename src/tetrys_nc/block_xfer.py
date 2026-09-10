@@ -387,7 +387,7 @@ class BlockSender:
             else None
         )
         fec_mode = (fec_mode or _env_str("TETRYS_FEC_MODE", "quantile")).lower()
-        if fec_mode not in ("fixed", "quantile", "hmm"):
+        if fec_mode not in ("fixed", "quantile"):
             fec_mode = "quantile"
         fec_floor = int(_env_float("TETRYS_FEC_FLOOR", FEC_FLOOR_PCT))
         fec_max = int(_env_float("TETRYS_FEC_MAX", FEC_MAX_PCT))
