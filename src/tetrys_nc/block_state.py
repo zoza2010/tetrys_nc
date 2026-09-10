@@ -665,15 +665,10 @@ def adaptive_start_pct(initial: int, mode: str, floor: int = FEC_FLOOR_PCT) -> i
     return max(int(floor), min(int(initial), FEC_COLD_PCT))
 
 
-def resolve_fec_cli(
-    overhead: int | None,
-    *,
-    env_mode: str | None = None,
-) -> tuple[str, int]:
+def resolve_fec_cli(overhead: int | None) -> tuple[str, int]:
     """`--gen-overhead N` locks FEC; omit it to run adaptive quantile."""
     if overhead is not None:
         return "fixed", int(overhead)
-    _ = env_mode
     return "quantile", FEC_COLD_PCT
 
 

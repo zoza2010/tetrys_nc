@@ -1145,10 +1145,7 @@ def run_block_server(
     min_bps, max_bps, start_bps = _pace_limits(
         WAN_START_MBIT if cc_on else rate_mbit, cc=cc_on
     )
-    fec_mode, fec_start = resolve_fec_cli(
-        initial_repair_pct,
-        env_mode=_env_str("TETRYS_FEC_MODE", "quantile"),
-    )
+    fec_mode, fec_start = resolve_fec_cli(initial_repair_pct)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)

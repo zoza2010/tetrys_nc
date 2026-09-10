@@ -1016,8 +1016,6 @@ def test_gen_overhead_locks_fec_omit_runs_autofec():
     assert resolve_fec_cli(24) == ("fixed", 24)
     assert resolve_fec_cli(8) == ("fixed", 8)
     assert resolve_fec_cli(None) == ("quantile", 12)
-    assert resolve_fec_cli(None, env_mode="hmm") == ("quantile", 12)
-    assert resolve_fec_cli(None, env_mode="fixed") == ("quantile", 12)
     locked = make_fec_controller(24, mode="fixed")
     assert locked.current == 24
     for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
