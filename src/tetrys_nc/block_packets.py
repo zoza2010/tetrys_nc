@@ -141,10 +141,12 @@ class BlockData:
     esi: int
     payload: bytes
     send_ts_us: int = 0
+    fec_pct: int = 0
 
     def pack(self) -> bytes:
+        flags = max(0, min(255, int(self.fec_pct)))
         return (
-            _HDR.pack(MAGIC, VERSION, BlockPacketType.DATA, 0, self.session_id)
+            _HDR.pack(MAGIC, VERSION, BlockPacketType.DATA, flags, self.session_id)
             + _DATA.pack(self.block_id, self.esi, self.send_ts_us & 0xFFFFFFFF)
             + self.payload
         )
@@ -154,7 +156,7 @@ class BlockData:
         _require(data, 20, BlockPacketType.DATA)
         session = struct.unpack_from("!I", data, 4)[0]
         block_id, esi, stamp = _DATA.unpack_from(data, 8)
-        return cls(session, block_id, esi, data[20:], stamp)
+        return cls(session, block_id, esi, data[20:], stamp, data[3])
 
 
 def pack_data_packets(
@@ -178,17 +180,26 @@ def pack_data_packets(
     return out
 
 
-def stamp_data_wires(wires: list[bytes], send_ts_us: int) -> None:
-    """Overwrite DATA send_ts in place so echo RTT is not encode/prefetch age."""
+def stamp_data_wires(
+    wires: list[bytes],
+    send_ts_us: int,
+    fec_pct: int | None = None,
+) -> None:
+    """Overwrite DATA send_ts (and optional live FEC) so the client sees now."""
     packed = struct.pack("!I", send_ts_us & 0xFFFFFFFF)
+    fec = None if fec_pct is None else max(0, min(255, int(fec_pct)))
     for i, wire in enumerate(wires):
         if len(wire) < 20:
             continue
         if isinstance(wire, bytearray):
             wire[16:20] = packed
+            if fec is not None:
+                wire[3] = fec
             continue
         buf = bytearray(wire)
         buf[16:20] = packed
+        if fec is not None:
+            buf[3] = fec
         wires[i] = buf
 
 

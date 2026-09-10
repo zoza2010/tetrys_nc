@@ -468,7 +468,11 @@ class BlockSender:
             t_pace = time.perf_counter()
             limiter.consume(sum(map(len, batch)))
             timers.pace_s += time.perf_counter() - t_pace
-            stamp_data_wires(batch, int(time.monotonic() * 1_000_000) & 0xFFFFFFFF)
+            stamp_data_wires(
+                batch,
+                int(time.monotonic() * 1_000_000) & 0xFFFFFFFF,
+                self.repair_ctl.current,
+            )
             t_send = time.perf_counter()
             send_datagrams(self.sock, self.client, batch, chunk=_SEND_CHUNK)
             timers.send_s += time.perf_counter() - t_send
@@ -927,6 +931,7 @@ class BlockReceiver:
         self.dup_esi = 0
         self.slot_seen: dict[int, float] = {}
         self.fd = -1
+        self.fec_pct = int(meta.initial_repair_pct)
 
     def _send_feedback(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -975,6 +980,8 @@ class BlockReceiver:
             self.slot_seen.pop(block_id, None)
 
     def _on_data(self, packet: BlockData, raw: bytes) -> None:
+        if packet.fec_pct > 0:
+            self.fec_pct = int(packet.fec_pct)
         block_id = packet.block_id
         if block_id >= self.total_blocks:
             return
@@ -1025,7 +1032,8 @@ class BlockReceiver:
                 f"{name[:36]:<36} [{_client_bar(self.decoded_bytes / max(1, meta.file_size))}] "
                 f"{100.0 * self.decoded_bytes / max(1, meta.file_size):5.1f}% "
                 f"{_client_size(self.decoded_bytes)}/{_client_size(meta.file_size)}  "
-                f"{len(self.done)}/{self.total_blocks}  {_client_rate(self.inst_bps)}"
+                f"{len(self.done)}/{self.total_blocks}  {_client_rate(self.inst_bps)} "
+                f"fec={self.fec_pct}%"
             )
             if sys.stdout.isatty() and now - self.last_log >= 0.05:
                 if self.bar_shown:
@@ -1044,6 +1052,7 @@ class BlockReceiver:
                 f"open={len(self.slots)} unique={self.unique_payload_bytes / elapsed / 1048576:.1f} "
                 f"app={self.decoded_bytes / elapsed / 1048576:.1f}MiB/s "
                 f"inst={_client_rate(self.inst_bps)} "
+                f"fec={self.fec_pct}% "
                 f"dup_esi={self.dup_esi}",
                 flush=True,
             )
@@ -1068,7 +1077,7 @@ class BlockReceiver:
         print(
             f"META name={meta.file_name} size={meta.file_size} "
             f"blocks={self.total_blocks} K={meta.block_k} T={meta.symbol_size} "
-            f"fec={meta.initial_repair_pct}%",
+            f"fec={meta.initial_repair_pct}% (start)",
             flush=True,
         )
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1116,7 +1125,8 @@ class BlockReceiver:
                 raise ValueError("output hash mismatch")
         print(
             f"OK: wrote {output} ({meta.file_size} bytes) in {elapsed:.2f}s "
-            f"({meta.file_size / elapsed / 1048576:.2f} MiB/s) fin={self.fin_seen}",
+            f"({meta.file_size / elapsed / 1048576:.2f} MiB/s) "
+            f"fec={self.fec_pct}% fin={self.fin_seen}",
             flush=True,
         )
         return 0
