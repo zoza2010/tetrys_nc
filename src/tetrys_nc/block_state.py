@@ -602,11 +602,30 @@ class QuantileFecController:
             return self.current
         cover = self._cover_cap()
         coverable = [n for n in self.needed if n <= cover]
-        src = coverable if len(coverable) >= FEC_MIN_TRAIN else list(self.needed)
-        q = percentile(src, FEC_QUANTILE) or 0.0
-        q_up = percentile(src, FEC_UP_QUANTILE) or 0.0
+        uncov_n = len(self.needed) - len(coverable)
         # Two repair ticks on a delayed RTT look like a storm on small K.
         storm = sample.decode_failed or sample.repair_rounds >= 3
+        # Need at the 48% cap is a policer/blackout, not a 32% target.
+        # Chasing it burns repair and first-close stays 0.
+        if uncov_n * 2 >= len(self.needed):
+            # Extra FEC cannot first-close. Leave a false 32% climb; stay ≥ cold.
+            self.clean_n += 1
+            nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
+            if self.current > FEC_COLD_PCT and nxt >= FEC_COLD_PCT and self.clean_n >= 8:
+                self.level_idx -= 1
+                self.clean_n = 0
+                self.probe_fail_at = -1
+                self.reason = (
+                    f"down uncoverable {uncov_n}/{len(self.needed)} -> {self.current}"
+                )
+                return self.current
+            self.reason = (
+                f"hold uncoverable {uncov_n}/{len(self.needed)} {self.current}%"
+            )
+            return self.current
+        src = coverable if coverable else list(self.needed)
+        q = percentile(src, FEC_QUANTILE) or 0.0
+        q_up = percentile(src, FEC_UP_QUANTILE) or 0.0
         if (
             sample.rank_known
             and storm

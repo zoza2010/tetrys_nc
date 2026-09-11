@@ -36,6 +36,11 @@ class PathSpec:
     reorder_p: float = 0.0
     reorder_extra_s: float = 0.020
     rate_mbit: float = 0.0
+    # If True, over-rate is a model drop (policer). Default rate_mbit instead
+    # adds delay, which grows the proxy queue and can queue_drop.
+    rate_drop: bool = False
+    rate_down: bool = True
+    rate_up: bool = True
     seed: int = 1
     # WAN HOL recipe: after a healthy start, blackhole *data* (server→client)
     # while ACKs still flow, then leave residual data loss. Server keeps blasting
@@ -59,6 +64,8 @@ class PathSpec:
     duty_on_s: float = 0.0
     duty_off_s: float = 0.0
     duty_down: bool = True
+    # Off-window is a hard drop (airtime flap), not extra delay.
+    duty_drop: bool = False
 
 
 PROFILES: dict[str, PathSpec] = {
@@ -324,6 +331,83 @@ PROFILES: dict[str, PathSpec] = {
         reorder_extra_s=0.040,
         seed=24,
     ),
+    # Policer: tokens run out → drop. RTT of survivors stays delay_s.
+    # Opposite of rate_mbit (queue) and of bloat. Bites --rate 200.
+    "shaper": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.001,
+        rate_mbit=90.0,
+        rate_drop=True,
+        rate_down=True,
+        rate_up=False,
+        seed=31,
+    ),
+    # Same at WAN lock-850: ~500 Mbit hard cap, no standing queue.
+    "shaper-wan": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.002,
+        rate_mbit=500.0,
+        rate_drop=True,
+        rate_down=True,
+        rate_up=False,
+        seed=32,
+    ),
+    # Clean first, then the policer engages (phase2 rate drop).
+    "shaper-late": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.002,
+        rate_mbit=200.0,
+        rate_drop=True,
+        rate_down=True,
+        rate_up=False,
+        phase2_start_s=0.40,
+        phase2_rate_mbit=70.0,
+        seed=33,
+    ),
+    # Airtime flap: 120 ms on / 80 ms hard drop. Delivered RTT stays put.
+    "flap": PathSpec(
+        delay_s=0.050,
+        jitter_s=0.003,
+        loss=0.01,
+        duty_on_s=0.120,
+        duty_off_s=0.080,
+        duty_drop=True,
+        duty_down=True,
+        seed=34,
+    ),
+    # Quiet then a late 70% hole (last-window / tail storm).
+    "tail-crush": PathSpec(
+        delay_s=0.050,
+        loss=0.015,
+        phase2_start_s=0.25,
+        phase2_loss=0.70,
+        seed=35,
+    ),
+    # Delay chaos without loss: first-flight unique looks random.
+    "jitter-storm": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.028,
+        loss=0.0,
+        seed=36,
+    ),
+    # Data is fine; chatty ACKs hit a tiny uplink policer.
+    "ack-shaper": PathSpec(
+        delay_s=0.040,
+        rate_mbit=3.0,
+        rate_drop=True,
+        rate_down=False,
+        rate_up=True,
+        seed=37,
+    ),
+    # 200 ms reorder hole, not a blackout. Isolated DIR vs undercover.
+    "reorder-hol": PathSpec(
+        delay_s=0.045,
+        jitter_s=0.004,
+        reorder_p=0.18,
+        reorder_extra_s=0.200,
+        loss=0.02,
+        seed=38,
+    ),
 }
 
 
@@ -360,14 +444,25 @@ class Direction:
         self._last = self.t0
         bps = self._rate_bps(self.t0)
         if bps > 0:
-            self._tokens = bps * 0.05
+            self._tokens = min(self._token_cap(bps), bps * 0.05)
 
     def _in_phase2(self, now: float) -> bool:
         spec = self.spec
         return spec.phase2_start_s > 0 and (now - self.t0) >= spec.phase2_start_s
 
+    def _rate_applies(self) -> bool:
+        if self.is_down:
+            return self.spec.rate_down
+        return self.spec.rate_up
+
+    def _token_cap(self, bps: float) -> float:
+        burst_s = 0.015 if self.spec.rate_drop else 0.25
+        return bps * burst_s
+
     def _rate_bps(self, now: float) -> float:
         spec = self.spec
+        if not self._rate_applies():
+            return 0.0
         if self._in_phase2(now) and spec.phase2_rate_mbit is not None:
             return spec.phase2_rate_mbit * 1_000_000 / 8
         if spec.rate_mbit > 0:
@@ -425,6 +520,9 @@ class Direction:
         """Return delivery deadline, or None to drop (model)."""
         if self.rng.random() < self._loss_p(now):
             return None
+        duty = self._duty_extra_s(now)
+        if duty > 0.0 and self.spec.duty_drop:
+            return None
         delay = self.spec.delay_s
         if not self.is_down and self.spec.delay_up_s is not None:
             delay = self.spec.delay_up_s
@@ -436,15 +534,17 @@ class Direction:
         if bps > 0:
             elapsed = max(0.0, now - self._last)
             self._last = now
-            self._tokens = min(bps * 0.25, self._tokens + elapsed * bps)
+            self._tokens = min(self._token_cap(bps), self._tokens + elapsed * bps)
             need = float(nbytes)
             if self._tokens < need:
+                if self.spec.rate_drop:
+                    return None
                 extra = (need - self._tokens) / bps
                 delay += extra
                 self._tokens = 0.0
             else:
                 self._tokens -= need
-        delay += self._duty_extra_s(now)
+        delay += duty
         return now + delay
 
 
@@ -565,6 +665,9 @@ def spec_from_args(args: argparse.Namespace) -> PathSpec:
         reorder_p=base.reorder_p,
         reorder_extra_s=base.reorder_extra_s,
         rate_mbit=args.rate_mbit if args.rate_mbit is not None else base.rate_mbit,
+        rate_drop=base.rate_drop,
+        rate_down=base.rate_down,
+        rate_up=base.rate_up,
         seed=args.seed if args.seed is not None else base.seed,
         blackout_start_s=base.blackout_start_s,
         blackout_dur_s=base.blackout_dur_s,
@@ -582,6 +685,7 @@ def spec_from_args(args: argparse.Namespace) -> PathSpec:
         duty_on_s=base.duty_on_s,
         duty_off_s=base.duty_off_s,
         duty_down=base.duty_down,
+        duty_drop=base.duty_drop,
     )
 
 
@@ -609,10 +713,11 @@ def main(argv: list[str] | None = None) -> int:
         reorder = (
             f" reorder={spec.reorder_p:.0%}/{spec.reorder_extra_s*1e3:.0f}ms"
         )
+    rate_how = "drop" if spec.rate_drop else "queue"
     print(
         f"netem {listen} -> {forward} profile={args.profile} "
         f"delay={spec.delay_s*1e3:.0f}ms loss={spec.loss} "
-        f"rate={spec.rate_mbit:.0f}mbit{duty}{reorder} "
+        f"rate={spec.rate_mbit:.0f}mbit/{rate_how}{duty}{reorder} "
         f"ge={spec.ge_p_gb} seed={spec.seed}  (TETRYS_GSO=0 on sender)"
     )
     last = time.monotonic()

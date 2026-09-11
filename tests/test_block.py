@@ -26,6 +26,7 @@ from tetrys_nc.block_packets import (
     merge_open_feedback,
     pack_data_packets,
     parse_packet,
+    stamp_data_wires,
 )
 from tetrys_nc.block_state import (
     BlockGeometry,
@@ -34,6 +35,7 @@ from tetrys_nc.block_state import (
     FEC_COLD_PCT,
     FEC_COVER_MAX,
     FEC_FLOOR_PCT,
+    FEC_NEED_CAP,
     FEC_LEVELS,
     FEC_MIN_TRAIN,
     FEC_PROBE_PERIOD,
@@ -560,6 +562,14 @@ def test_pack_data_packets_roundtrips_like_blockdata():
     for i, wire in enumerate(wires):
         got = BlockData.unpack(bytes(wire))
         assert got == BlockData(3, 4, 7 + i, payloads[i], 11)
+
+
+def test_stamp_data_wires_overwrites_live_fec():
+    wires = pack_data_packets(3, 4, [b"aa"], send_ts_us=11)
+    stamp_data_wires(wires, 99, fec_pct=32)
+    got = BlockData.unpack(bytes(wires[0]))
+    assert got.send_ts_us == 99
+    assert got.fec_pct == 32
 
 
 def test_decode_failed_skips_repair_age_wait():
@@ -1129,6 +1139,32 @@ def test_quantile_fec_probe_ok_allows_down_below_18():
     ctl.observe_block(probe)
     for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN_LOW):
         ctl.observe_block(close)
+    assert ctl.current == 12
+
+
+def test_quantile_fec_holds_when_most_needs_are_uncoverable():
+    """Shaper / 50%+ drop: the 48% cap is not a request for 32% FEC."""
+    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
+    assert needed_repair_pct(hole, 768) >= FEC_NEED_CAP
+    for _ in range(FEC_MIN_TRAIN + 8):
+        ctl.observe_block(make_block_sample(hole, 768, tail=False))
+    assert ctl.current == 12
+    assert "uncoverable" in ctl.reason
+
+
+def test_quantile_fec_walks_down_from_false_32_when_uncoverable():
+    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    dirty = _fec_state(662, initial_repair=92, extra=400, rounds=3)
+    for _ in range(FEC_MIN_TRAIN):
+        ctl.observe_block(make_block_sample(dirty, 768, tail=False))
+    still = _fec_state(733, initial_repair=184, extra=400, rounds=3)
+    for _ in range(FEC_MIN_TRAIN):
+        ctl.observe_block(make_block_sample(still, 768, tail=False))
+    assert ctl.current == 32
+    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
+    for _ in range(8 * 8):
+        ctl.observe_block(make_block_sample(hole, 768, tail=False))
     assert ctl.current == 12
 
 
