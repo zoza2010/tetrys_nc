@@ -186,6 +186,9 @@ class BlastCc:
         hard = min(self.max_bps, self._inflight_ceiling())
         if self.phase == STARTUP:
             return self._startup_search_cap(hard)
+        if self._pipe_starved():
+            # Do not pin to a 22 Mbit first unique. That is one block / RTT.
+            return min(hard, max(self.rate * _STEP_MAX, self._starved_fill_bps()))
         bw = self.bw.max_bw
         if bw is None:
             return hard
@@ -203,13 +206,12 @@ class BlastCc:
     def _startup_search_cap(self, hard: float) -> float:
         bw = self.bw.max_bw
         if bw is None:
-            # No unique yet: small steps only. 2.88^n toward 10 Gbit is how
-            # the timer blasted 8 → 2.8 Gbit before the first ACK window.
-            return min(hard, max(self.min_bps, self.rate * _STEP_MAX))
-        # Second-highest lags one step while unique follows send. Use the
-        # live sample too so 1.25× compound still reaches a fat pipe.
+            # Hold near start. rate × 1.25^n is how the timer walked
+            # 8 → 2.7 Gbit before three unique samples (Spain 8 MiB/s).
+            return min(hard, max(self.min_bps, self.start_bps * _STEP_MAX))
+        # Follow the filter. A single GRO/ACK burst is not C.
         ref = bw
-        if self.last_delivery > 0:
+        if 0 < self.last_delivery <= bw * 1.50:
             ref = max(ref, self.last_delivery)
         return min(hard, max(self.min_bps, ref * _STARTUP_FOLLOW))
 
@@ -273,6 +275,16 @@ class BlastCc:
         """HOL/window pause looks like qdelay. It is not a standing queue."""
         return self._unique_cliff() or self._send_paused()
 
+    def _pipe_starved(self) -> bool:
+        """Less than two blocks in flight. Empty queue cannot be C."""
+        if self.rate <= 0:
+            return True
+        return self.rate * self._rtt_s() < 2 * 1048576
+
+    def _starved_fill_bps(self) -> float:
+        """Rate that puts ~2 blocks in the pipe so the window can open."""
+        return max(self.min_bps, 2 * 1048576 / self._rtt_s())
+
     def _drain_target(self) -> float:
         """One 0.75× step, but never below measured unique."""
         cut = self.rate * _DRAIN_GAIN
@@ -283,17 +295,18 @@ class BlastCc:
 
     def _pipe_oversend(self) -> bool:
         """Send is well above unique arrival. Cap or iid — measure to tell."""
-        if self.last_unique < 1 * 1048576:
+        # First-window unique (~one block) is not C. Measuring it locked
+        # Spain at 51 Mbit / 13 MiB/s.
+        if self.last_unique < 16 * 1048576:
             return False
         absorbed = self._absorbed_bps()
         if absorbed is None or absorbed <= 0:
             return False
-        # Unique cliffed below the filter: HOL/window stall at the current
-        # operating point. A cliff after we already blasted past delivery
-        # is the overshoot, not HOL — still oversend.
+        # Unique cliffed below the filter: HOL only if we are still at
+        # follow. Send above follow then a cliff is the 1.3 Gbit Spain
+        # overshoot (close 100% → 5%, ov stayed 0 under 1.50× slack).
         if self.last_delivery > 0 and self.last_delivery < absorbed * 0.50:
-            if self._send_ref() <= absorbed * _STARTUP_FOLLOW:
-                return False
+            return self._send_ref() >= absorbed * _STARTUP_FOLLOW
         if self.have_source and self.last_send_rate > 0:
             # Window stall: source admission stopped AND decode is not
             # keeping up. Source finishing a small file is not a stall.
@@ -302,11 +315,9 @@ class BlastCc:
                 and self.recv_lag
             ):
                 return False
-        # Startup steps are 1.35×. A 1.20 policer treats every climb as
-        # oversend and MEASURE-locks the previous unique (~130 Mbit).
-        # Startup steps 1.35×; unique lags one RTT. A 1.2–1.5× trip locks
-        # the previous unique (~50 Mbit). 2.5× is a real overshoot.
-        gain = 2.5 if self.phase == STARTUP else _POLICER_GAIN
+        # Startup follows unique at 1.35×. 2.5× slack let 2.7 Gbit sit
+        # on a 900 Mbit filter. 1.50 is just above follow.
+        gain = 1.50 if self.phase == STARTUP else _POLICER_GAIN
         return self._send_ref() > absorbed * gain
 
     def _slower_pairs(self) -> list[tuple[float, float]]:
@@ -390,13 +401,23 @@ class BlastCc:
             and ratio_before >= 0.45
             and ratio_after >= 0.80
         )
-        keep = (unique_held and lost_less and decoded_ok and follows_trial) or fat_plateau
+        collapsed = (
+            self.measure_delivery > 0
+            and self.last_delivery > 0
+            and self.last_delivery < self.measure_delivery * 0.70
+        )
+        keep = (
+            (unique_held and lost_less and decoded_ok and follows_trial)
+            or fat_plateau
+            or collapsed
+        )
         if keep:
             self.last_good = min(self.last_good, self.rate)
             self.measure_need_decode = False
             self._emit(
                 f"measure_keep held={int(unique_held)} less={int(lost_less)} "
                 f"follow={int(follows_trial)} fat={int(fat_plateau)} "
+                f"collapse={int(collapsed)} "
                 f"rb={ratio_before:.2f} ra={ratio_after:.2f}"
             )
         else:
@@ -441,6 +462,8 @@ class BlastCc:
             return self.rate
         # No channel guess: wait for an echo before inventing a rate.
         if self.min_rtt is None:
+            return self.rate
+        if self.bw.max_bw is None:
             return self.rate
         if self._pipe_oversend():
             return self.rate
@@ -550,10 +573,12 @@ class BlastCc:
         else:
             self.high_delay_n = 0
 
+        starved = self._pipe_starved()
         buffer_full = (
             qdelay >= self._qdelay_stop()
             and self.high_delay_n >= _QDELAY_HOLD
             and not self._admit_stall()
+            and not starved
         )
         holding = now < self.measure_holdoff
         if not self.recv_lag:
@@ -580,7 +605,7 @@ class BlastCc:
                 self.rate = self._clip(self._drain_target())
                 self.last_step_ts = now
                 self._emit("startup_drain qdelay")
-            elif settled and oversend:
+            elif oversend and (settled or self._unique_cliff()):
                 self._start_measure(now)
             elif at_cap:
                 self._emit("startup_at_cap")
@@ -602,7 +627,16 @@ class BlastCc:
                 self.drain_cuts += 1
                 self.rate = self._clip(self._drain_target())
         elif self.phase == CRUISE:
-            if buffer_full:
+            if starved and not oversend:
+                # Spain 22 Mbit / open=1: probe +10% and qdelay drain
+                # sat for 40s. Jump toward two-block BDP, then follow.
+                hard = min(self.max_bps, self._inflight_ceiling())
+                ceiling = min(hard, max(self.rate * _STEP_MAX, self._starved_fill_bps()))
+                if now - self.last_step_ts >= step_s and self.rate < ceiling * 0.98:
+                    self.last_step_ts = now
+                    self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
+                    self._emit("cruise_fill")
+            elif buffer_full:
                 self.phase = DRAIN
                 self.drain_ts = now
                 self.drain_cuts = 1
@@ -644,7 +678,7 @@ class BlastCc:
                 and self.probe_base > 0
                 and self.last_delivery >= self.probe_base * 0.95
             )
-            lag_stuck = recv_lag and not unique_held
+            lag_stuck = recv_lag and not unique_held and not starved
             if buffer_full or lag_stuck or policer or oversend:
                 why = (
                     "qdelay"
@@ -668,10 +702,11 @@ class BlastCc:
                     and self.probe_base > 0
                     and self.last_delivery >= self.probe_base * 1.02
                 )
+                filling = starved and not oversend
                 better = (
-                    (decode_gained or unique_gained)
-                    and qdelay < self._qdelay_stop()
-                    and self.high_delay_n == 0
+                    (decode_gained or unique_gained or filling)
+                    and (filling or qdelay < self._qdelay_stop())
+                    and (filling or self.high_delay_n == 0)
                     and not lag_stuck
                     and not self._over_delivery(window_full=window_full)
                 )

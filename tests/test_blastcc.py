@@ -74,16 +74,31 @@ def test_on_timer_waits_for_rtt_before_climb():
     assert cc.rate == seed
 
 
-def test_on_timer_climbs_during_blocked_send():
+def test_on_timer_does_not_invent_rate_before_unique():
+    """Spain 8 MiB/s: 1.25^n without unique walked 8 → 2.7 Gbit."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    now = 1.0
+    for _ in range(40):
+        now += 0.08
+        cc.on_timer(now)
+    assert cc.rate < 20_000_000 / 8
+
+
+def test_on_timer_climbs_after_unique_while_send_blocked():
     cc = _cc()
     cc.min_rtt = 0.08
-    seed = cc.rate
     now = 1.0
+    unique = 0
+    for i in range(1, 5):
+        now += 0.20
+        unique += int(_CAP * 0.20)
+        _feed(cc, now, i, unique, 0.080)
     for _ in range(8):
         now += 0.12
         cc.on_timer(now)
-    assert cc.rate > seed
-    assert cc.rate == pytest.approx(_CAP)
+    assert cc.rate == pytest.approx(_CAP, rel=0.02)
 
 
 def test_startup_climbs_to_cap_without_delivery_plateau():
@@ -109,6 +124,47 @@ def test_single_jitter_does_not_drain():
         _feed(cc, now, i, unique, rtt)
     assert cc.phase != DRAIN
     assert cc.rate > _START * 0.90
+
+
+def test_cruise_fills_when_one_block_in_flight():
+    """Spain: cruise at 22 Mbit, open=1, 40s of probe_revert. Not C."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = CRUISE
+    cc.rate = 22_000_000 / 8
+    cc.last_good = cc.rate
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    now = 5.0
+    unique = 1_000_000
+    for i in range(1, 8):
+        now += 0.20
+        unique += int(max(cc.rate, 1) * 0.20)
+        _feed(cc, now, i, unique, 0.081)
+    assert cc.rate > 80_000_000 / 8
+
+
+def test_starved_pipe_does_not_qdelay_drain():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = CRUISE
+    cc.rate = 22_000_000 / 8
+    cc.last_good = cc.rate
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.04
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    now = 5.0
+    unique = 1_000_000
+    for i in range(1, 10):
+        now += 0.12
+        unique += 200_000
+        _feed(cc, now, i, unique, 0.160)
+    assert cc.phase != DRAIN
 
 
 def test_sustained_queue_enters_drain_not_loss():
@@ -353,6 +409,31 @@ def test_unique_cliff_is_window_stall_not_a_cap():
     assert cc.rate > _CAP * 0.70
 
 
+def test_measure_keeps_cut_if_unique_collapsed():
+    """Spain: cut 1348→1099, unique cliffs, restore put 1348 back and died."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    absorbed = 999_000_000 / 8
+    cc.rate = 1_348_000_000 / 8
+    cc.last_good = start
+    cc.bw.observe(absorbed * 0.90)
+    cc.bw.observe(absorbed * 0.95)
+    cc.bw.observe(absorbed)
+    cc.last_delivery = absorbed
+    now = 10.0
+    cc._start_measure(now)
+    trial = cc.rate
+    cc.last_delivery = 266_000_000 / 8
+    cc.measure_until = now
+    cc._finish_measure(now)
+    assert cc.rate == pytest.approx(trial, rel=0.02)
+    assert cc.rate < 1_200_000_000 / 8
+
+
 def test_measure_restores_if_unique_holds_but_decode_is_stuck():
     """Uncoverable window: unique looks like a thin cap, decoded does not recover."""
     cc = _cc()
@@ -482,10 +563,10 @@ def test_startup_does_not_open_search_cap_before_unique():
     cc = BlastCc(max_bps=cap, start_bps=start, min_bps=start)
     cc.min_rtt = 0.08
     now = 1.0
-    for _ in range(8):
+    for _ in range(30):
         now += 0.12
         cc.on_timer(now)
-    assert cc.rate < 200_000_000 / 8
+    assert cc.rate < 20_000_000 / 8
 
 
 def test_startup_ceiling_tracks_unique_not_burst_times_gain():
@@ -495,8 +576,36 @@ def test_startup_ceiling_tracks_unique_not_burst_times_gain():
     cc.bw.observe(burst * 0.90)
     cc.bw.observe(burst * 0.95)
     cc.bw.observe(burst)
+    cc.last_delivery = 2_000_000_000 / 8
     assert cc._startup_ceiling() < burst * 1.50
     assert cc._startup_ceiling() < 2_000_000_000 / 8
+
+
+def test_first_window_unique_is_not_oversend():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    cc.rate = 1_357_000_000 / 8
+    cc.last_unique = 8 * 1048576
+    cc.last_delivery = 13_000_000 / 8
+    assert cc._pipe_oversend() is False
+
+
+def test_follow_pace_then_unique_cliff_is_oversend():
+    """Spain after 2.7 Gbit cap: 1290 on ~900 unique, then cliff, ov stayed 0."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    cc.min_rtt = 0.08
+    absorbed = 947_000_000 / 8
+    cc.rate = 1_290_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_unique = 16 * 1048576
+    cc.last_delivery = 200_000_000 / 8
+    cc.bw.observe(absorbed * 0.9)
+    cc.bw.observe(absorbed * 0.95)
+    cc.bw.observe(absorbed)
+    assert cc._pipe_oversend() is True
 
 
 def test_overshoot_then_unique_cliff_is_still_oversend():
@@ -510,7 +619,7 @@ def test_overshoot_then_unique_cliff_is_still_oversend():
     cc.rtt.n = 20
     cc.rate = 2_800_000_000 / 8
     cc.last_send_rate = cc.rate
-    cc.last_unique = 8 * 1048576
+    cc.last_unique = 16 * 1048576
     cc.last_delivery = 40_000_000 / 8
     absorbed = 900_000_000 / 8
     cc.bw.observe(absorbed * 0.9)
