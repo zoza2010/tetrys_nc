@@ -51,7 +51,6 @@ from .block_state import (
     WAN_ACTIVE_BYTES,
     WAN_BLOCK_K,
     WAN_CC_CAP_MBIT,
-    WAN_START_MBIT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
     ghost_flight_ready,
@@ -212,16 +211,24 @@ def _env_str(name: str, default: str) -> str:
 
 def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, float]:
     if cc:
-        # Search cap is not the 850 lock. Always above 1 Gbit unless env is
-        # even higher (default 10 Gbit).
+        # Search cap is not a path guess. Always above 1 Gbit unless env is
+        # even higher (default 10 Gbit). Start at the stall floor; BlastCc
+        # climbs after the first RTT, then sits on measured delivery.
         cap_mbit = max(
             2000.0,
             _env_float("TETRYS_CC_CAP_MBIT", WAN_CC_CAP_MBIT),
         )
         max_bps = cap_mbit * 1_000_000 / 8
-        start_mbit = min(cap_mbit, max(rate_mbit, 1.0))
-        start_bps = start_mbit * 1_000_000 / 8
-        min_bps = 250_000_000 / 8
+        min_bps = 8_000_000 / 8
+        start_raw = os.environ.get("TETRYS_START_MBIT", "").strip()
+        if start_raw:
+            try:
+                start_mbit = max(float(start_raw), 1.0)
+            except ValueError:
+                start_mbit = min_bps * 8 / 1_000_000
+            start_bps = min(max_bps, start_mbit * 1_000_000 / 8)
+        else:
+            start_bps = min_bps
         return min_bps, max_bps, start_bps
     # `--rate` is a hard lock. Optional env may clip; 850 must not
     # silently override a higher requested lock.
@@ -451,6 +458,30 @@ class BlockSender:
                 ):
                     self.client_fin.set()
 
+    def _apply_cc(self) -> None:
+        """Push the latest ACK into BlastCc. Admit can block the main loop."""
+        cc = self.cc
+        if cc is None:
+            return
+        _completed, _opened, unique_rx, decoded, echo_ts, fb_id = (
+            self.feedback.snapshot()
+        )
+        self.limiter.set_rate(
+            cc.on_feedback(
+                time.monotonic(),
+                feedback_id=fb_id,
+                unique_bytes=unique_rx,
+                decoded_bytes=decoded,
+                echo_ts_us=echo_ts,
+                extra_frac=self.extra_win.frac,
+                window_full=len(self.active) >= self.geometry.active_blocks,
+                sent_bytes=self.source_wire_total + self.repair_wire_total,
+                source_bytes=self.source_wire_total,
+            )
+        )
+        for line in cc.pull_events():
+            print(line, flush=True)
+
     def _send_wires(self, wires: list[bytes], *, repair: bool) -> None:
         limiter = self.limiter
         cc = self.cc
@@ -463,6 +494,7 @@ class BlockSender:
                 )
         for pos in range(0, len(wires), _SEND_CHUNK):
             if cc is not None:
+                self._apply_cc()
                 limiter.set_rate(cc.on_timer(time.monotonic()))
             batch = wires[pos : pos + _SEND_CHUNK]
             t_pace = time.perf_counter()
@@ -563,7 +595,10 @@ class BlockSender:
             )
             if sample.train:
                 if not state.fec_sampled:
-                    self.repair_ctl.observe_block(sample)
+                    self.repair_ctl.observe_block(
+                        sample,
+                        allow_up=self.cc is None or self.cc.fec_may_raise,
+                    )
                     state.fec_sampled = True
                 self.extra_win.observe(sample.dir_pressure())
                 self.extra_frac_samples.append(extra / max(1, self.block_k))
@@ -621,7 +656,10 @@ class BlockSender:
                     state, self.block_k, tail=False, qdelay_high=qdelay_high
                 )
                 if sample.train:
-                    self.repair_ctl.observe_block(sample)
+                    self.repair_ctl.observe_block(
+                        sample,
+                        allow_up=self.cc is None or self.cc.fec_may_raise,
+                    )
                     state.fec_sampled = True
         self.timers.repair_s += time.perf_counter() - t_r
         return sent
@@ -745,6 +783,15 @@ class BlockSender:
         )
         self.pace_samples.append(self.limiter.rate * 8 / 1e6)
         cc = self.cc
+        cc_extra = ""
+        if cc is not None:
+            cc_extra = (
+                f"snd={cc.last_send_rate * 8 / 1e6:.0f} "
+                f"unq={cc.last_delivery * 8 / 1e6:.0f} "
+                f"good={cc.last_good * 8 / 1e6:.0f} "
+                f"ov={int(cc._pipe_oversend())} "
+                f"fec_up={int(cc.fec_may_raise)} "
+            )
         print(
             f"progress sent={self.next_block}/{self.total_blocks} "
             f"done={len(completed)} active={len(self.active)} "
@@ -754,6 +801,7 @@ class BlockSender:
             f"close={close_pct:.0f}% "
             f"pace={self.limiter.rate * 8 / 1e6:.0f}Mbit "
             f"cc={cc.phase if cc is not None else 'off'} "
+            f"{cc_extra}"
             f"xfrac={self.extra_win.frac * 100:.0f}% "
             f"loss_p50={((percentile(self.loss_samples, 50) or 0.0) * 100):.1f}% "
             f"ack={unique_rx / elapsed / 1048576:.1f} "
@@ -795,17 +843,7 @@ class BlockSender:
                     )
                     break
                 if self.cc is not None:
-                    self.limiter.set_rate(
-                        self.cc.on_feedback(
-                            now,
-                            feedback_id=fb_id,
-                            unique_bytes=unique_rx,
-                            decoded_bytes=decoded,
-                            echo_ts_us=echo_ts,
-                            extra_frac=self.extra_win.frac,
-                            window_full=len(self.active) >= self.geometry.active_blocks,
-                        )
-                    )
+                    self._apply_cc()
                 tail = self.next_block >= self.total_blocks
                 if tail and self.tail_started is None:
                     self.tail_started = now
@@ -1153,7 +1191,7 @@ def run_block_server(
     prefetch_depth = min(64, max(geometry.active_blocks, 32))
     cc_on = rate_mbit is None
     min_bps, max_bps, start_bps = _pace_limits(
-        WAN_START_MBIT if cc_on else rate_mbit, cc=cc_on
+        0.0 if cc_on else rate_mbit, cc=cc_on
     )
     fec_mode, fec_start = resolve_fec_cli(initial_repair_pct)
 

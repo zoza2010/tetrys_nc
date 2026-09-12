@@ -62,8 +62,9 @@ FEC_MIN_TRAIN = 8
 FEC_CLEAN_DOWN = 24
 FEC_CLEAN_DOWN_LOW = 48
 FEC_SOFT_FLOOR = 18
-# Omit `--gen-overhead` to search; cold start is 12%, not the old 24% lock.
-FEC_COLD_PCT = 12
+# Omit `--gen-overhead` to search; cold start is the floor, first blocks
+# sound at cover-max, then lock from first-flight need.
+FEC_COLD_PCT = FEC_FLOOR_PCT
 FEC_PROBE_PERIOD = 16
 FEC_RAPTORQ_MARGIN = 2
 DIR_LIGHT_SLACK = 8
@@ -476,6 +477,8 @@ class QuantileFecController:
     probe_fail_at: int = -1
     reason: str = "cold"
     dir_rounds: int = 0
+    measured: bool = False
+    sounding: bool = False
     needed: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
     repair_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
 
@@ -494,6 +497,7 @@ class QuantileFecController:
         self.level_idx = fec_level_index(
             self.start_pct, min_pct=self.min_pct, max_pct=self.max_pct
         )
+        self.sounding = int(self.start_pct) <= int(self.min_pct)
         self.reason = f"cold start={self.current} mode={self.mode}"
 
     @property
@@ -503,8 +507,16 @@ class QuantileFecController:
         return int(FEC_LEVELS[self.level_idx])
 
     def encode_pct(self, block_id: int) -> int:
-        """Most blocks at current; every Nth is a probe one level below."""
-        if self.mode == "fixed" or self.level_idx <= 0:
+        """Most blocks at current; every Nth is a probe one level below.
+
+        Until first-flight trains, send cover-max so blocks close for
+        measurement. That sounding cover is not the operating point.
+        """
+        if self.mode == "fixed":
+            return self.current
+        if self.sounding and not self.measured:
+            return self._cover_cap()
+        if self.level_idx <= 0:
             return self.current
         nxt = FEC_LEVELS[self.level_idx - 1]
         if nxt < self.min_pct:
@@ -537,7 +549,8 @@ class QuantileFecController:
         else:
             delta = int(math.ceil(deficit * p / max(1e-6, 1.0 - p)))
         cover = self._cover_cap()
-        if self.mode != "fixed" and self.current < cover and p >= 0.03:
+        sounding = self.sounding and not self.measured
+        if self.mode != "fixed" and not sounding and self.current < cover and p >= 0.03:
             delta = max(
                 delta,
                 int(math.ceil(deficit * (cover - self.current) / max(1, cover))),
@@ -576,7 +589,7 @@ class QuantileFecController:
         else:
             self.probe_fail_at = nxt_pct
 
-    def observe_block(self, sample: BlockLossSample) -> int:
+    def observe_block(self, sample: BlockLossSample, *, allow_up: bool = True) -> int:
         self.dir_rounds += max(0, sample.repair_rounds)
         if self.mode == "fixed":
             self.reason = f"fixed {self.current}"
@@ -598,7 +611,7 @@ class QuantileFecController:
         self.needed.append(needed_pct)
         self.repair_loss.append(loss)
         if len(self.needed) < FEC_MIN_TRAIN:
-            self.reason = f"warm n={len(self.needed)} hold={self.current}"
+            self.reason = f"sound n={len(self.needed)} hold={self.current}"
             return self.current
         cover = self._cover_cap()
         coverable = [n for n in self.needed if n <= cover]
@@ -607,18 +620,21 @@ class QuantileFecController:
         storm = sample.decode_failed or sample.repair_rounds >= 3
         # Need at the 48% cap is a policer/blackout, not a 32% target.
         # Chasing it burns repair and first-close stays 0.
-        if uncov_n * 2 >= len(self.needed):
-            # Extra FEC cannot first-close. Leave a false 32% climb; stay ≥ cold.
+        if uncov_n * 2 >= len(self.needed) and not coverable:
+            # Every sample sits on the need cap. FEC cannot first-close;
+            # CC must cut.
             self.clean_n += 1
             nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-            if self.current > FEC_COLD_PCT and nxt >= FEC_COLD_PCT and self.clean_n >= 8:
+            if self.current > self.min_pct and nxt >= self.min_pct and self.clean_n >= 8:
                 self.level_idx -= 1
                 self.clean_n = 0
                 self.probe_fail_at = -1
+                self.measured = True
                 self.reason = (
                     f"down uncoverable {uncov_n}/{len(self.needed)} -> {self.current}"
                 )
                 return self.current
+            self.measured = True
             self.reason = (
                 f"hold uncoverable {uncov_n}/{len(self.needed)} {self.current}%"
             )
@@ -635,6 +651,17 @@ class QuantileFecController:
             q_up = max(q_up, needed_pct)
         target_idx = fec_level_index(q, min_pct=self.min_pct, max_pct=cover)
         up_idx = fec_level_ceil_index(q_up, min_pct=self.min_pct, max_pct=cover)
+        if self.sounding and not self.measured:
+            self.measured = True
+            # p75: one dirty first-flight must not lock cover-max.
+            self.level_idx = fec_level_ceil_index(
+                q_up, min_pct=self.min_pct, max_pct=cover
+            )
+            self.clean_n = 0
+            self.probe_fail_at = -1
+            self.reason = f"lock p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current}"
+            return self.current
+        self.measured = True
         saw_repair = (
             sample.extra_symbols > 0
             or sample.repair_rounds >= 1
@@ -645,7 +672,7 @@ class QuantileFecController:
             and q_up > self.current
             and saw_repair
         )
-        if up_idx > self.level_idx:
+        if allow_up and up_idx > self.level_idx:
             # Isolated DIR is delay/reorder (p75 stays ~0). Jump on a storm
             # or when most first-flights in the window needed more FEC.
             if (storm and sample.dir_pressure()) or undercover:
@@ -678,10 +705,10 @@ class QuantileFecController:
 
 
 def adaptive_start_pct(initial: int, mode: str, floor: int = FEC_FLOOR_PCT) -> int:
-    """Fixed mode keeps the lock; adaptive cold-start is min(initial, 12%)."""
+    """Fixed mode keeps the lock; adaptive cold-start is the measurement floor."""
     if (mode or "").strip().lower() == "fixed":
         return int(initial)
-    return max(int(floor), min(int(initial), FEC_COLD_PCT))
+    return max(int(floor), min(int(initial), int(floor)))
 
 
 def resolve_fec_cli(overhead: int | None) -> tuple[str, int]:

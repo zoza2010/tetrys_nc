@@ -350,23 +350,33 @@ def test_pace_limits_env_cap_still_clips(monkeypatch):
 
 def test_pace_limits_cc_uses_search_cap(monkeypatch):
     monkeypatch.delenv("TETRYS_CC_CAP_MBIT", raising=False)
+    monkeypatch.delenv("TETRYS_START_MBIT", raising=False)
     min_bps, max_bps, start_bps = _pace_limits(850.0, cc=True)
-    assert start_bps == pytest.approx(850_000_000 / 8)
+    assert start_bps == pytest.approx(8_000_000 / 8)
     assert max_bps == pytest.approx(10000_000_000 / 8)
-    assert min_bps == pytest.approx(250_000_000 / 8)
-    assert min_bps < start_bps
+    assert min_bps == pytest.approx(8_000_000 / 8)
+    assert start_bps == min_bps
 
 
 def test_pace_limits_cc_cap_is_above_one_gigabit(monkeypatch):
     monkeypatch.delenv("TETRYS_CC_CAP_MBIT", raising=False)
+    monkeypatch.delenv("TETRYS_START_MBIT", raising=False)
     min_bps, max_bps, start_bps = _pace_limits(850.0, cc=True)
-    assert start_bps == pytest.approx(850_000_000 / 8)
+    assert start_bps == pytest.approx(8_000_000 / 8)
     assert max_bps == pytest.approx(10000_000_000 / 8)
     assert max_bps * 8 / 1e6 > 1000.0
-    assert min_bps == pytest.approx(250_000_000 / 8)
+    assert min_bps == pytest.approx(8_000_000 / 8)
     monkeypatch.setenv("TETRYS_CC_CAP_MBIT", "850")
     _, capped, _ = _pace_limits(850.0, cc=True)
     assert capped * 8 / 1e6 >= 2000.0
+
+
+def test_pace_limits_cc_start_env_is_optional(monkeypatch):
+    monkeypatch.setenv("TETRYS_START_MBIT", "850")
+    min_bps, max_bps, start_bps = _pace_limits(0.0, cc=True)
+    assert start_bps == pytest.approx(850_000_000 / 8)
+    assert min_bps == pytest.approx(8_000_000 / 8)
+    assert max_bps > start_bps
 
 
 def test_feedback_client_lost_after_silence():
@@ -1010,22 +1020,25 @@ def test_quantile_fec_dir_pressure_does_not_block_down_without_storm():
     assert ctl.current < 18
 
 
-def test_adaptive_cold_start_clamps_cli_24_to_12():
-    assert FEC_COLD_PCT == 12
-    assert adaptive_start_pct(24, "quantile") == 12
+def test_adaptive_cold_start_clamps_cli_24_to_floor():
+    assert FEC_COLD_PCT == FEC_FLOOR_PCT == 4
+    assert adaptive_start_pct(24, "quantile") == 4
     assert adaptive_start_pct(24, "fixed") == 24
-    assert adaptive_start_pct(8, "quantile") == 8
+    assert adaptive_start_pct(8, "quantile") == 4
     assert adaptive_start_pct(4, "quantile") == 4
     ctl = make_fec_controller(24, mode="quantile", clamp_cold=True)
-    assert ctl.current == 12
+    assert ctl.current == 4
+    assert ctl.sounding is True
+    assert ctl.encode_pct(1) == FEC_COVER_MAX
     live = make_fec_controller(24, mode="quantile")
     assert live.current == 24
+    assert live.sounding is False
 
 
 def test_gen_overhead_locks_fec_omit_runs_autofec():
     assert resolve_fec_cli(24) == ("fixed", 24)
     assert resolve_fec_cli(8) == ("fixed", 8)
-    assert resolve_fec_cli(None) == ("quantile", 12)
+    assert resolve_fec_cli(None) == ("quantile", 4)
     locked = make_fec_controller(24, mode="fixed")
     assert locked.current == 24
     for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
@@ -1072,7 +1085,7 @@ def test_quantile_fec_sparse_dir_tail_does_not_up():
     )
     for i in range(FEC_WINDOW):
         ctl.observe_block(dirty if i % 20 == 0 else close)
-    assert ctl.current == 12
+    assert ctl.current <= 12
 
 
 def test_quantile_fec_jumps_up_on_storm_dir():
@@ -1090,7 +1103,7 @@ def test_quantile_fec_jumps_up_on_storm_dir():
 def test_quantile_fec_covers_dirty_hour_loss_up_to_32():
     """23% path loss at 12% FEC needs ~26–30%; cover 24% left that below TCP."""
     ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    assert ctl.current == 12
+    assert ctl.current == 4
     # 12% blast, ~23% drop: unique ≈ 0.77*(K+R0).
     dirty = _fec_state(662, initial_repair=92, extra=400, rounds=3)
     need = needed_repair_pct(dirty, 768)
@@ -1106,6 +1119,31 @@ def test_quantile_fec_covers_dirty_hour_loss_up_to_32():
     for _ in range(FEC_MIN_TRAIN):
         ctl.observe_block(make_block_sample(still, 768, tail=False))
     assert ctl.current == 32
+
+
+def test_fec_sounding_locks_from_first_flight_need():
+    ctl = make_fec_controller(4, mode="quantile", clamp_cold=True)
+    assert ctl.encode_pct(0) == FEC_COVER_MAX
+    dirty = make_block_sample(
+        _fec_state(662, initial_repair=92, extra=400, rounds=3), 768, tail=False
+    )
+    for _ in range(FEC_MIN_TRAIN - 1):
+        ctl.observe_block(dirty)
+        assert ctl.current == 4
+        assert ctl.encode_pct(3) == FEC_COVER_MAX
+    ctl.observe_block(dirty)
+    assert ctl.current >= 24
+    assert ctl.encode_pct(1) == ctl.current
+
+
+def test_fec_does_not_raise_while_hunting_rate():
+    ctl = make_fec_controller(8, mode="quantile")
+    dirty = make_block_sample(
+        _fec_state(620, initial_repair=62, extra=200, rounds=3), 768, tail=False
+    )
+    for _ in range(FEC_MIN_TRAIN):
+        ctl.observe_block(dirty, allow_up=False)
+    assert ctl.current == 8
 
 
 def test_fec_encode_pct_probes_one_level_below():
@@ -1142,6 +1180,17 @@ def test_quantile_fec_probe_ok_allows_down_below_18():
     assert ctl.current == 12
 
 
+def test_quantile_fec_trains_coverable_mix_instead_of_cold_hold():
+    """Half uncoverable + coverable ~24% must not freeze at the 12% cold start."""
+    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
+    mid = _fec_state(620, initial_repair=92, extra=80, rounds=2)
+    for _ in range(24):
+        ctl.observe_block(make_block_sample(hole, 768, tail=False))
+        ctl.observe_block(make_block_sample(mid, 768, tail=False))
+    assert ctl.current >= 18
+
+
 def test_quantile_fec_holds_when_most_needs_are_uncoverable():
     """Shaper / 50%+ drop: the 48% cap is not a request for 32% FEC."""
     ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
@@ -1149,7 +1198,7 @@ def test_quantile_fec_holds_when_most_needs_are_uncoverable():
     assert needed_repair_pct(hole, 768) >= FEC_NEED_CAP
     for _ in range(FEC_MIN_TRAIN + 8):
         ctl.observe_block(make_block_sample(hole, 768, tail=False))
-    assert ctl.current == 12
+    assert ctl.current == 4
     assert "uncoverable" in ctl.reason
 
 
@@ -1163,9 +1212,9 @@ def test_quantile_fec_walks_down_from_false_32_when_uncoverable():
         ctl.observe_block(make_block_sample(still, 768, tail=False))
     assert ctl.current == 32
     hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
-    for _ in range(8 * 8):
+    for _ in range(48 + 8 * 8):
         ctl.observe_block(make_block_sample(hole, 768, tail=False))
-    assert ctl.current == 12
+    assert ctl.current == 4
 
 
 def test_quantile_fec_does_not_raise_for_uncoverable_burst():

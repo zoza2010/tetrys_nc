@@ -1,4 +1,4 @@
-"""Blast rate-search: filtered RTT, startup to cap, loss does not cut."""
+"""Blast rate-search: delay/policer cuts; extra/DIR is not a rate signal."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import pytest
 from tetrys_nc.blastcc import (
     CRUISE,
     DRAIN,
+    MEASURE,
     PROBE,
     STARTUP,
     BlastCc,
@@ -34,15 +35,20 @@ def _feed(
     unique: int,
     rtt: float,
     extra: float = 0.0,
+    decoded: int | None = None,
+    sent: int = 0,
+    source: int = 0,
 ) -> float:
     return cc.on_feedback(
         now,
         feedback_id=fb,
         unique_bytes=unique,
-        decoded_bytes=unique,
+        decoded_bytes=unique if decoded is None else decoded,
         echo_ts_us=_echo(now, rtt),
         extra_frac=extra,
         window_full=True,
+        sent_bytes=sent,
+        source_bytes=source,
     )
 
 
@@ -58,8 +64,19 @@ def test_rtt_from_echo_wraps_32bit():
     assert rtt_from_echo(now, 0) is None
 
 
+def test_on_timer_waits_for_rtt_before_climb():
+    cc = _cc()
+    seed = cc.rate
+    now = 1.0
+    for _ in range(8):
+        now += 0.12
+        cc.on_timer(now)
+    assert cc.rate == seed
+
+
 def test_on_timer_climbs_during_blocked_send():
     cc = _cc()
+    cc.min_rtt = 0.08
     seed = cc.rate
     now = 1.0
     for _ in range(8):
@@ -87,7 +104,7 @@ def test_single_jitter_does_not_drain():
     unique = 0
     for i in range(1, 12):
         now += 0.05
-        unique += 1_000_000
+        unique += int(_CAP * 0.05)
         rtt = 0.095 if i == 10 else 0.080
         _feed(cc, now, i, unique, rtt)
     assert cc.phase != DRAIN
@@ -136,13 +153,17 @@ def test_extra_repair_without_delay_does_not_cut_cruise():
     cc.rtt.srtt = 0.081
     now = 101.0
     held = cc.rate
-    _feed(cc, now, 1, 5_000_000, 0.081, extra=0.02)
-    _feed(cc, now + 0.20, 2, 15_000_000, 0.081, extra=0.02)
+    unique = 0
+    for i, dt in enumerate((0.20, 0.20), start=1):
+        now = 101.0 + (i - 1) * dt if i > 1 else 101.0
+        unique += int(held * dt)
+        _feed(cc, now, i, unique, 0.081, extra=0.02)
     assert cc.rate == held
     assert cc.phase == CRUISE
 
 
-def test_busy_extra_repair_cuts_cruise():
+def test_busy_extra_repair_does_not_ratchet_cruise():
+    """DIR/FEC pressure is not a full pipe. Lock-850 holds 95; extra cuts fell to 70."""
     cc = _cc()
     cc.phase = CRUISE
     cc.rate = _CAP
@@ -151,10 +172,15 @@ def test_busy_extra_repair_cuts_cruise():
     cc.rtt.n = 20
     cc.rtt.min_rtt = 0.08
     cc.rtt.srtt = 0.08
-    cc.last_delivery = 80 * 1048576
-    _feed(cc, 101.0, 1, 5_000_000, 0.08, extra=0.20)
-    _feed(cc, 101.2, 2, 15_000_000, 0.08, extra=0.20)
-    assert cc.rate < _CAP
+    cc.min_rtt = 0.08
+    now = 101.0
+    unique = 0
+    for i in range(1, 8):
+        now += 0.12
+        unique += int(_CAP * 0.12)
+        _feed(cc, now, i, unique, 0.081, extra=0.20)
+    assert cc.rate == pytest.approx(_CAP, rel=0.02)
+    assert cc.phase in (CRUISE, PROBE)
 
 
 def test_probe_then_revert_if_filtered_delay_rises():
@@ -168,29 +194,212 @@ def test_probe_then_revert_if_filtered_delay_rises():
     cc.rtt.n = 20
     cc.cruise_ts = 0.0
     now = 5.0
-    _feed(cc, now, 1, 1, 0.08)
+    unique = int(_CAP * 0.8 * 1.0)
+    _feed(cc, now, 1, unique, 0.08)
     assert cc.phase == PROBE
     base = cc.probe_base
     fb = 2
     while now < cc.probe_until:
         now += 0.05
-        _feed(cc, now, fb, fb, 0.16)
+        unique += int(base * 0.05)
+        _feed(cc, now, fb, unique, 0.16)
         fb += 1
-    _feed(cc, cc.probe_until + 0.01, fb, fb, 0.16)
+    unique += int(base * 0.05)
+    _feed(cc, cc.probe_until + 0.01, fb, unique, 0.16)
     assert cc.phase == CRUISE
     assert cc.rate == base
 
 
-def test_busy_extra_repair_cuts_startup_without_delay():
+def test_busy_extra_repair_does_not_drain_startup():
     cc = _cc()
     now = 10.0
     unique = 0
-    for i in range(1, 6):
+    for i in range(1, 12):
         now += 0.20
         unique += int(_CAP * 0.20)
         _feed(cc, now, i, unique, 0.080, extra=0.20)
-    assert cc.phase == DRAIN
-    assert cc.rate < _START * 0.90
+    assert cc.phase != DRAIN
+    assert cc.rate >= _CAP * 0.98
+
+
+def test_oversend_measures_plateau_without_slower_history():
+    """First contact with a cap: unique stays put after a trial cut."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    thin = 200_000_000 / 8
+    for i in range(1, 16):
+        now += 0.12
+        unique += int(thin * 0.12)
+        _feed(cc, now, i, unique, 0.081)
+    assert cc.rate < _CAP * 0.45
+    assert cc.rate == pytest.approx(thin * 1.10, rel=0.30)
+    assert cc.phase in (CRUISE, MEASURE, PROBE)
+
+
+def test_source_done_still_measures_policer():
+    """File fits in the window: source stops, unique plateaus, repair oversend."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    sent = 0
+    frozen_src = 16 * 1048576
+    thin = 90_000_000 / 8
+    for i in range(1, 18):
+        now += 0.12
+        unique += int(thin * 0.12)
+        sent += int(_CAP * 0.12)
+        _feed(cc, now, i, unique, 0.081, sent=sent, source=frozen_src)
+    assert cc.rate < _CAP * 0.45
+    assert cc.rate == pytest.approx(thin * 1.10, rel=0.35)
+
+
+def test_policer_cuts_when_faster_send_buys_no_delivery():
+    """Shaper: unique stays put when send rises. iid loss would track send."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    thin = 200_000_000 / 8
+    # Sit on the cap (no oversend) so the jump to 850 is the elasticity signal.
+    cc.rate = thin * 1.05
+    cc.last_good = cc.rate
+    fb = 1
+    for _ in range(6):
+        now += 0.12
+        unique += int(thin * 0.12)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    for _ in range(8):
+        now += 0.12
+        unique += int(thin * 0.12)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    assert cc.rate < _CAP * 0.45
+    assert cc.rate == pytest.approx(thin * 1.10, rel=0.25)
+
+
+def test_lossy_fat_pipe_does_not_look_like_policer():
+    """23% iid: unique is 0.77× send but still rises when send rises."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    fb = 1
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    for _ in range(14):
+        now += 0.12
+        unique += int(cc.rate * 0.77 * 0.12)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    assert cc.rate == pytest.approx(_CAP, rel=0.08)
+
+
+def test_unique_cliff_is_window_stall_not_a_cap():
+    """HOL/uncoverable: unique was high, then stops. Do not ratchet to 8 Mbit."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    fb = 1
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    for _ in range(10):
+        now += 0.12
+        unique += int(_CAP * 0.90 * 0.12)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    held = cc.rate
+    for _ in range(12):
+        now += 0.12
+        unique += int(8_000_000 / 8 * 0.12)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    assert cc.rate == pytest.approx(held, rel=0.12)
+    assert cc.rate > _CAP * 0.70
+
+
+def test_measure_restores_if_unique_holds_but_decode_is_stuck():
+    """Uncoverable window: unique looks like a thin cap, decoded does not recover."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    fb = 1
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    thin = 200_000_000 / 8
+    stuck = 0
+    for _ in range(20):
+        now += 0.12
+        unique += int(thin * 0.12)
+        _feed(cc, now, fb, unique, 0.081, decoded=stuck)
+        fb += 1
+    assert cc.last_good == pytest.approx(_CAP)
+    assert cc.rate == pytest.approx(_CAP, rel=0.12)
+
+
+def test_window_crawl_at_one_third_start_is_not_a_fat_plateau():
+    """dirty-wan HOL: unique ~0.38×850 with no decode must not lock ~350 Mbit."""
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.cruise_ts = 10.0
+    cc.rtt.n = 20
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.min_rtt = 0.08
+    now = 10.0
+    unique = 0
+    fb = 1
+    cc.rate = _CAP
+    cc.last_good = _CAP
+    crawl = int(_CAP * 0.38)
+    for _ in range(20):
+        now += 0.12
+        unique += int(crawl * 0.12)
+        _feed(cc, now, fb, unique, 0.081, decoded=0)
+        fb += 1
+    assert cc.last_good == pytest.approx(_CAP)
+    assert cc.rate == pytest.approx(_CAP, rel=0.12)
 
 
 def test_cruise_ceiling_does_not_repin_to_start_after_cut():
@@ -205,6 +414,109 @@ def test_cruise_ceiling_does_not_repin_to_start_after_cut():
     ceiling = cc._rate_ceiling()
     assert ceiling < _START
     assert ceiling >= cc.rate
+
+
+def test_probe_reverts_if_faster_send_buys_no_delivery():
+    cc = _cc()
+    cc.phase = CRUISE
+    cc.rate = _CAP * 0.8
+    cc.last_good = cc.rate
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    now = 5.0
+    unique = int(_CAP * 0.8)
+    _feed(cc, now, 1, unique, 0.08)
+    assert cc.phase == PROBE
+    base = cc.probe_base
+    fb = 2
+    while now < cc.probe_until:
+        now += 0.05
+        unique += int(base * 0.05)
+        _feed(cc, now, fb, unique, 0.081)
+        fb += 1
+    unique += int(base * 0.05)
+    _feed(cc, cc.probe_until + 0.01, fb, unique, 0.081)
+    assert cc.phase == CRUISE
+    assert cc.rate == pytest.approx(base)
+
+
+def test_search_seeds_at_stall_floor_not_channel_guess():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    assert cc.rate == pytest.approx(start)
+    assert cc.phase == STARTUP
+
+
+def test_startup_climbs_above_start_toward_search_cap():
+    start = 8_000_000 / 8
+    cap = 10_000_000_000 / 8
+    cc = BlastCc(max_bps=cap, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    now = 1.0
+    unique = 0
+    for i in range(1, 24):
+        now += 0.20
+        unique += int(cc.rate * 0.20)
+        _feed(cc, now, i, unique, 0.080)
+    assert cc.rate > 850_000_000 / 8
+    assert cc.rate <= cap
+
+
+def test_startup_does_not_pin_ceiling_to_start():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    # One step is allowed; the 10 Gbit search cap stays closed until unique.
+    assert cc._rate_ceiling() > start
+    assert cc._rate_ceiling() < start * 4
+
+
+def test_startup_does_not_open_search_cap_before_unique():
+    start = 8_000_000 / 8
+    cap = 10_000_000_000 / 8
+    cc = BlastCc(max_bps=cap, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    now = 1.0
+    for _ in range(8):
+        now += 0.12
+        cc.on_timer(now)
+    assert cc.rate < 200_000_000 / 8
+
+
+def test_startup_ceiling_tracks_unique_not_burst_times_gain():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    burst = 900_000_000 / 8
+    cc.bw.observe(burst * 0.90)
+    cc.bw.observe(burst * 0.95)
+    cc.bw.observe(burst)
+    assert cc._startup_ceiling() < burst * 1.50
+    assert cc._startup_ceiling() < 2_000_000_000 / 8
+
+
+def test_overshoot_then_unique_cliff_is_still_oversend():
+    """Spain: 2.8 Gbit blast, unique cliffs. That is overshoot, not HOL."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.rate = 2_800_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_unique = 8 * 1048576
+    cc.last_delivery = 40_000_000 / 8
+    absorbed = 900_000_000 / 8
+    cc.bw.observe(absorbed * 0.9)
+    cc.bw.observe(absorbed * 0.95)
+    cc.bw.observe(absorbed)
+    assert cc._pipe_oversend() is True
 
 
 def test_probe_can_raise_above_start_without_channel_cap():
@@ -258,3 +570,71 @@ def test_stamp_overwrites_encode_age():
     stamp_data_wires(wires, 99)
     pkt = parse_packet(bytes(wires[0]))
     assert pkt.send_ts_us == 99
+
+
+def test_window_pause_high_rtt_does_not_drain_startup():
+    """Spain run 4: encode pause + unique cliff looked like a standing queue."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    now = 10.0
+    unique = 0
+    fat = 900_000_000 / 8
+    for i in range(1, 12):
+        now += 0.12
+        unique += int(fat * 0.12)
+        _feed(cc, now, i, unique, 0.080, sent=int(fat * (now - 10.0)))
+    held = cc.rate
+    assert held > 400_000_000 / 8
+    paused_sent = int(fat * (now - 10.0))
+    for i in range(12, 24):
+        now += 0.12
+        unique += int(fat * 0.12 * 0.20)
+        _feed(cc, now, i, unique, 0.160, sent=paused_sent)
+    assert cc.phase != DRAIN
+    assert cc.rate > held * 0.70
+
+
+def test_drain_does_not_compound_below_unique():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    absorbed = 1_000_000_000 / 8
+    cc.rate = 1_347_000_000 / 8
+    cc.last_good = cc.rate
+    cc.bw.observe(absorbed * 0.90)
+    cc.bw.observe(absorbed * 0.95)
+    cc.bw.observe(absorbed)
+    first = cc._drain_target()
+    # Floor is filtered unique × 1.10, not another 0.75× off the limiter.
+    assert first >= absorbed * 0.95 * 1.10 * 0.99
+    cc.rate = first
+    second = cc._drain_target()
+    assert second >= first * 0.99
+
+
+def test_probe_keeps_when_unique_rose_even_if_decode_flat():
+    cc = _cc()
+    cc.phase = CRUISE
+    base = _CAP * 0.5
+    cc.rate = base
+    cc.last_good = base
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    now = 5.0
+    unique = int(base)
+    decoded = unique
+    _feed(cc, now, 1, unique, 0.08, decoded=decoded)
+    assert cc.phase == PROBE
+    fb = 2
+    while now < cc.probe_until:
+        now += 0.05
+        unique += int(cc.rate * 0.05)
+        _feed(cc, now, fb, unique, 0.081, decoded=decoded)
+        fb += 1
+    unique += int(cc.rate * 0.05)
+    _feed(cc, cc.probe_until + 0.01, fb, unique, 0.081, decoded=decoded)
+    assert cc.phase == CRUISE
+    assert cc.rate > base

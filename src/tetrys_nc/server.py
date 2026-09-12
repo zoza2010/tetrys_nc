@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="rate_mbit",
         help="lock UDP send rate in Mbit/s (disables rate search). "
-        "Omit to search from 850 Mbit, cap 10000 Mbit",
+        "Omit to search from the stall floor after the first RTT",
     )
     p.add_argument(
         "--ramp-s",
@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "lock RaptorQ repair percent (disables auto FEC). "
-            "Omit to run adaptive FEC from 12 percent, floor 4, cap 32"
+            "Omit to sound cover-max, then lock FEC from first-flight need"
         ),
     )
     args = p.parse_args(argv)

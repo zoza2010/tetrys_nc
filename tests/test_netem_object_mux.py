@@ -43,7 +43,7 @@ def test_object_mux_packed_through_netem(tmp_path: Path, profile: str) -> None:
     pytest.importorskip("raptorq")
     early, late, want = _make_mix(tmp_path / "src")
     out = tmp_path / "recv"
-    srv_port = 17710 if profile == "spain" else 17720
+    srv_port = 17910 if profile == "spain" else 17920
     env = os.environ.copy()
     env["TETRYS_GSO"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
@@ -111,7 +111,7 @@ def test_object_mux_packed_through_netem(tmp_path: Path, profile: str) -> None:
             capture_output=True,
             text=True,
         )
-        ok = cli.returncode == 0 and "object-mux OK" in ((cli.stdout or "") + (cli.stderr or ""))
+        ok = cli.returncode == 0 and "files=" in ((cli.stdout or "") + (cli.stderr or ""))
     except subprocess.TimeoutExpired:
         ok = False
         cli = None

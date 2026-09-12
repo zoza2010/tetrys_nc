@@ -172,3 +172,68 @@ def test_extreme_profiles_transfer_8m(tmp_path: Path, profile: str) -> None:
     assert ok, f"{profile} did not complete\n{emu[-400:]}\n{srv[-400:]}"
     assert "done in" in srv, srv[-800:]
     assert valid, f"{profile} netem invalid\n{emu[-400:]}"
+
+
+def _ensure_blob_32m() -> Path:
+    blob = ROOT / "testdata" / "blob_32m.bin"
+    if not blob.is_file():
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "sim.genfile",
+                "--output",
+                str(blob),
+                "--size",
+                "32M",
+            ],
+            cwd=ROOT,
+        )
+    return blob
+
+
+def test_cc_search_starts_at_floor_and_tracks_shaper(tmp_path: Path) -> None:
+    """Omit --rate: seed 8 Mbit, then sit near the 90 Mbit drop-shaper."""
+    pytest.importorskip("raptorq")
+    from tetrys_nc.block_state import parse_done_metrics
+
+    blob = _ensure_blob_32m()
+    ok, srv, emu = _run_through_netem(
+        tmp_path,
+        blob,
+        "shaper",
+        srv_port=17840,
+        timeout=90,
+        rate=None,
+        extra_env={"TETRYS_FEC_MODE": "quantile"},
+    )
+    assert ok, f"shaper CC search failed\n{emu[-400:]}\n{srv[-800:]}"
+    assert "start=8Mbit" in srv
+    assert "cc=blast" in srv
+    got = parse_done_metrics(srv)
+    assert got is not None, srv[-800:]
+    assert got.pace_med < 200.0, srv[-800:]
+    assert got.pace_med > 40.0, srv[-800:]
+
+
+def test_cc_search_tracks_fatter_shaper(tmp_path: Path) -> None:
+    pytest.importorskip("raptorq")
+    from tetrys_nc.block_state import parse_done_metrics
+
+    blob = ROOT / "testdata" / "blob_64m.bin"
+    if not blob.is_file():
+        blob = _ensure_blob_32m()
+    ok, srv, emu = _run_through_netem(
+        tmp_path,
+        blob,
+        "shaper-wan",
+        srv_port=17850,
+        timeout=90,
+        rate=None,
+        extra_env={"TETRYS_FEC_MODE": "quantile"},
+    )
+    assert ok, f"shaper-wan CC search failed\n{emu[-400:]}\n{srv[-800:]}"
+    got = parse_done_metrics(srv)
+    assert got is not None, srv[-800:]
+    assert got.pace_med > 150.0, srv[-800:]
+    assert got.goodput_mib > 15.0, srv[-800:]

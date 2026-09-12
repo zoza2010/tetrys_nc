@@ -30,7 +30,7 @@ def _run_through_netem(
     *,
     srv_port: int,
     timeout: int,
-    rate: str = "200",
+    rate: str | None = "200",
     extra_env: dict[str, str] | None = None,
     gen_overhead: str | None = None,
 ) -> tuple[bool, str, str]:
@@ -51,13 +51,13 @@ def _run_through_netem(
         "--port",
         str(srv_port),
         "--skip-hash",
-        "--rate",
-        rate,
         "--ramp-s",
         "0.2",
         "--gen-k",
         "48",
     ]
+    if rate is not None:
+        srv_cmd.extend(["--rate", rate])
     if gen_overhead is not None:
         srv_cmd.extend(["--gen-overhead", gen_overhead])
     srv = subprocess.Popen(
