@@ -1088,6 +1088,21 @@ def test_quantile_fec_sparse_dir_tail_does_not_up():
     assert ctl.current <= 12
 
 
+def test_quantile_fec_floor_walks_on_p95_when_p75_is_zero():
+    """Spain 2026-09-13: hold p95=28% at 4% because p75 stayed 0. Must leave 4%."""
+    ctl = make_fec_controller(4, mode="quantile", floor_pct=4)
+    close = make_block_sample(_fec_state(950, extra=0, initial_repair=31), 768, tail=False)
+    stuck = make_block_sample(
+        _fec_state(620, initial_repair=31, extra=200, rounds=1),
+        768,
+        tail=False,
+    )
+    assert (stuck.needed_repair_pct or 0) > 18
+    for i in range(FEC_MIN_TRAIN + 4):
+        ctl.observe_block(stuck if i % 3 == 0 else close)
+    assert ctl.current > 4
+
+
 def test_quantile_fec_jumps_up_on_storm_dir():
     ctl = make_fec_controller(4, mode="quantile", floor_pct=4)
     assert ctl.current == 4

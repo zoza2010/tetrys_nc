@@ -192,18 +192,36 @@ def _ensure_blob_32m() -> Path:
     return blob
 
 
+def _ensure_blob_64m() -> Path:
+    blob = ROOT / "testdata" / "blob_64m.bin"
+    if not blob.is_file():
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "sim.genfile",
+                "--output",
+                str(blob),
+                "--size",
+                "64M",
+            ],
+            cwd=ROOT,
+        )
+    return blob
+
+
 def test_cc_search_starts_at_floor_and_tracks_shaper(tmp_path: Path) -> None:
     """Omit --rate: seed 8 Mbit, then sit near the 90 Mbit drop-shaper."""
     pytest.importorskip("raptorq")
     from tetrys_nc.block_state import parse_done_metrics
 
-    blob = _ensure_blob_32m()
+    blob = _ensure_blob_64m()
     ok, srv, emu = _run_through_netem(
         tmp_path,
         blob,
         "shaper",
         srv_port=17840,
-        timeout=90,
+        timeout=120,
         rate=None,
         extra_env={"TETRYS_FEC_MODE": "quantile"},
     )
@@ -212,17 +230,18 @@ def test_cc_search_starts_at_floor_and_tracks_shaper(tmp_path: Path) -> None:
     assert "cc=blast" in srv
     got = parse_done_metrics(srv)
     assert got is not None, srv[-800:]
+    # 32 MiB finished while still on two-block fill (~209 Mbit). 64 MiB
+    # is long enough for the 90 Mbit policer to show up in the median.
     assert got.pace_med < 200.0, srv[-800:]
     assert got.pace_med > 40.0, srv[-800:]
+    assert got.pace_p10 < 160.0, srv[-800:]
 
 
 def test_cc_search_tracks_fatter_shaper(tmp_path: Path) -> None:
     pytest.importorskip("raptorq")
     from tetrys_nc.block_state import parse_done_metrics
 
-    blob = ROOT / "testdata" / "blob_64m.bin"
-    if not blob.is_file():
-        blob = _ensure_blob_32m()
+    blob = _ensure_blob_64m()
     ok, srv, emu = _run_through_netem(
         tmp_path,
         blob,

@@ -561,6 +561,10 @@ class QuantileFecController:
         return min(max(0, delta), cap)
 
     def _skip_outlier(self, needed_pct: float) -> bool:
+        # At the floor a 48% stuck-window sample is the undercover signal,
+        # not an outlier. Skipping it left Spain at 4% / close 67% / 39 MiB/s.
+        if self.current <= self.min_pct:
+            return False
         if len(self.needed) < FEC_MIN_TRAIN:
             return False
         p95 = percentile(list(self.needed), 95) or 0.0
@@ -683,6 +687,24 @@ class QuantileFecController:
                 self.reason = (
                     f"{why} p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current}"
                 )
+                return self.current
+        # Stuck window: completed-block p75 stays 0 while p95 already shows
+        # 28% need. Walk one level from the floor so 4% does not HOL the path.
+        if (
+            allow_up
+            and self.current <= self.min_pct
+            and q > self.current
+            and saw_repair
+        ):
+            nxt_idx = min(
+                self.level_idx + 1,
+                fec_level_index(q, min_pct=self.min_pct, max_pct=cover),
+            )
+            if nxt_idx > self.level_idx:
+                self.level_idx = nxt_idx
+                self.clean_n = 0
+                self.probe_fail_at = -1
+                self.reason = f"up-floor p95={q:.1f} -> {self.current}"
                 return self.current
         # Storm already zeroed clean_n on the way up. One-round DIR (pad,
         # reorder) must not freeze a high level after the path goes quiet.
