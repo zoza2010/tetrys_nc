@@ -491,6 +491,7 @@ class BlockSender:
                 window_full=len(self.active) >= self.geometry.active_blocks,
                 sent_bytes=self.source_wire_total + self.repair_wire_total,
                 source_bytes=self.source_wire_total,
+                path_loss=self.repair_ctl.path_loss_q(50),
             )
         )
         for line in cc.pull_events():

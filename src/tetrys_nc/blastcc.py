@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .block_state import WAN_ACTIVE_BYTES
+from .block_state import FEC_COVER_MAX, WAN_ACTIVE_BYTES, cover_loss_p
 
 STARTUP = "startup"
 DRAIN = "drain"
@@ -34,8 +34,10 @@ _MIN_RTT_HOLD_S = 10.0
 _MIN_RTT_SAMPLES = 8
 _SRTT_ALPHA = 0.125
 _STARTUP_GAIN = 2.0 / math.log(2)
-# Once unique exists, send at most this times delivery. 2.88× a burst
-# sample is how Spain jumped 900 Mbit → 2.8 Gbit and never recovered.
+# BBR Startup: 2.89× BtlBw while unique has not yet tracked send (pipe
+# filling from 8 Mbit). After a fat sample, walk 1.25× — a second 2.89×
+# jump (557→1610) on a dropper has no queue to absorb it. 1.15× unique
+# from the first fat sample crawled Spain to a unique-lock at 810.
 _STARTUP_FOLLOW = 1.35
 # Coverable iid: unique is ~0.77×send, so 1.35×unique barely climbs.
 # Track a growing filter faster; stall-exit stops a 2 Gbit walk.
@@ -81,6 +83,7 @@ _BW_MIN_SAMPLES = 3
 # FEC max 32% covers ~24% path loss → unique/send ≈ 0.76. Slack for ACK
 # noise. Below this, unique is too thin to be coverable iid.
 _IID_RATIO = 0.70
+_COVERABLE_P = cover_loss_p(FEC_COVER_MAX)
 # Unique-ESI rate is delivered payload. Send much faster than that with a
 # flat RTT is a policer. extra/DIR is FEC's job, not a rate cut.
 _POLICER_GAIN = 1.20
@@ -181,12 +184,14 @@ class BlastCc:
     probe_base: float = 0.0
     last_fb: int = -1
     last_extra: float = 0.0
+    last_path_loss: float | None = None
     last_sent: int = 0
     last_send_rate: float = 0.0
     last_source: int = 0
     last_source_rate: float = 0.0
     have_source: bool = False
     send_samples: list[tuple[float, float]] = field(default_factory=list)
+    path_samples: list[tuple[float, float]] = field(default_factory=list)
     measure_restore: float = 0.0
     measure_good: float = 0.0
     measure_delivery: float = 0.0
@@ -267,14 +272,7 @@ class BlastCc:
         ref = bw
         if 0 < self.last_delivery <= bw * 1.50:
             ref = max(ref, self.last_delivery)
-        if self.was_fat:
-            follow = _DELIVERY_HEADROOM
-        elif self._fat_pipe() or self.rate <= ref * _DELIVERY_HEADROOM:
-            follow = _DELIVERY_HEADROOM
-        elif self._iid_like():
-            follow = _STARTUP_TRACK
-        else:
-            follow = _STARTUP_FOLLOW
+        follow = self._startup_gain()
         return min(hard, max(self.min_bps, ref * follow))
 
     def _startup_ceiling(self) -> float:
@@ -292,19 +290,11 @@ class BlastCc:
         bw = self.bw.max_bw
         if bw is None:
             return hard
-        if self.was_fat:
-            follow = _DELIVERY_HEADROOM
-        elif self._fat_pipe() or self.rate <= bw * _DELIVERY_HEADROOM:
-            follow = _DELIVERY_HEADROOM
-        else:
-            follow = _STARTUP_TRACK
-        cap = bw * follow
-        # After loss grew with send, stop probing past the last clean rate.
-        # Do not pin startup climb to the first 8 Mbit 0%-loss sample.
         if self.saw_loss_knee:
             knee = self._knee_bps()
-            if knee is not None:
-                cap = min(cap, knee)
+            cap = knee if knee is not None else bw
+        else:
+            cap = bw * self._startup_gain()
         return min(hard, max(self.min_bps, cap))
 
     def _note_bw(self, settled: bool) -> None:
@@ -316,6 +306,21 @@ class BlastCc:
             self.bw_stall_n = 0
         elif settled:
             self.bw_stall_n += 1
+
+    def _startup_gain(self) -> float:
+        """BBR 2.89× while BtlBw is still growing. One lagged unique sample
+        after a step is not 'pipe full' — that 1.15× crawl sat at 50 Mbit.
+        """
+        self._fat_pipe()
+        dirty = not self._clean_pipe()
+        stalled = self.bw_stall_n >= _BW_STALL
+        if dirty and self.was_fat and stalled:
+            return _DELIVERY_HEADROOM
+        if dirty and self._iid_like():
+            return _STARTUP_TRACK
+        if stalled:
+            return _STEP_MAX
+        return _STARTUP_GAIN
 
     def _startup_bw_stalled(self, settled: bool) -> bool:
         """Delivery stopped growing: C is in the filter, stop the 2 Gbit walk."""
@@ -339,10 +344,18 @@ class BlastCc:
         return ok
 
     def _clean_pipe(self) -> bool:
-        """Send is still in the ~0% region (lock-900), not iperf 1000/5%."""
+        """Send is still in the ~0% region (lock-900), not iperf 1000/5%.
+
+        Prefer first-flight path loss when the receiver has trained: unique
+        lag/HOL looks like 15% ESI loss while first-flight is still ~0.
+        """
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
         got = self.last_delivery
-        if got <= 0 or send <= 0 or self._unique_cliff():
+        if send <= 0 or self._unique_cliff() or self._send_paused():
+            return False
+        if self.last_path_loss is not None:
+            return self.last_path_loss < _LOSS_NOISE
+        if got <= 0:
             return False
         return got >= send * _CLEAN_RATIO
 
@@ -353,12 +366,26 @@ class BlastCc:
         """
         if not self.was_fat or self._unique_cliff() or self._send_paused():
             return False
+        if self.last_extra >= 0.20:
+            return False
         if self.bw_stall_n < _BW_STALL:
             return False
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
         got = self.last_delivery
         if send <= 0 or got <= 0:
             return False
+        # Unique already faster than the limiter: still filling from 8 Mbit.
+        # WAN locked 179 while unq=227 / snd=264 (path 0%).
+        if self.rate > 0 and got > self.rate * 1.10:
+            return False
+        if not self._clean_pipe() and self.knee_bps <= 0:
+            bw = self.bw.max_bw
+            # HOL/measure trickle: unique well behind send. A 1.15× hunt
+            # above a stalled unique is the 0% C plateau.
+            if bw is None or got < bw * 0.90:
+                return False
+            if send > got * 1.40:
+                return False
         return True
 
     def _locked_c(self) -> bool:
@@ -420,6 +447,8 @@ class BlastCc:
             f"cc_trace {msg} phase={self.phase} rate={mbit:.0f} "
             f"snd={snd:.0f} unq={unq:.0f} bw={bw_m:.0f} "
             f"good={self.last_good * 8 / 1_000_000:.0f} "
+            f"knee={self.knee_bps * 8 / 1_000_000:.0f} "
+            f"path={(self.last_path_loss or 0.0) * 100:.1f}% "
             f"lag={int(self.recv_lag)} ov={int(self._pipe_oversend())}"
         )
 
@@ -607,10 +636,14 @@ class BlastCc:
         """
         if self._unique_cliff() or self._send_paused():
             return False
-        # A 1.15× startup step with ACK lag looks like 13% loss. Wait until
-        # cruise/probe: unique has plateaued, then a faster send is C.
-        if self.phase == STARTUP:
+        # First-flight still ~0: unique lag is HOL/ACK, not the dropper.
+        # WAN locked 40 Mbit at snd=267/unq=240/path=0%.
+        if self.last_path_loss is not None and self.last_path_loss < _LOSS_KNEE:
             return False
+        # A 1.15× startup step with ACK lag looks like 13% loss. First-flight
+        # loss still lets Startup lock last-clean-send like BBR v2 (high
+        # loss → exit Startup). Unique lag without path_loss stays filtered
+        # by _LOSS_KEEPUP.
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
         got = self.last_delivery
         if send <= 0 or got <= 0:
@@ -630,10 +663,47 @@ class BlastCc:
             return False
         return loss_now >= _LOSS_KNEE and loss_now >= loss_old + _LOSS_KNEE
 
+    def _path_loss_grew(self) -> bool:
+        """First-flight p rose with send: dropper C, not HOL unique lag.
+
+        Coverable iid (flat p at every rate, p ≲ 24%) is FEC's job.
+        """
+        if self.last_path_loss is None:
+            return False
+        if self._unique_cliff() or self._send_paused():
+            return False
+        p = self.last_path_loss
+        if p < _LOSS_KNEE:
+            return False
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        slower = [
+            pl for s, pl in self.path_samples if 0 < s < send * 0.92
+        ]
+        if len(slower) >= 2:
+            old = min(slower)
+            # Already noisy at a slower send: coverable iid, FEC's job.
+            # Only the 0% → 3%+ step is the dropper knee.
+            if old >= _LOSS_NOISE:
+                return False
+            if p >= _LOSS_KNEE:
+                return True
+            return False
+        if (
+            self.knee_bps > 0
+            and send > self.knee_bps * 1.05
+            and p >= _LOSS_KNEE
+            and p <= _COVERABLE_P
+        ):
+            return True
+        return False
+
     def _note_loss_knee(self, now: float) -> None:
-        hit = self.phase != STARTUP and (
-            self._should_lock_c() or self._dropper_knee_sample()
-        )
+        if self.phase in (MEASURE, DRAIN):
+            return
+        hit = self._dropper_knee_sample() or self._path_loss_grew()
+        if self.last_extra >= 0.20 and self.knee_bps <= 0:
+            # Window-busy HOL is not C. First-flight still may be.
+            hit = self._path_loss_grew()
         if hit:
             self.loss_knee_n += 1
         else:
@@ -644,39 +714,60 @@ class BlastCc:
             self.saw_loss_knee = True
 
     def _c_lock_bps(self) -> float | None:
-        """Rate to sit at once unique no longer keeps up.
+        """Sit on the last ~0% send, like `--rate 900`.
 
-        Unique fell vs the filter (Spain snd=1182/unq=845, bw=1017): lock
-        live unique — that is recv C. Unique still tracking send into a
-        leaky dropper (sim 1233/1121): lock the last 0.99 latch, not unique.
-        Never sit above live unique: Spain lock-1040 / unq=952 was the 5%
-        fringe (FEC 18%, first_close 89%) vs lock-900 at 4%/98%.
+        Unique is recv after the dropper (Spain lock-810 / unq=810 vs
+        lock-900). A HOL unique dip is not a lower C. Only use live
+        unique when nothing clean was latched.
         """
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
         delivery = self.last_delivery
         bw = self.bw.max_bw
-        if self._clean_pipe() and send > 0:
-            knee = min(send, self.rate) if self.rate > 0 else send
-        elif (
-            delivery > 0
-            and bw is not None
-            and delivery < bw * _CLEAN_RATIO
+        knee = self._last_clean_send()
+        # 8 Mbit 0.99 latch vs unique 260 is a ramp leftover, not C.
+        floor = max(self.min_bps, self.start_bps) * 4
+        if (
+            knee is not None
+            and delivery > 0
+            and knee <= floor
+            and knee < delivery * 0.50
             and not self._unique_cliff()
         ):
-            knee = delivery
-        elif self.knee_bps > 0:
-            knee = self.knee_bps
-        elif delivery > 0:
-            knee = delivery
-        else:
-            knee = bw
+            knee = None
+        if knee is None or knee <= 0:
+            tracking = (
+                delivery > 0
+                and send > 0
+                and not self._unique_cliff()
+                and delivery >= send * _IID_RATIO
+            )
+            if tracking and (self._clean_pipe() or delivery >= send * _IID_RATIO):
+                knee = send
+                if self.rate > 0 and self.rate >= send * 0.85:
+                    knee = min(send, self.rate)
+            elif delivery > 0 and not self._unique_cliff():
+                knee = delivery
+            else:
+                knee = bw
         if knee is None or knee <= 0:
             return None
-        if delivery > 0 and not self._clean_pipe():
-            knee = min(knee, delivery)
-        if send > 0 and knee > send:
+        if (
+            send > 0
+            and knee > send * 1.10
+            and not self._send_paused()
+            and not self._unique_cliff()
+        ):
             knee = send
         return knee
+
+    def _last_clean_send(self) -> float | None:
+        if self.knee_bps > 0:
+            return self.knee_bps
+        best: float | None = None
+        for send, got in self.send_samples:
+            if send > 0 and got / send >= _KNEE_GOOD_RATIO:
+                best = send if best is None else max(best, send)
+        return best
 
     def _lock_knee(self, now: float) -> None:
         """Sit like `--rate`. Do not keep probing C."""
@@ -684,8 +775,8 @@ class BlastCc:
         if knee is None or knee <= 0:
             return
         self.knee_bps = knee
-        self.rate = min(self.rate, knee) if self.rate > 0 else knee
-        self.last_good = self.rate
+        self.rate = knee
+        self.last_good = knee
         self.saw_loss_knee = True
         self._enter_cruise(now, take_rate=False)
         self._emit("loss_knee_lock")
@@ -718,8 +809,20 @@ class BlastCc:
         # GRO/ACK burst (snd=1100 at limiter 855) is not a higher C.
         if self.rate > 0 and send > self.rate * 1.10:
             return
+        if self.last_path_loss is not None and self.last_path_loss >= _LOSS_KNEE:
+            return
         if got / send >= _KNEE_GOOD_RATIO:
             self.knee_bps = max(self.knee_bps, min(send, self.rate))
+
+    def _note_path_sample(self) -> None:
+        if self.last_path_loss is None:
+            return
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        if send <= 0:
+            return
+        self.path_samples.append((send, self.last_path_loss))
+        if len(self.path_samples) > _BW_WINDOW:
+            del self.path_samples[0]
 
     def _over_delivery(self, *, window_full: bool) -> bool:
         """Policer from elasticity: faster send did not raise unique.
@@ -777,6 +880,8 @@ class BlastCc:
         self.saw_loss_knee = False
         self.loss_knee_n = 0
         self.send_samples.clear()
+        self.path_samples.clear()
+        self.last_path_loss = None
 
     def _cut_to_delivery(self, now: float, *, remember: bool = True) -> None:
         if self._locked_c():
@@ -954,7 +1059,9 @@ class BlastCc:
             return self.rate
         if now - self.last_step_ts >= self._step_s():
             self.last_step_ts = now
-            self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
+            bw = self.bw.max_bw or self.rate
+            aimed = bw * self._startup_gain()
+            self.rate = min(ceiling, max(self.rate, aimed))
         return self.rate
 
     def _observe_delivery(
@@ -1034,6 +1141,7 @@ class BlastCc:
         window_full: bool,
         sent_bytes: int = 0,
         source_bytes: int = 0,
+        path_loss: float | None = None,
     ) -> float:
         if feedback_id <= self.last_fb:
             return self.rate
@@ -1041,11 +1149,15 @@ class BlastCc:
         raw_rtt = rtt_from_echo(now, echo_ts_us)
         qdelay = self.rtt.observe(now, raw_rtt)
         self.min_rtt = self.rtt.min_rtt
+        if path_loss is not None:
+            self.last_path_loss = max(0.0, min(1.0, float(path_loss)))
+        self.last_extra = extra_frac
         self._observe_delivery(
             now, unique_bytes, decoded_bytes, sent_bytes, source_bytes
         )
+        self._note_path_sample()
+        self._fat_pipe()
         self._note_loss_knee(now)
-        self.last_extra = extra_frac
         if self._unique_cliff() and self.recv_lag:
             self.cliff_n += 1
         elif self._limiter_stale() and self.recv_lag:
@@ -1123,10 +1235,9 @@ class BlastCc:
                 self._enter_cruise(now)
             elif self._startup_bw_stalled(settled) and not starved:
                 bw = self.bw.max_bw or self.rate
-                # Fat + unique no longer keeping up: that is C. Lock now so
-                # cruise cannot probe 1.10× into the dropper (Spain 1015→1098,
-                # FEC stuck at 18%). A clean plateau still enters cruise.
-                if self._should_lock_c():
+                # Unique stall at 180 Mbit is still filling from 8, not C.
+                # Freeze only when first-flight / dropper loss grew.
+                if self._path_loss_grew() or self._dropper_knee_sample():
                     self._emit("startup_stall")
                     self._lock_knee(now)
                 else:
@@ -1140,7 +1251,9 @@ class BlastCc:
                     self._enter_cruise(now, take_rate=not self.recv_lag)
             elif now - self.last_step_ts >= step_s:
                 self.last_step_ts = now
-                self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
+                bw = self.bw.max_bw or self.rate
+                aimed = bw * self._startup_gain()
+                self.rate = min(ceiling, max(self.rate, aimed))
         elif self.phase == DRAIN:
             drained_long = now - self.drain_ts >= _DRAIN_MAX_S
             if policer:
@@ -1204,7 +1317,7 @@ class BlastCc:
                 self._emit("cruise_cliff_cut")
             elif settled and oversend_held:
                 self._start_measure(now)
-            elif self._should_lock_c():
+            elif self._path_loss_grew() or self._loss_grew():
                 self._lock_knee(now)
             elif (
                 not self.saw_loss_knee

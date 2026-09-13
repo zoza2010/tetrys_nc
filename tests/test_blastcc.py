@@ -12,6 +12,7 @@ from tetrys_nc.blastcc import (
     STARTUP,
     BlastCc,
     BwFilter,
+    _STARTUP_GAIN,
     rtt_from_echo,
 )
 from tetrys_nc.block_packets import pack_data_packets, parse_packet, stamp_data_wires
@@ -38,6 +39,7 @@ def _feed(
     decoded: int | None = None,
     sent: int = 0,
     source: int = 0,
+    path_loss: float | None = None,
 ) -> float:
     return cc.on_feedback(
         now,
@@ -49,6 +51,7 @@ def _feed(
         window_full=True,
         sent_bytes=sent,
         source_bytes=source,
+        path_loss=path_loss,
     )
 
 
@@ -83,26 +86,45 @@ def test_fec_may_lower_only_in_settled_cruise():
     assert cc.fec_may_lower_floor is True
 
 
-def test_fat_startup_ceiling_stays_near_unique():
-    """`--rate 900` + auto FEC → 8%. CC must not 1.50× that unique."""
+def test_startup_gain_is_bbr_until_fat():
+    """Empty pipe: 2.89× BtlBw. After unique tracks send, walk 1.25×."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    filling = 200_000_000 / 8
+    cc.rate = filling * 2.0
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = filling
+    for x in (filling * 0.95, filling, filling * 1.02):
+        cc.bw.observe(x)
+    assert cc._fat_pipe() is False
+    assert cc._startup_search_cap(cc.max_bps) >= filling * 2.5
+    assert cc._startup_gain() == pytest.approx(_STARTUP_GAIN)
+
+
+def test_fat_startup_ceiling_walks_not_jump():
+    """`--rate 900` + auto FEC. 2.89× until stall; dirty stall 1.15×."""
     start = 850_000_000 / 8
     cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
     cc.min_rtt = 0.08
     burst = 900_000_000 / 8
-    cc.rate = burst * 0.90
-    cc.last_send_rate = cc.rate
+    cc.rate = burst
+    cc.last_send_rate = burst
     cc.last_delivery = burst
     for x in (burst * 0.95, burst, burst * 1.02):
         cc.bw.observe(x)
-    assert cc._startup_search_cap(cc.max_bps) <= burst * 1.20
-    assert cc._raise_ceiling() <= burst * 1.20
+    assert cc._fat_pipe() is True
+    assert cc._startup_gain() == pytest.approx(_STARTUP_GAIN)
+    cc.bw_stall_n = 3
+    assert cc._startup_search_cap(cc.max_bps) <= burst * 1.30
+    assert cc._raise_ceiling() <= burst * 1.30
     cc.phase = STARTUP
     assert cc.fec_may_lower is True
     assert cc.fec_may_lower_floor is True
-    # Edging the limiter above unique must not open 1.50×.
     cc.rate = burst * 1.12
     cc.last_send_rate = cc.rate
     cc.was_fat = True
+    assert cc._clean_pipe() is False
     assert cc._startup_search_cap(cc.max_bps) <= burst * 1.20
     assert cc._raise_ceiling() <= burst * 1.20
 
@@ -619,6 +641,7 @@ def test_startup_does_not_open_search_cap_before_unique():
 
 
 def test_startup_ceiling_tracks_unique_not_burst_times_gain():
+    """GRO/ACK 2 Gbit unique is not C. Ceiling follows filtered bw, 2.89×."""
     start = 8_000_000 / 8
     cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
     burst = 900_000_000 / 8
@@ -626,8 +649,9 @@ def test_startup_ceiling_tracks_unique_not_burst_times_gain():
     cc.bw.observe(burst * 0.95)
     cc.bw.observe(burst)
     cc.last_delivery = 2_000_000_000 / 8
-    assert cc._startup_ceiling() <= burst * 1.20
-    assert cc._startup_ceiling() < 2_000_000_000 / 8
+    cap = cc._startup_ceiling()
+    assert cap <= burst * _STARTUP_GAIN * 1.02
+    assert cap < (2_000_000_000 / 8) * _STARTUP_GAIN
 
 
 def test_first_window_unique_is_not_oversend():
@@ -920,6 +944,11 @@ def _simulate_path(
         unique += max(1, int(delivered * dt))
         decoded += max(0, int(dec * dt))
         sent += max(1, int(send * dt))
+        if hol:
+            # First-flight of already-trained blocks stays quiet; unique cliffs.
+            path_loss = 0.0
+        else:
+            path_loss = 0.0 if send <= 0 else max(0.0, 1.0 - delivered / send)
         _feed(
             cc,
             now,
@@ -929,6 +958,7 @@ def _simulate_path(
             decoded=decoded,
             sent=sent,
             source=sent,
+            path_loss=path_loss,
         )
         fb += 1
         rates.append(cc.rate)
@@ -997,6 +1027,25 @@ def test_loss_grew_ignores_encode_lag_not_dropper():
     assert cc._loss_grew() is False
 
 
+def test_dropper_knee_ignores_unique_lag_when_first_flight_quiet():
+    """WAN: snd=267 unq=240 path=0 is ACK lag, not C=40."""
+    cc = _search_cc()
+    cc.phase = STARTUP
+    cc.was_fat = True
+    cc.knee_bps = 40_000_000 / 8
+    cc.rate = 40_000_000 / 8
+    cc.last_send_rate = 267_000_000 / 8
+    cc.last_delivery = 240_000_000 / 8
+    cc.last_path_loss = 0.0
+    cc.send_samples = [
+        (30_000_000 / 8, 30_000_000 / 8),
+        (35_000_000 / 8, 35_000_000 / 8),
+        (40_000_000 / 8, 40_000_000 / 8),
+    ]
+    assert cc._dropper_knee_sample() is False
+    assert cc._path_loss_grew() is False
+
+
 def test_should_lock_c_when_unique_stalled_and_send_ahead():
     cc = _search_cc()
     c = 800_000_000 / 8
@@ -1015,12 +1064,13 @@ def test_should_lock_c_when_unique_stalled_and_send_ahead():
     assert cc._should_lock_c() is True
 
 
-def test_lock_knee_sits_on_delivery_when_unique_fell():
-    """Spain: bw=1017, unq=845, snd=1182. Unique fell — lock 845 not 684."""
+def test_lock_knee_sits_on_last_clean_send_when_unique_fell():
+    """Spain: bw=1017, unq=845, snd=1182. Sit on last 0.99 send, not unique."""
     cc = _search_cc()
     cc.phase = CRUISE
     cc.was_fat = True
-    cc.knee_bps = 684_000_000 / 8
+    knee = 900_000_000 / 8
+    cc.knee_bps = knee
     cc.rate = 1_170_000_000 / 8
     cc.last_send_rate = 1_182_000_000 / 8
     cc.last_delivery = 845_000_000 / 8
@@ -1028,7 +1078,7 @@ def test_lock_knee_sits_on_delivery_when_unique_fell():
     for x in (1_000_000_000 / 8, 1_010_000_000 / 8, 1_017_000_000 / 8):
         cc.bw.observe(x)
     cc._lock_knee(0.0)
-    assert cc.rate == pytest.approx(cc.last_delivery)
+    assert cc.rate == pytest.approx(knee)
     assert cc.saw_loss_knee is True
 
 
@@ -1051,21 +1101,97 @@ def test_lock_knee_sits_on_clean_latch_when_unique_tracks_send():
     assert cc.saw_loss_knee is True
 
 
-def test_lock_knee_does_not_sit_above_unique_on_dropper_fringe():
-    """Spain 91 MiB/s: knee 1040 / unq=952 / bw=1001. Sit on 952, not 1040."""
+def test_clean_pipe_uses_first_flight_not_unique_lag():
+    """HOL unique dip with quiet first-flight is not a dirty path."""
+    cc = _search_cc()
+    send = 900_000_000 / 8
+    cc.rate = send
+    cc.last_send_rate = send
+    cc.last_delivery = 760_000_000 / 8
+    cc.last_path_loss = 0.01
+    assert cc._clean_pipe() is True
+    cc.last_path_loss = 0.05
+    assert cc._clean_pipe() is False
+
+
+def test_path_loss_grew_locks_last_clean_send():
+    """First-flight 0% at 900 → 5% at 1000: lock 900, not unique 948."""
+    cc = _search_cc()
+    clean = 900_000_000 / 8
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = clean
+    cc.rate = 1_000_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = 948_000_000 / 8
+    cc.last_path_loss = 0.05
+    cc.path_samples = [
+        (clean * 0.90, 0.0),
+        (clean * 0.95, 0.005),
+        (clean, 0.01),
+    ]
+    assert cc._path_loss_grew() is True
+    cc.loss_knee_n = 2
+    cc._lock_knee(0.0)
+    assert cc.rate == pytest.approx(clean)
+
+
+def test_flat_coverable_path_loss_is_fec_not_c_lock():
+    """~20% iid at every rate: FEC, not a dropper knee."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.rate = 700_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = cc.rate * 0.80
+    cc.last_path_loss = 0.20
+    cc.path_samples = [
+        (400_000_000 / 8, 0.20),
+        (500_000_000 / 8, 0.19),
+        (600_000_000 / 8, 0.21),
+    ]
+    assert cc._path_loss_grew() is False
+    assert cc._dropper_knee_sample() is False
+
+
+def test_lock_knee_does_not_latch_dropper_fringe():
+    """Spain 91 MiB/s: 1040 Mbit at 5% first-flight is not last-clean."""
     cc = _search_cc()
     cc.phase = CRUISE
     cc.was_fat = True
-    cc.knee_bps = 1_040_000_000 / 8
+    clean = 900_000_000 / 8
+    cc.knee_bps = clean
     cc.rate = 1_136_000_000 / 8
-    cc.last_send_rate = 1_329_000_000 / 8
-    cc.last_delivery = 952_000_000 / 8
+    cc.last_send_rate = 1_040_000_000 / 8
+    cc.last_delivery = 1_030_000_000 / 8
+    cc.last_path_loss = 0.05
     cc.last_good = cc.rate
     for x in (1_000_000_000 / 8, 1_001_000_000 / 8, 1_001_000_000 / 8):
         cc.bw.observe(x)
+    cc._note_knee()
+    assert cc.knee_bps == pytest.approx(clean)
+    cc.last_send_rate = 1_329_000_000 / 8
+    cc.last_delivery = 952_000_000 / 8
     cc._lock_knee(0.0)
-    assert cc.rate == pytest.approx(cc.last_delivery)
+    assert cc.rate == pytest.approx(clean)
     assert cc.rate < 1_000_000_000 / 8
+
+
+def test_lock_knee_discards_startup_leftover_latch():
+    """WAN: 0.99 latch at 10 Mbit vs unique 260. Must not freeze at 10."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = 10_000_000 / 8
+    cc.rate = 10_000_000 / 8
+    cc.last_good = cc.rate
+    cc.last_send_rate = 276_000_000 / 8
+    cc.last_delivery = 260_000_000 / 8
+    cc.last_path_loss = 0.0
+    for x in (200_000_000 / 8, 210_000_000 / 8, 221_000_000 / 8):
+        cc.bw.observe(x)
+    cc._lock_knee(0.0)
+    assert cc.rate > 200_000_000 / 8
+    assert cc.rate == pytest.approx(cc.last_send_rate)
 
 
 def test_c_lock_holds_through_hol_unique_cliff():
