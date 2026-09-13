@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .block_packets import BlockFeedback, OpenBlock
+from .block_packets import MAX_OPEN_BLOCKS, BlockFeedback, OpenBlock
 
 # Local bench at T=1350: K=384 ~1.6 ms encode / 0.26 ms decode;
 # K=768 ~3.2 ms encode (~307 MiB/s) / 0.5 ms decode; K=1536 ~7.6 ms encode.
@@ -35,6 +35,11 @@ REPAIR_TICK_PKTS = 48
 REPAIR_TICK_PKTS_MAX = 256
 REPAIR_TICK_S = 0.012
 REPAIR_INTERVAL_S = 0.050
+# Window-full HOL (Spain: pace=752, src=0, rpr=5120 ≈ 55 Mbit): drip
+# 256 pkt / 50 ms starves the limiter. Blast repair; limiter paces.
+HOL_REPAIR_TICK_PKTS = 2048
+HOL_REPAIR_TICK_S = 0.20
+HOL_EXTRA_FRAC = 0.40
 TAIL_REPAIR_TICK_PKTS = 256
 TAIL_REPAIR_TICK_PER_BLOCK = 48
 TAIL_REPAIR_TICK_S = 0.040
@@ -62,9 +67,10 @@ FEC_MIN_TRAIN = 8
 FEC_CLEAN_DOWN = 24
 FEC_CLEAN_DOWN_LOW = 48
 FEC_SOFT_FLOOR = 18
-# Omit `--gen-overhead` to search; cold start is the floor, first blocks
-# sound at cover-max, then lock from first-flight need.
-FEC_COLD_PCT = FEC_FLOOR_PCT
+# Omit `--gen-overhead` to search. Adaptive operates at cover-max, then
+# walks down one probe level at a time when p95 is clean. Overcover
+# first-flights must not lock the floor (need≈0 is not "4% is enough").
+FEC_COLD_PCT = FEC_COVER_MAX
 FEC_PROBE_PERIOD = 16
 FEC_RAPTORQ_MARGIN = 2
 DIR_LIGHT_SLACK = 8
@@ -102,6 +108,7 @@ class SenderBlockState:
     last_repair_ts: float = 0.0
     decode_failed: bool = False
     unique_at_age: int = -1
+    rx_at_flight: int = -1
     first_deficit: int = -1
     repair_rounds: int = 0
     probe: bool = False
@@ -151,6 +158,14 @@ class SenderFeedbackState:
             for block_id in list(self.open_rx):
                 if block_id in self.completed and block_id not in incoming:
                     self.open_rx.pop(block_id, None)
+            # The 80-open ACK rotates. Unbounded merge grew to 4471 and
+            # the send loop looked stuck (Spain lock-921, open=4471).
+            cap = MAX_OPEN_BLOCKS * 2
+            if len(self.open_rx) > cap:
+                stale = [bid for bid in self.open_rx if bid not in incoming]
+                drop = len(self.open_rx) - cap
+                for bid in stale[:drop]:
+                    self.open_rx.pop(bid, None)
             self.last_feedback_ts = time.monotonic() if now is None else now
         return True
 
@@ -185,26 +200,28 @@ def select_repair_candidates(
     cooldown_s: float = REPAIR_COOLDOWN_S,
     dir_pad: int = 4,
     dir_pad_fn=None,
+    prefer_oldest: bool = False,
 ) -> list[tuple[int, int, int]]:
     """Pick repair targets: smallest positive deficit, then oldest.
 
-    Returns (need, -age_ms, block_id). Packet gaps and HOL frontiers are
-    intentionally unused: only unique ESI / decode_failed matter.
+    `prefer_oldest` is the full-window HOL case: smallest-need first
+    spends the 256-pkt drip on almost-done blocks and never feeds the
+    frontier. Returns (need, -age_ms, block_id).
     """
     candidates: list[tuple[int, int, int]] = []
     for block_id, state in states.items():
         item = opened.get(block_id)
         if item is not None:
-            state.unique_rx = max(state.unique_rx, item.unique_esi)
-            state.decode_failed = item.decode_failed
+            apply_open_block(state, item)
         age = now - state.sent_at
         failed = state.decode_failed or (item is not None and item.decode_failed)
         if age >= age_s or tail or failed:
             if state.unique_at_age < 0 and state.unique_rx > 0:
                 state.unique_at_age = state.unique_rx
-                state.first_deficit = max(
-                    0, block_k + FEC_RAPTORQ_MARGIN - state.unique_rx
-                )
+                if state.first_deficit < 0:
+                    state.first_deficit = max(
+                        0, block_k + FEC_RAPTORQ_MARGIN - state.unique_rx
+                    )
         if not tail and age < age_s and not failed:
             continue
         if now - state.last_repair_ts < cooldown_s:
@@ -214,9 +231,17 @@ def select_repair_candidates(
         need = state.repair_need(block_k, margin=FEC_RAPTORQ_MARGIN, pad=pad)
         if item is None and age >= age_s:
             need = max(need, 8)
+        # `tail` is true as soon as the last source block is admitted —
+        # often 64 in-flight. Dripping all of them is a repair storm.
+        # Only the drained window (Spain 2070/2072, rpr=0) needs a nudge.
+        if tail and len(states) <= 8:
+            need = max(need, 8)
         if need > 0:
             candidates.append((need, -int(age * 1000), block_id))
-    candidates.sort()
+    if prefer_oldest:
+        candidates.sort(key=lambda t: (t[1], t[0], t[2]))
+    else:
+        candidates.sort()
     return candidates
 
 
@@ -225,12 +250,44 @@ def ghost_flight_ready(item: OpenBlock | None) -> bool:
     return item is not None and item.age_bucket >= FLIGHT_AGE_BUCKETS
 
 
+def apply_open_block(state: SenderBlockState, item: OpenBlock) -> None:
+    """Copy live unique and the receiver-local first-flight freeze."""
+    state.unique_rx = max(state.unique_rx, item.unique_esi)
+    state.decode_failed = item.decode_failed or state.decode_failed
+    if item.unique_at_flight >= 0 and state.rx_at_flight < 0:
+        state.rx_at_flight = item.unique_at_flight
+
+
+def first_flight_unique(state: SenderBlockState) -> int:
+    """Prefer receiver freeze; sender-clock unique_at_age is ACK-delayed."""
+    if state.rx_at_flight >= 0:
+        return state.rx_at_flight
+    return state.unique_at_age
+
+
+def cover_loss_p(cover_pct: int) -> float:
+    """Packet drop `p` that `cover_pct` FEC first-closes: r/(100+r)."""
+    r = max(0, int(cover_pct))
+    return r / (100.0 + r)
+
+
 def block_loss_frac(state: SenderBlockState, block_k: int) -> float | None:
     """Loss vs initial flight (K + initial repair) at first repair age."""
-    if state.unique_at_age < 0:
+    got = first_flight_unique(state)
+    if got < 0:
         return None
     flight = max(1, block_k + max(0, state.initial_repair))
-    return max(0.0, min(1.0, 1.0 - state.unique_at_age / flight))
+    return max(0.0, min(1.0, 1.0 - got / flight))
+
+
+def fec_pct_for_loss(loss: float) -> float:
+    """Repair percent of K that first-closes packet loss `p`: p/(1-p).
+
+    `needed_repair_pct` is missing/K against the already-padded flight, so a
+    28% blast with 19% drop reports ~25% need and refuses to leave 28%.
+    """
+    p = min(0.49, max(0.0, float(loss)))
+    return 100.0 * p / max(1e-9, 1.0 - p)
 
 
 def needed_repair_pct(
@@ -244,9 +301,10 @@ def needed_repair_pct(
     """
     del margin
     extra = max(0, state.repair_emitted - state.initial_repair)
-    if state.unique_at_age > 0:
+    got = first_flight_unique(state)
+    if got > 0:
         flight = max(1, block_k + max(0, state.initial_repair))
-        missing = max(0, flight - state.unique_at_age)
+        missing = max(0, flight - got)
         return min(float(FEC_NEED_CAP), 100.0 * missing / max(1, block_k))
     if extra <= 0 and not state.decode_failed:
         return 0.0
@@ -265,9 +323,10 @@ def needed_repair_pct(
 
 def late_unique(state: SenderBlockState) -> int:
     """Symbols that arrived after first repair age (reorder, not loss)."""
-    if state.unique_at_age < 0:
+    got = first_flight_unique(state)
+    if got < 0:
         return 0
-    return max(0, state.unique_rx - state.unique_at_age)
+    return max(0, state.unique_rx - got)
 
 
 def fec_level_index(pct: float, *, min_pct: int = FEC_FLOOR_PCT, max_pct: int = FEC_MAX_PCT) -> int:
@@ -338,7 +397,7 @@ def make_block_sample(
     qdelay_high: bool = False,
 ) -> BlockLossSample:
     extra = max(0, state.repair_emitted - state.initial_repair)
-    rank_known = state.unique_at_age > 0
+    rank_known = first_flight_unique(state) > 0
     need = needed_repair_pct(state, block_k)
     if not rank_known:
         need = 0.0
@@ -373,10 +432,16 @@ def percentile(samples: list[float], p: float) -> float | None:
     return ordered[min(len(ordered) - 1, max(0, idx))]
 
 
-def repair_tick_limits(total_need: int, *, tail: bool) -> tuple[int, float]:
+def repair_tick_limits(
+    total_need: int, *, tail: bool, window_full: bool = False
+) -> tuple[int, float]:
     """Packet budget and wall-time cap for one repair tick."""
     if tail:
         return TAIL_REPAIR_TICK_PKTS, TAIL_REPAIR_TICK_S
+    if window_full:
+        need = max(0, int(total_need))
+        budget = min(HOL_REPAIR_TICK_PKTS, max(REPAIR_TICK_PKTS_MAX, need))
+        return budget, HOL_REPAIR_TICK_S
     budget = min(REPAIR_TICK_PKTS_MAX, max(REPAIR_TICK_PKTS, max(0, int(total_need))))
     tick_s = REPAIR_TICK_S if budget <= REPAIR_TICK_PKTS else max(REPAIR_TICK_S, 0.024)
     return budget, tick_s
@@ -462,6 +527,7 @@ class RepairDebtController:
 class QuantileFecController:
     """Discrete FEC from first-flight need. Slow down, bulk-undercover up.
 
+    Adaptive starts at cover-max and probe-down one level at a time.
     Down uses p95 so a quiet path can leave 24% but not walk through a real
     need. Up uses p75: DIR pad often closes a 23% miss in one or two rounds,
     so storm-only (repair_rounds ≥ 3) never left 12%. Isolated DIR / a 5%
@@ -480,6 +546,7 @@ class QuantileFecController:
     measured: bool = False
     sounding: bool = False
     needed: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
+    path_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
     repair_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
 
     def __post_init__(self) -> None:
@@ -497,7 +564,8 @@ class QuantileFecController:
         self.level_idx = fec_level_index(
             self.start_pct, min_pct=self.min_pct, max_pct=self.max_pct
         )
-        self.sounding = int(self.start_pct) <= int(self.min_pct)
+        # Hold cover-max (no down-probes) until first-flight trains.
+        self.sounding = int(self.current) >= int(self._cover_cap())
         self.reason = f"cold start={self.current} mode={self.mode}"
 
     @property
@@ -509,13 +577,13 @@ class QuantileFecController:
     def encode_pct(self, block_id: int) -> int:
         """Most blocks at current; every Nth is a probe one level below.
 
-        Until first-flight trains, send cover-max so blocks close for
-        measurement. That sounding cover is not the operating point.
+        Until first-flight trains, stay at cover-max (no down-probes).
+        Sounding overcover is the operating point, not a throwaway blast.
         """
         if self.mode == "fixed":
             return self.current
         if self.sounding and not self.measured:
-            return self._cover_cap()
+            return self.current
         if self.level_idx <= 0:
             return self.current
         nxt = FEC_LEVELS[self.level_idx - 1]
@@ -524,6 +592,12 @@ class QuantileFecController:
         if block_id % FEC_PROBE_PERIOD == 0:
             return nxt
         return self.current
+
+    def is_down_probe(self, block_id: int) -> bool:
+        """True only for an intentional lower-level probe, not overcover."""
+        if self.mode == "fixed":
+            return False
+        return self.encode_pct(block_id) < self.current
 
     def _cover_cap(self) -> int:
         return min(int(self.max_pct), FEC_COVER_MAX)
@@ -571,7 +645,7 @@ class QuantileFecController:
         p99 = percentile(list(self.needed), 99) or 0.0
         return needed_pct > max(p99, 2.0 * max(p95, 1.0)) and needed_pct >= 40.0
 
-    def _down_ready(self, sample: BlockLossSample) -> bool:
+    def _down_ready(self, sample: BlockLossSample, *, allow_down_low: bool = True) -> bool:
         """One level at a time; below 18% only with a real first-flight snapshot."""
         if self.level_idx <= 0:
             return False
@@ -580,10 +654,41 @@ class QuantileFecController:
             return False
         if nxt < FEC_SOFT_FLOOR and not sample.rank_known:
             return False
+        if nxt < FEC_SOFT_FLOOR and not allow_down_low:
+            return False
         if self.probe_fail_at == nxt:
             return False
         need = FEC_CLEAN_DOWN_LOW if nxt < FEC_SOFT_FLOOR else FEC_CLEAN_DOWN
         return self.clean_n >= need
+
+    def path_loss_q(self, q: float, *, coverable: bool = False) -> float | None:
+        src = list(self.path_loss)
+        if coverable:
+            cap_p = cover_loss_p(self._cover_cap())
+            src = [p for p in src if p <= cap_p]
+        if not src:
+            return None
+        return percentile(src, q)
+
+    def hol_frac(self) -> float | None:
+        """Share of first-flight samples above FEC cover (window HOL, not C)."""
+        if not self.path_loss:
+            return None
+        cap_p = cover_loss_p(self._cover_cap())
+        hol = sum(1 for p in self.path_loss if p > cap_p)
+        return hol / len(self.path_loss)
+
+    def _loss_down_idx(self, cover: int, *, settled: bool) -> int | None:
+        """Level that still covers typical path loss, not overcover need%."""
+        coverable = [p for p in self.path_loss if fec_pct_for_loss(p) <= cover]
+        src = coverable if coverable else list(self.path_loss)
+        if not src:
+            return None
+        qtile = FEC_UP_QUANTILE if settled else FEC_QUANTILE
+        q = percentile(src, qtile) or 0.0
+        return fec_level_ceil_index(
+            fec_pct_for_loss(q), min_pct=self.min_pct, max_pct=cover
+        )
 
     def _note_probe(self, sample: BlockLossSample) -> None:
         nxt_pct = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
@@ -593,7 +698,15 @@ class QuantileFecController:
         else:
             self.probe_fail_at = nxt_pct
 
-    def observe_block(self, sample: BlockLossSample, *, allow_up: bool = True) -> int:
+    def observe_block(
+        self,
+        sample: BlockLossSample,
+        *,
+        allow_up: bool = True,
+        allow_down: bool = True,
+        allow_down_low: bool = True,
+        window_busy: bool = False,
+    ) -> int:
         self.dir_rounds += max(0, sample.repair_rounds)
         if self.mode == "fixed":
             self.reason = f"fixed {self.current}"
@@ -606,7 +719,7 @@ class QuantileFecController:
             if sample.extra_symbols > 0 or sample.dir_pressure():
                 self.reason = f"probe-fail {self.probe_fail_at}%"
                 return self.current
-        if self._skip_outlier(needed_pct):
+        if self._skip_outlier(needed_pct) and not window_busy:
             self.reason = f"skip-outlier need={needed_pct:.1f}"
             return self.current
         loss = 0.0 if sample.extra_symbols <= 0 else min(
@@ -614,6 +727,8 @@ class QuantileFecController:
         )
         self.needed.append(needed_pct)
         self.repair_loss.append(loss)
+        if sample.first_flight_loss is not None:
+            self.path_loss.append(float(sample.first_flight_loss))
         if len(self.needed) < FEC_MIN_TRAIN:
             self.reason = f"sound n={len(self.needed)} hold={self.current}"
             return self.current
@@ -629,7 +744,13 @@ class QuantileFecController:
             # CC must cut.
             self.clean_n += 1
             nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-            if self.current > self.min_pct and nxt >= self.min_pct and self.clean_n >= 8:
+            if (
+                allow_down
+                and self.current > self.min_pct
+                and nxt >= self.min_pct
+                and self.clean_n >= 8
+                and (nxt >= FEC_SOFT_FLOOR or allow_down_low)
+            ):
                 self.level_idx -= 1
                 self.clean_n = 0
                 self.probe_fail_at = -1
@@ -643,7 +764,7 @@ class QuantileFecController:
                 f"hold uncoverable {uncov_n}/{len(self.needed)} {self.current}%"
             )
             return self.current
-        src = coverable if coverable else list(self.needed)
+        src = list(self.needed) if (window_busy or not coverable) else coverable
         q = percentile(src, FEC_QUANTILE) or 0.0
         q_up = percentile(src, FEC_UP_QUANTILE) or 0.0
         if (
@@ -654,17 +775,29 @@ class QuantileFecController:
             q = max(q, needed_pct)
             q_up = max(q_up, needed_pct)
         target_idx = fec_level_index(q, min_pct=self.min_pct, max_pct=cover)
+        loss_idx = self._loss_down_idx(cover, settled=allow_down_low)
+        if loss_idx is not None:
+            target_idx = loss_idx
         up_idx = fec_level_ceil_index(q_up, min_pct=self.min_pct, max_pct=cover)
         if self.sounding and not self.measured:
+            # Arm probes. Keep cover-max: overcover need≈0 is not a floor lock.
             self.measured = True
-            # p75: one dirty first-flight must not lock cover-max.
-            self.level_idx = fec_level_ceil_index(
-                q_up, min_pct=self.min_pct, max_pct=cover
-            )
             self.clean_n = 0
             self.probe_fail_at = -1
-            self.reason = f"lock p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current}"
+            self.reason = (
+                f"armed p{FEC_QUANTILE:.0f}={q:.1f} hold={self.current}"
+            )
             return self.current
+        if window_busy and allow_up:
+            want = fec_level_index(float(cover), min_pct=self.min_pct, max_pct=cover)
+            want = max(want, up_idx)
+            if want > self.level_idx:
+                self.level_idx = want
+                self.clean_n = 0
+                self.probe_fail_at = -1
+                self.measured = True
+                self.reason = f"up-window-busy -> {self.current}"
+                return self.current
         self.measured = True
         saw_repair = (
             sample.extra_symbols > 0
@@ -710,10 +843,23 @@ class QuantileFecController:
         # reorder) must not freeze a high level after the path goes quiet.
         if storm and sample.dir_pressure():
             self.clean_n = 0
+        elif not allow_down:
+            # Low-rate overcover must not bank hysteresis for a dump to 4%.
+            self.clean_n = 0
+            self.reason = (
+                f"hold-hunt p{FEC_QUANTILE:.0f}={q:.1f} {self.current}%"
+            )
+            return self.current
         else:
             self.clean_n += 1
         nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-        if self._down_ready(sample) and nxt >= FEC_LEVELS[target_idx]:
+        if nxt < FEC_SOFT_FLOOR and not allow_down_low:
+            self.clean_n = 0
+            self.reason = (
+                f"hold-floor p{FEC_QUANTILE:.0f}={q:.1f} {self.current}%"
+            )
+            return self.current
+        if self._down_ready(sample, allow_down_low=allow_down_low) and nxt >= FEC_LEVELS[target_idx]:
             self.level_idx -= 1
             self.clean_n = 0
             self.probe_fail_at = -1
@@ -727,10 +873,11 @@ class QuantileFecController:
 
 
 def adaptive_start_pct(initial: int, mode: str, floor: int = FEC_FLOOR_PCT) -> int:
-    """Fixed mode keeps the lock; adaptive cold-start is the measurement floor."""
+    """Fixed mode keeps the lock; adaptive starts at cover-max and probe-down."""
     if (mode or "").strip().lower() == "fixed":
         return int(initial)
-    return max(int(floor), min(int(initial), int(floor)))
+    del initial
+    return max(int(floor), int(FEC_COVER_MAX))
 
 
 def resolve_fec_cli(overhead: int | None) -> tuple[str, int]:
@@ -762,13 +909,34 @@ def make_fec_controller(
     top = FEC_MAX_PCT if max_pct is None else int(max_pct)
     start = int(initial_repair_pct)
     if clamp_cold:
-        start = adaptive_start_pct(start, chosen, floor)
+        start = min(top, adaptive_start_pct(start, chosen, floor))
     return QuantileFecController(
         mode=chosen,
         start_pct=start,
         min_pct=floor,
         max_pct=top,
     )
+
+
+def block_quartile(block_id: int, total: int) -> int:
+    """0..3 bucket by block index so first_close miss is not a single scalar."""
+    if total <= 0:
+        return 0
+    return min(3, max(0, (int(block_id) * 4) // int(total)))
+
+
+def fmt_quartile_pcts(hits: list[int], seen: list[int]) -> str:
+    parts: list[str] = []
+    for hit, n in zip(hits, seen):
+        if n <= 0:
+            parts.append("-")
+        else:
+            parts.append(str(int(round(100.0 * hit / n))))
+    return "/".join(parts)
+
+
+def fmt_quartile_counts(counts: list[int]) -> str:
+    return "/".join(str(int(n)) for n in counts)
 
 
 @dataclass(slots=True)

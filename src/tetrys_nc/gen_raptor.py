@@ -150,6 +150,9 @@ class GenReceiveSlot:
         "tlen",
         "symbols_rx",
         "dup_esi",
+        "flight_esi_lim",
+        "unique_flight",
+        "unique_at_flight",
         "_seen",
         "_source_mask",
         "_has_repair",
@@ -177,6 +180,9 @@ class GenReceiveSlot:
         self.tlen = tlen
         self.symbols_rx = 0
         self.dup_esi = 0
+        self.flight_esi_lim = 0
+        self.unique_flight = 0
+        self.unique_at_flight = -1
         self._seen: set[int] = set()
         self._source_mask = 0
         self._has_repair = False
@@ -201,6 +207,23 @@ class GenReceiveSlot:
         if self._source_mask == full and not self._has_repair:
             return False
         return True
+
+    def arm_flight_limit(self, lim: int) -> None:
+        """First-flight ESI watermark from K+R0. First packet wins."""
+        lim = max(0, int(lim))
+        if self.flight_esi_lim > 0 or lim <= 0:
+            return
+        self.flight_esi_lim = lim
+        self.unique_flight = sum(1 for esi in self._seen if esi < lim)
+
+    def maybe_freeze_flight(self, age_s: float, age_limit_s: float) -> None:
+        """Freeze first-flight unique after a receiver-local first-flight window."""
+        if self.unique_at_flight >= 0 or age_s < age_limit_s:
+            return
+        if self.flight_esi_lim > 0:
+            self.unique_at_flight = self.unique_flight
+        else:
+            self.unique_at_flight = self.symbols_rx
 
     def missing_source_esi(self, source_k: int, *, limit: int = 24) -> list[int]:
         if source_k <= 0:
@@ -229,6 +252,8 @@ class GenReceiveSlot:
             return None
         self._seen.add(esi)
         self.symbols_rx += 1
+        if self.flight_esi_lim > 0 and esi < self.flight_esi_lim:
+            self.unique_flight += 1
         if self._decoded is not None:
             return self._decoded
         self._pkts.append((esi, rq_blob))

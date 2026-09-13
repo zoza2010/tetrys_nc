@@ -57,11 +57,16 @@ from tetrys_nc.block_state import (
     FecRunMetrics,
     adaptive_gate_failures,
     adaptive_start_pct,
+    block_quartile,
+    fmt_quartile_counts,
+    fmt_quartile_pcts,
     resolve_fec_cli,
     block_loss_frac,
     dir_lightweight,
     fec_level_ceil_index,
     fec_level_index,
+    fec_pct_for_loss,
+    first_flight_unique,
     ghost_flight_ready,
     late_unique,
     make_block_sample,
@@ -207,6 +212,23 @@ def test_feedback_keeps_ghost_open_on_completed_block():
     assert opened[8].unique_esi == 410
 
 
+def test_feedback_open_rx_does_not_grow_unbounded():
+    state = SenderFeedbackState(3)
+    for i in range(1, 400):
+        assert state.apply(
+            BlockFeedback(
+                3,
+                i,
+                i,
+                0,
+                open_blocks=[OpenBlock(i, 10), OpenBlock(i + 1, 11)],
+            ),
+            now=float(i),
+        )
+    _done, opened, *_rest = state.snapshot()
+    assert len(opened) <= MAX_OPEN_BLOCKS * 2
+
+
 def test_ghost_flight_ready_waits_full_repair_age():
     assert FLIGHT_AGE_BUCKETS == 6
     assert ghost_flight_ready(None) is False
@@ -223,6 +245,18 @@ def test_merge_open_feedback_keeps_ghosts_when_window_is_full():
     assert len(opened) == 64 + 12
     assert MAX_OPEN_BLOCKS == 80
     assert MAX_GHOST_OPEN == 16
+
+
+def test_merge_open_feedback_keeps_newest_when_incomplete_overflows():
+    incomplete = [OpenBlock(i, 400) for i in range(80)]
+    ghosts = [OpenBlock(1000 + i, 900, age_bucket=6) for i in range(16)]
+    opened = merge_open_feedback(incomplete, ghosts)
+    ids = {item.block_id for item in opened}
+    assert {1000 + i for i in range(16)} <= ids
+    assert {0, 1, 2} <= ids
+    assert {77, 78, 79} <= ids
+    assert 70 not in ids
+    assert len(opened) == MAX_OPEN_BLOCKS
 
 
 def test_reordered_symbols_decode_like_ordered_symbols():
@@ -448,6 +482,39 @@ def test_block_loss_frac_uses_unique_at_first_repair_age():
     assert small == 48
     tail_b, _ = repair_tick_limits(10, tail=True)
     assert tail_b == 256
+    hol_b, hol_s = repair_tick_limits(400, tail=False, window_full=True)
+    assert hol_b >= 256
+    assert hol_s >= 0.10
+
+
+def test_window_full_repair_prefers_oldest_hol():
+    """Spain HOL: smallest-need first spent the drip on almost-done blocks."""
+    now = 10.0
+    young = SenderBlockState(1, unique_rx=760, sent_at=9.7)
+    old = SenderBlockState(0, unique_rx=200, sent_at=8.0)
+    opened = {0: OpenBlock(0, 200), 1: OpenBlock(1, 760)}
+    oldest = select_repair_candidates(
+        {0: old, 1: young},
+        opened,
+        now,
+        block_k=768,
+        tail=False,
+        age_s=0.12,
+        cooldown_s=0.0,
+        prefer_oldest=True,
+    )
+    assert oldest[0][2] == 0
+    nearest = select_repair_candidates(
+        {0: old, 1: young},
+        opened,
+        now,
+        block_k=768,
+        tail=False,
+        age_s=0.12,
+        cooldown_s=0.0,
+        prefer_oldest=False,
+    )
+    assert nearest[0][2] == 1
 
 
 def test_repair_age_stamps_unique_once():
@@ -590,6 +657,51 @@ def test_decode_failed_skips_repair_age_wait():
         states, opened, now, block_k=768, tail=False, age_s=0.24, cooldown_s=0.0
     )
     assert [item[2] for item in got] == [0]
+
+
+def test_tail_drips_repair_when_unique_already_at_rank():
+    """Spain CC lock-921: unique 770, no DONE, rpr=0 until the process was killed."""
+    now = 10.0
+    state = SenderBlockState(2070, unique_rx=770, sent_at=1.0)
+    opened = {2070: OpenBlock(2070, 770)}
+    quiet = select_repair_candidates(
+        {2070: state},
+        opened,
+        now,
+        block_k=768,
+        tail=False,
+        age_s=0.12,
+        cooldown_s=0.0,
+    )
+    assert quiet == []
+    got = select_repair_candidates(
+        {2070: state},
+        opened,
+        now,
+        block_k=768,
+        tail=True,
+        age_s=0.12,
+        cooldown_s=0.0,
+    )
+    assert got and got[0][2] == 2070
+    assert got[0][0] >= 8
+
+
+def test_tail_does_not_drip_a_full_in_flight_window():
+    """All source admitted is `tail`, but 32 in-flight blocks must not storm."""
+    now = 10.0
+    states = {i: SenderBlockState(i, unique_rx=770, sent_at=1.0) for i in range(32)}
+    opened = {i: OpenBlock(i, 770) for i in states}
+    got = select_repair_candidates(
+        states,
+        opened,
+        now,
+        block_k=768,
+        tail=True,
+        age_s=0.12,
+        cooldown_s=0.0,
+    )
+    assert got == []
 
 
 def test_encoder_rebuild_preserves_esi_prefix(tmp_path: Path):
@@ -831,6 +943,52 @@ def test_late_unique_is_reorder_not_loss():
     assert sample.first_flight_loss == pytest.approx(1.0 - 700 / 952)
 
 
+def test_openblock_carries_unique_at_flight():
+    item = OpenBlock(7, 700, unique_at_flight=680)
+    got = parse_packet(
+        BlockFeedback(9, 1, 0, 0, open_blocks=[item]).pack()
+    )
+    assert got.open_blocks[0].unique_at_flight == 680
+    assert got.open_blocks[0].unique_esi == 700
+    empty = parse_packet(
+        BlockFeedback(9, 2, 0, 0, open_blocks=[OpenBlock(8, 10)]).pack()
+    )
+    assert empty.open_blocks[0].unique_at_flight == -1
+
+
+def test_block_loss_frac_prefers_receiver_flight():
+    state = SenderBlockState(
+        0, unique_rx=900, initial_repair=184, unique_at_age=700
+    )
+    state.rx_at_flight = 850
+    assert first_flight_unique(state) == 850
+    assert block_loss_frac(state, 768) == pytest.approx(1.0 - 850 / 952)
+    assert late_unique(state) == 50
+
+
+def test_slot_freezes_first_flight_not_dir_esi():
+    slot = GenReceiveSlot(0, gen_k=8, symbol_size=32, block_bytes=256, tlen=256)
+    slot._decoded = b"done"
+    slot.arm_flight_limit(10)
+    for esi in range(10):
+        slot.add_packet(b"x" * 32, esi)
+    slot.add_packet(b"x" * 32, 15)
+    assert slot.unique_flight == 10
+    assert slot.symbols_rx == 11
+    slot.maybe_freeze_flight(0.05, 0.12)
+    assert slot.unique_at_flight < 0
+    slot.maybe_freeze_flight(0.12, 0.12)
+    assert slot.unique_at_flight == 10
+
+
+def test_coverable_path_loss_ignores_hol():
+    ctl = make_fec_controller(24, mode="quantile")
+    ctl.path_loss.extend([0.10, 0.13, 0.87, 0.12, 0.91, 0.11])
+    assert (ctl.path_loss_q(95) or 0.0) > 0.8
+    assert (ctl.path_loss_q(50, coverable=True) or 0.0) < 0.15
+    assert ctl.hol_frac() == pytest.approx(2.0 / 6.0)
+
+
 def test_block_sample_skips_tail_and_incomplete():
     incomplete = _fec_state(-1, unique_rx=400)
     incomplete.unique_at_age = -1
@@ -1020,25 +1178,29 @@ def test_quantile_fec_dir_pressure_does_not_block_down_without_storm():
     assert ctl.current < 18
 
 
-def test_adaptive_cold_start_clamps_cli_24_to_floor():
-    assert FEC_COLD_PCT == FEC_FLOOR_PCT == 4
-    assert adaptive_start_pct(24, "quantile") == 4
+def test_adaptive_cold_start_is_cover_max_not_floor():
+    assert FEC_COLD_PCT == FEC_COVER_MAX == 32
+    assert adaptive_start_pct(24, "quantile") == 32
     assert adaptive_start_pct(24, "fixed") == 24
-    assert adaptive_start_pct(8, "quantile") == 4
-    assert adaptive_start_pct(4, "quantile") == 4
+    assert adaptive_start_pct(8, "quantile") == 32
+    assert adaptive_start_pct(4, "quantile") == 32
     ctl = make_fec_controller(24, mode="quantile", clamp_cold=True)
-    assert ctl.current == 4
+    assert ctl.current == FEC_COVER_MAX
     assert ctl.sounding is True
     assert ctl.encode_pct(1) == FEC_COVER_MAX
+    assert ctl.is_down_probe(1) is False
+    assert ctl.is_down_probe(16) is False
     live = make_fec_controller(24, mode="quantile")
     assert live.current == 24
     assert live.sounding is False
+    assert live.is_down_probe(16) is True
+    assert live.encode_pct(16) == 18
 
 
 def test_gen_overhead_locks_fec_omit_runs_autofec():
     assert resolve_fec_cli(24) == ("fixed", 24)
     assert resolve_fec_cli(8) == ("fixed", 8)
-    assert resolve_fec_cli(None) == ("quantile", 4)
+    assert resolve_fec_cli(None) == ("quantile", 32)
     locked = make_fec_controller(24, mode="fixed")
     assert locked.current == 24
     for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
@@ -1076,7 +1238,7 @@ def test_quantile_fec_dir_cluster_undercover_ups_without_storm():
 
 def test_quantile_fec_sparse_dir_tail_does_not_up():
     """A 5% DIR tail must not walk 12→24 via p95."""
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    ctl = make_fec_controller(12, mode="quantile")
     close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
     dirty = make_block_sample(
         _fec_state(620, initial_repair=92, extra=200, rounds=1),
@@ -1117,8 +1279,8 @@ def test_quantile_fec_jumps_up_on_storm_dir():
 
 def test_quantile_fec_covers_dirty_hour_loss_up_to_32():
     """23% path loss at 12% FEC needs ~26–30%; cover 24% left that below TCP."""
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    assert ctl.current == 4
+    ctl = make_fec_controller(12, mode="quantile")
+    assert ctl.current == 12
     # 12% blast, ~23% drop: unique ≈ 0.77*(K+R0).
     dirty = _fec_state(662, initial_repair=92, extra=400, rounds=3)
     need = needed_repair_pct(dirty, 768)
@@ -1136,19 +1298,40 @@ def test_quantile_fec_covers_dirty_hour_loss_up_to_32():
     assert ctl.current == 32
 
 
-def test_fec_sounding_locks_from_first_flight_need():
+def test_fec_sounding_keeps_cover_max_on_clean_overcover():
     ctl = make_fec_controller(4, mode="quantile", clamp_cold=True)
     assert ctl.encode_pct(0) == FEC_COVER_MAX
-    dirty = make_block_sample(
-        _fec_state(662, initial_repair=92, extra=400, rounds=3), 768, tail=False
+    close = make_block_sample(
+        _fec_state(1010, extra=0, initial_repair=246), 768, tail=False
     )
+    assert (close.needed_repair_pct or 0) < 1.0
     for _ in range(FEC_MIN_TRAIN - 1):
-        ctl.observe_block(dirty)
-        assert ctl.current == 4
+        ctl.observe_block(close)
+        assert ctl.current == FEC_COVER_MAX
         assert ctl.encode_pct(3) == FEC_COVER_MAX
-    ctl.observe_block(dirty)
-    assert ctl.current >= 24
-    assert ctl.encode_pct(1) == ctl.current
+        assert ctl.is_down_probe(16) is False
+    ctl.observe_block(close)
+    assert ctl.current == FEC_COVER_MAX
+    assert "armed" in ctl.reason
+    assert ctl.encode_pct(1) == FEC_COVER_MAX
+    assert ctl.encode_pct(16) == 28
+    assert ctl.is_down_probe(16) is True
+    for _ in range(FEC_CLEAN_DOWN):
+        ctl.observe_block(close)
+    assert ctl.current == 28
+
+
+def test_fec_down_probe_is_not_overcover():
+    """encode_pct > current used to tag every sounding block as a probe."""
+    low = make_fec_controller(4, mode="quantile")
+    assert low.is_down_probe(1) is False
+    assert low.is_down_probe(16) is False
+    mid = make_fec_controller(24, mode="quantile")
+    assert mid.encode_pct(1) == 24
+    assert mid.is_down_probe(1) is False
+    assert mid.is_down_probe(16) is True
+    fixed = make_fec_controller(24, mode="fixed")
+    assert fixed.is_down_probe(16) is False
 
 
 def test_fec_does_not_raise_while_hunting_rate():
@@ -1159,6 +1342,38 @@ def test_fec_does_not_raise_while_hunting_rate():
     for _ in range(FEC_MIN_TRAIN):
         ctl.observe_block(dirty, allow_up=False)
     assert ctl.current == 8
+
+
+def test_fec_does_not_down_while_hunting_rate():
+    """Spain 2026-09-13: p95=0 on 32% overcover during CC climb dumped to 4%."""
+    ctl = make_fec_controller(4, mode="quantile", clamp_cold=True)
+    close = make_block_sample(
+        _fec_state(1010, extra=0, initial_repair=246), 768, tail=False
+    )
+    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
+        ctl.observe_block(close, allow_down=False)
+    assert ctl.current == FEC_COVER_MAX
+    assert "hunt" in ctl.reason
+
+
+def test_fec_holds_soft_floor_until_pace_settled():
+    ctl = make_fec_controller(24, mode="quantile")
+    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
+    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 6 + FEC_CLEAN_DOWN_LOW * 2):
+        ctl.observe_block(close, allow_down_low=False)
+    assert ctl.current == FEC_SOFT_FLOOR
+    assert "floor" in ctl.reason
+
+
+def test_fec_uncoverable_holds_while_hunting():
+    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
+    for _ in range(48 + 8 * 8):
+        ctl.observe_block(
+            make_block_sample(hole, 768, tail=False), allow_down=False
+        )
+    assert ctl.current == FEC_COVER_MAX
+    assert "uncoverable" in ctl.reason
 
 
 def test_fec_encode_pct_probes_one_level_below():
@@ -1196,7 +1411,7 @@ def test_quantile_fec_probe_ok_allows_down_below_18():
 
 
 def test_quantile_fec_trains_coverable_mix_instead_of_cold_hold():
-    """Half uncoverable + coverable ~24% must not freeze at the 12% cold start."""
+    """Half uncoverable + coverable ~24% must not freeze below cover."""
     ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
     hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
     mid = _fec_state(620, initial_repair=92, extra=80, rounds=2)
@@ -1208,7 +1423,7 @@ def test_quantile_fec_trains_coverable_mix_instead_of_cold_hold():
 
 def test_quantile_fec_holds_when_most_needs_are_uncoverable():
     """Shaper / 50%+ drop: the 48% cap is not a request for 32% FEC."""
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
+    ctl = make_fec_controller(4, mode="quantile")
     hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
     assert needed_repair_pct(hole, 768) >= FEC_NEED_CAP
     for _ in range(FEC_MIN_TRAIN + 8):
@@ -1219,12 +1434,6 @@ def test_quantile_fec_holds_when_most_needs_are_uncoverable():
 
 def test_quantile_fec_walks_down_from_false_32_when_uncoverable():
     ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    dirty = _fec_state(662, initial_repair=92, extra=400, rounds=3)
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(make_block_sample(dirty, 768, tail=False))
-    still = _fec_state(733, initial_repair=184, extra=400, rounds=3)
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(make_block_sample(still, 768, tail=False))
     assert ctl.current == 32
     hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
     for _ in range(48 + 8 * 8):
@@ -1244,6 +1453,23 @@ def test_quantile_fec_does_not_raise_for_uncoverable_burst():
         ctl.observe_block(make_block_sample(burst, 768, tail=False))
     assert ctl.current <= FEC_COVER_MAX
     assert ctl.current == 18
+
+
+def test_quantile_fec_window_busy_raises_cover_max():
+    """Spain HOL: xfrac=81% / path 42% / FEC walked 24→18. Jump to cover."""
+    ctl = make_fec_controller(18, mode="quantile")
+    close = make_block_sample(
+        _fec_state(950, initial_repair=138, extra=0), 768, tail=False
+    )
+    hole = make_block_sample(
+        _fec_state(400, initial_repair=138, extra=200, rounds=2), 768, tail=False
+    )
+    for _ in range(FEC_MIN_TRAIN):
+        ctl.observe_block(close)
+    assert ctl.current == 18
+    for _ in range(8):
+        ctl.observe_block(hole, window_busy=True)
+    assert ctl.current == FEC_COVER_MAX
 
 
 def test_quantile_fec_ignores_tail_and_p99_blackout():
@@ -1301,6 +1527,44 @@ def test_dir_margin_covers_fec_gap_in_one_round():
     assert pad == 25
 
 
+def test_fec_pct_for_loss_maps_packet_drop_to_repair():
+    assert fec_pct_for_loss(0.0) == pytest.approx(0.0)
+    assert fec_pct_for_loss(0.10) == pytest.approx(100.0 / 9.0)
+    assert fec_pct_for_loss(0.20) == pytest.approx(25.0)
+    assert fec_pct_for_loss(0.2424) == pytest.approx(32.0, rel=0.03)
+
+
+def test_first_close_still_records_path_loss():
+    k = 768
+    r0 = 246
+    unique = int((k + r0) * 0.92)
+    sample = make_block_sample(
+        _fec_state(unique, extra=0, initial_repair=r0), k, tail=False
+    )
+    assert sample.extra_symbols == 0
+    assert sample.first_flight_loss is not None
+    assert sample.first_flight_loss > 0.05
+    ctl = make_fec_controller(32, mode="quantile")
+    ctl.observe_block(sample)
+    assert ctl.path_loss[-1] == pytest.approx(sample.first_flight_loss)
+
+
+def test_fec_down_uses_path_loss_not_padded_need():
+    """28% blast + 19% drop used to report need~25% and stick at 28%."""
+    k = 768
+    r0 = 215
+    unique = int(round((k + r0) * (1.0 - 0.19)))
+    sample = make_block_sample(
+        _fec_state(unique, extra=0, initial_repair=r0), k, tail=False
+    )
+    assert (sample.needed_repair_pct or 0) > 24
+    assert fec_pct_for_loss(sample.first_flight_loss or 0) < 28
+    ctl = make_fec_controller(28, mode="quantile")
+    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN):
+        ctl.observe_block(sample, allow_down_low=False)
+    assert ctl.current == 24
+
+
 def test_quantile_fec_does_not_down_below_p95_need():
     """8% iid looks first-close at 24% FEC; do not walk through the quantile."""
     ctl = make_fec_controller(24, mode="quantile")
@@ -1338,6 +1602,15 @@ def test_adaptive_gate_accepts_clean_wire_cut_and_rejects_wan_drop():
     fails = adaptive_gate_failures("wan-burst", fixed, bad_wan)
     assert any("goodput" in item for item in fails)
     assert any("75" in item for item in fails)
+
+
+def test_block_quartile_and_fmt():
+    assert block_quartile(0, 2072) == 0
+    assert block_quartile(518, 2072) == 1
+    assert block_quartile(1036, 2072) == 2
+    assert block_quartile(2071, 2072) == 3
+    assert fmt_quartile_pcts([10, 8, 0, 0], [10, 10, 0, 0]) == "100/80/-/-"
+    assert fmt_quartile_counts([0, 5, 12, 20]) == "0/5/12/20"
 
 
 def test_parse_done_metrics_from_sender_log():

@@ -46,6 +46,7 @@ from .block_state import (
     REPAIR_INTERVAL_S,
     TAIL_REPAIR_COOLDOWN_S,
     TAIL_REPAIR_TICK_PER_BLOCK,
+    HOL_EXTRA_FRAC,
     SenderBlockState,
     SenderFeedbackState,
     WAN_ACTIVE_BYTES,
@@ -53,6 +54,10 @@ from .block_state import (
     WAN_CC_CAP_MBIT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
+    apply_open_block,
+    block_quartile,
+    fmt_quartile_counts,
+    fmt_quartile_pcts,
     ghost_flight_ready,
     make_block_sample,
     make_fec_controller,
@@ -61,12 +66,13 @@ from .block_state import (
     select_repair_candidates,
 )
 from .blastcc import BlastCc, _SEED_FRAC
-from .gen_raptor import GenEncoder, GenReceiveSlot
+from .gen_raptor import GenEncoder, GenReceiveSlot, blast_repair_budget
 from .netutil import recv_datagrams, send_datagrams, take_send_stats, try_set_buffer
 from .ratectl import RateLimiter
 
 _FEEDBACK_S = 0.020
 _TAIL_IDLE_S = 5.0
+_FIN_INTERVAL_S = 0.05
 _ENCODER_CACHE = 64
 _SEND_CHUNK = 64
 
@@ -417,14 +423,22 @@ class BlockSender:
         self.aborted = False
         self.tail_idle_start: float | None = None
         self.tail_started: float | None = None
+        self.last_fin_ts: float = 0.0
         self.first_close = 0
         self.first_close_seen = 0
         self.extra_blocks = 0
+        self.close_q_hits = [0, 0, 0, 0]
+        self.close_q_seen = [0, 0, 0, 0]
+        self.extra_q = [0, 0, 0, 0]
+        self.extra_lo: int | None = None
+        self.extra_hi: int | None = None
+        self.last_encode_pct = int(self.repair_ctl.current)
         self.extra_win = ExtraRepairWindow()
         self.loss_samples: list[float] = []
         self.extra_frac_samples: list[float] = []
         self.pace_samples: list[float] = []
         self.flight_loss_samples: list[float] = []
+        self.late_frac_samples: list[float] = []
         self._wait_flight: dict[int, SenderBlockState] = {}
         self.probe_ids: set[int] = set()
         self.last_unique = 0
@@ -538,6 +552,20 @@ class BlockSender:
                 self.enc_cache.pop(drop, None)
         return encoder
 
+    def _observe_fec(self, sample) -> None:
+        cc = self.cc
+        busy = self.extra_win.pressure()
+        jammed = self.extra_win.frac >= HOL_EXTRA_FRAC
+        self.repair_ctl.observe_block(
+            sample,
+            allow_up=cc is None or cc.fec_may_raise or jammed,
+            allow_down=(cc is None or cc.fec_may_lower) and not busy and not jammed,
+            allow_down_low=(cc is None or cc.fec_may_lower_floor)
+            and not busy
+            and not jammed,
+            window_busy=jammed,
+        )
+
     def _reap_completed(
         self,
         completed: set[int],
@@ -552,13 +580,23 @@ class BlockSender:
             extra = max(0, state.repair_emitted - state.initial_repair)
             item = opened.get(block_id)
             if item is not None:
-                state.unique_rx = max(state.unique_rx, item.unique_esi)
+                apply_open_block(state, item)
             self._wait_flight[block_id] = state
             self.first_close_seen += 1
+            q = block_quartile(block_id, self.total_blocks)
+            self.close_q_seen[q] += 1
             if extra == 0:
                 self.first_close += 1
+                self.close_q_hits[q] += 1
             else:
                 self.extra_blocks += 1
+                self.extra_q[q] += 1
+                self.extra_lo = (
+                    block_id if self.extra_lo is None else min(self.extra_lo, block_id)
+                )
+                self.extra_hi = (
+                    block_id if self.extra_hi is None else max(self.extra_hi, block_id)
+                )
             self.enc_cache.pop(block_id, None)
             if block_id in self.enc_order:
                 self.enc_order.remove(block_id)
@@ -572,20 +610,25 @@ class BlockSender:
         for block_id, state in list(self._wait_flight.items()):
             item = opened.get(block_id)
             if item is not None:
-                state.unique_rx = max(state.unique_rx, item.unique_esi)
-            ready = ghost_flight_ready(item) or (
-                tail and now - state.sent_at >= REPAIR_AGE_S
+                apply_open_block(state, item)
+            ready = (
+                state.rx_at_flight >= 0
+                or ghost_flight_ready(item)
+                or (tail and now - state.sent_at >= REPAIR_AGE_S)
             )
             if not ready and now - state.sent_at < REPAIR_AGE_S + 0.20:
                 continue
-            # First-repair snapshot is the first-flight rank. Do not replace
-            # it with unique-at-decode after DIR filled the hole.
+            # Receiver freeze is first-flight rank. Do not replace it with
+            # unique-at-decode after DIR filled the hole.
             if state.unique_at_age < 0:
-                if state.unique_rx > 0:
+                if state.rx_at_flight >= 0:
+                    state.unique_at_age = state.rx_at_flight
+                elif state.unique_rx > 0:
                     state.unique_at_age = state.unique_rx
-                    state.first_deficit = max(
-                        0, self.block_k + FEC_RAPTORQ_MARGIN - state.unique_rx
-                    )
+                    if state.first_deficit < 0:
+                        state.first_deficit = max(
+                            0, self.block_k + FEC_RAPTORQ_MARGIN - state.unique_rx
+                        )
                 elif state.unique_rx < self.block_k:
                     state.unique_rx = self.block_k
             extra = max(0, state.repair_emitted - state.initial_repair)
@@ -595,22 +638,20 @@ class BlockSender:
             )
             if sample.train:
                 if not state.fec_sampled:
-                    self.repair_ctl.observe_block(
-                        sample,
-                        allow_up=self.cc is None or self.cc.fec_may_raise,
-                    )
+                    self._observe_fec(sample)
                     state.fec_sampled = True
                 self.extra_win.observe(sample.dir_pressure())
                 self.extra_frac_samples.append(extra / max(1, self.block_k))
+                flight = max(1, self.block_k + max(0, state.initial_repair))
                 if sample.first_flight_loss is not None:
                     self.flight_loss_samples.append(sample.first_flight_loss)
-                if extra == 0:
-                    self.loss_samples.append(0.0)
-                elif sample.first_flight_loss is not None:
                     self.loss_samples.append(sample.first_flight_loss)
+                self.late_frac_samples.append(sample.late_unique / flight)
             self._wait_flight.pop(block_id, None)
 
-    def _repair_tick(self, opened: dict[int, OpenBlock], now: float, tail: bool) -> int:
+    def _repair_tick(
+        self, opened: dict[int, OpenBlock], now: float, tail: bool, *, window_full: bool = False
+    ) -> int:
         t_r = time.perf_counter()
         cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
         candidates = select_repair_candidates(
@@ -624,9 +665,12 @@ class BlockSender:
             dir_pad_fn=lambda deficit: self.repair_ctl.dir_margin(
                 deficit, self.block_k, tail=tail
             ),
+            prefer_oldest=window_full and not tail,
         )
         total_need = sum(need for need, _age, _bid in candidates)
-        budget, tick_s = repair_tick_limits(total_need, tail=tail)
+        budget, tick_s = repair_tick_limits(
+            total_need, tail=tail, window_full=window_full and not tail
+        )
         per_block = TAIL_REPAIR_TICK_PER_BLOCK if tail else budget
         sent = 0
         for need, _age, block_id in candidates:
@@ -650,16 +694,16 @@ class BlockSender:
             state.last_repair_ts = now
             state.repair_rounds += 1
             sent += len(new_packets)
-            if not tail and not state.fec_sampled and state.unique_at_age > 0:
+            item = opened.get(block_id)
+            if item is not None:
+                apply_open_block(state, item)
+            if not tail and not state.fec_sampled and state.rx_at_flight >= 0:
                 qdelay_high = self.cc is not None and self.cc.high_delay_n >= 1
                 sample = make_block_sample(
                     state, self.block_k, tail=False, qdelay_high=qdelay_high
                 )
                 if sample.train:
-                    self.repair_ctl.observe_block(
-                        sample,
-                        allow_up=self.cc is None or self.cc.fec_may_raise,
-                    )
+                    self._observe_fec(sample)
                     state.fec_sampled = True
         self.timers.repair_s += time.perf_counter() - t_r
         return sent
@@ -710,7 +754,7 @@ class BlockSender:
 
     def _submit_encode(self, bid: int) -> None:
         pct = self.repair_ctl.encode_pct(bid)
-        if pct != self.repair_ctl.current:
+        if self.repair_ctl.is_down_probe(bid):
             self.probe_ids.add(bid)
         else:
             self.probe_ids.discard(bid)
@@ -762,6 +806,9 @@ class BlockSender:
                 probe=self.next_block in self.probe_ids,
             )
             self.probe_ids.discard(self.next_block)
+            self.last_encode_pct = int(
+                round(100.0 * budget / max(1, self.geometry.block_k))
+            )
             self._send_wires(wires, repair=False)
             self.next_block += 1
             admitted = True
@@ -791,19 +838,29 @@ class BlockSender:
                 f"good={cc.last_good * 8 / 1e6:.0f} "
                 f"ov={int(cc._pipe_oversend())} "
                 f"fec_up={int(cc.fec_may_raise)} "
+                f"fec_dn={int(cc.fec_may_lower)} "
             )
         print(
             f"progress sent={self.next_block}/{self.total_blocks} "
             f"done={len(completed)} active={len(self.active)} "
             f"ready={len(self.ready)} inflight={len(self.pending)} "
             f"open={len(opened)} fec={self.repair_ctl.current}% "
+            f"enc_fec={self.last_encode_pct}% "
             f"why={self.repair_ctl.reason.replace(' ', '_')} "
             f"close={close_pct:.0f}% "
+            f"close_q={fmt_quartile_pcts(self.close_q_hits, self.close_q_seen)} "
+            f"extra_q={fmt_quartile_counts(self.extra_q)} "
             f"pace={self.limiter.rate * 8 / 1e6:.0f}Mbit "
             f"cc={cc.phase if cc is not None else 'off'} "
             f"{cc_extra}"
             f"xfrac={self.extra_win.frac * 100:.0f}% "
             f"loss_p50={((percentile(self.loss_samples, 50) or 0.0) * 100):.1f}% "
+            f"path_p50={((self.repair_ctl.path_loss_q(50) or 0.0) * 100):.1f}% "
+            f"path_p95={((self.repair_ctl.path_loss_q(95) or 0.0) * 100):.1f}% "
+            f"cover_p50={((self.repair_ctl.path_loss_q(50, coverable=True) or 0.0) * 100):.1f}% "
+            f"cover_p95={((self.repair_ctl.path_loss_q(95, coverable=True) or 0.0) * 100):.1f}% "
+            f"hol={((self.repair_ctl.hol_frac() or 0.0) * 100):.0f}% "
+            f"late_p50={((percentile(self.late_frac_samples, 50) or 0.0) * 100):.1f}% "
             f"ack={unique_rx / elapsed / 1048576:.1f} "
             f"inst={inst_unique / 1048576:.1f} "
             f"app={decoded / elapsed / 1048576:.1f}MiB/s "
@@ -852,10 +909,16 @@ class BlockSender:
                 admitted = self._admit_source()
 
                 window_full = len(self.active) >= self.geometry.active_blocks
-                if tail or (
-                    window_full and now - self.last_repair_loop >= REPAIR_INTERVAL_S
-                ):
-                    self._repair_tick(opened, now, tail)
+                if tail:
+                    repair_gap = TAIL_REPAIR_COOLDOWN_S
+                elif window_full:
+                    repair_gap = 0.0
+                else:
+                    repair_gap = REPAIR_INTERVAL_S
+                if (tail or window_full) and now - self.last_repair_loop >= repair_gap:
+                    self._repair_tick(
+                        opened, now, tail, window_full=window_full
+                    )
                     self.last_repair_loop = now
 
                 if now - self.last_log >= 1.0:
@@ -863,9 +926,12 @@ class BlockSender:
                     self.last_log = now
 
                 if self.next_block >= self.total_blocks:
-                    self.sock.sendto(
-                        BlockFin(self.session_id, self.total_blocks).pack(), self.client
-                    )
+                    if now - self.last_fin_ts >= _FIN_INTERVAL_S:
+                        self.sock.sendto(
+                            BlockFin(self.session_id, self.total_blocks).pack(),
+                            self.client,
+                        )
+                        self.last_fin_ts = now
                 if len(completed) >= self.total_blocks:
                     self._flush_flight_samples(opened, tail=True)
                     fin = BlockFin(self.session_id, self.total_blocks).pack()
@@ -879,7 +945,7 @@ class BlockSender:
                         break
                 else:
                     self.tail_idle_start = None
-                if not admitted and not tail:
+                if not admitted:
                     t_wait = time.perf_counter()
                     time.sleep(0.001)
                     self.timers.wait_s += time.perf_counter() - t_wait
@@ -913,21 +979,34 @@ class BlockSender:
         def _pct(val: float | None) -> str:
             return "n/a" if val is None else f"{val * 100:.1f}%"
 
+        extra_span = ""
+        if self.extra_lo is not None and self.extra_hi is not None:
+            extra_span = f" extra_span={self.extra_lo}-{self.extra_hi}"
         print(
             f"done in {elapsed:.2f}s — goodput "
             f"{self.file_size / elapsed / 1048576:.2f} MiB/s — "
             f"source_wire={self.source_wire_total / 1048576:.1f}MiB "
             f"repair_wire={self.repair_wire_total / 1048576:.1f}MiB "
             f"first_close={close_pct:.0f}% extra_blocks={self.extra_blocks} "
+            f"close_q={fmt_quartile_pcts(self.close_q_hits, self.close_q_seen)} "
+            f"extra_q={fmt_quartile_counts(self.extra_q)}"
+            f"{extra_span} "
             f"dir_rounds={self.repair_ctl.dir_rounds} "
             f"xfrac={self.extra_win.frac * 100:.0f}% "
             f"loss_p50={_pct(percentile(self.loss_samples, 50))} "
             f"p90={_pct(percentile(self.loss_samples, 90))} "
             f"p99={_pct(percentile(self.loss_samples, 99))} "
             f"flight_p95={_pct(percentile(self.flight_loss_samples, 95))} "
+            f"path_p50={_pct(self.repair_ctl.path_loss_q(50))} "
+            f"path_p95={_pct(self.repair_ctl.path_loss_q(95))} "
+            f"cover_p50={_pct(self.repair_ctl.path_loss_q(50, coverable=True))} "
+            f"cover_p95={_pct(self.repair_ctl.path_loss_q(95, coverable=True))} "
+            f"hol={_pct(self.repair_ctl.hol_frac())} "
+            f"late_p50={_pct(percentile(self.late_frac_samples, 50))} "
             f"extra_p50={_pct(percentile(self.extra_frac_samples, 50))} "
             f"p90={_pct(percentile(self.extra_frac_samples, 90))} "
-            f"fec={self.repair_ctl.current}% why={self.repair_ctl.reason.replace(' ', '_')} "
+            f"fec={self.repair_ctl.current}% enc_fec={self.last_encode_pct}% "
+            f"why={self.repair_ctl.reason.replace(' ', '_')} "
             f"tail={tail_s:.2f}s {pace_txt}",
             flush=True,
         )
@@ -978,11 +1057,14 @@ class BlockReceiver:
         self.feedback_id += 1
 
         def _open(block_id: int, slot: GenReceiveSlot) -> OpenBlock:
+            age_s = now - self.slot_seen.get(block_id, now)
+            slot.maybe_freeze_flight(age_s, REPAIR_AGE_S)
             return OpenBlock(
                 block_id,
                 slot.symbols_rx,
                 slot.decode_failed,
-                min(255, int((now - self.slot_seen.get(block_id, now)) / 0.020)),
+                min(255, int(age_s / 0.020)),
+                slot.unique_at_flight,
             )
 
         incomplete = [
@@ -1026,15 +1108,9 @@ class BlockReceiver:
         off = block_id * self.geometry.block_bytes
         tlen = min(self.geometry.block_bytes, self.meta.file_size - off)
         slot = self.slots.get(block_id)
-        if block_id in self.done:
-            if slot is None:
-                return
-            before = slot.symbols_rx
-            slot.add_packet(packet.payload, packet.esi)
-            if slot.symbols_rx > before:
-                self.unique_payload_bytes += len(raw)
-            return
         if slot is None:
+            if block_id in self.done:
+                return
             slot = GenReceiveSlot(
                 block_id,
                 gen_k=self.meta.block_k,
@@ -1044,8 +1120,14 @@ class BlockReceiver:
             )
             self.slots[block_id] = slot
             self.slot_seen[block_id] = time.monotonic()
+        fec = int(packet.fec_pct or self.fec_pct or self.meta.initial_repair_pct)
+        slot.arm_flight_limit(slot.gen_k + blast_repair_budget(slot.gen_k, fec))
         before = slot.symbols_rx
         decoded = slot.add_packet(packet.payload, packet.esi)
+        if block_id in self.done:
+            if slot.symbols_rx > before:
+                self.unique_payload_bytes += len(raw)
+            return
         if slot.symbols_rx == before:
             self.dup_esi += 1
             return

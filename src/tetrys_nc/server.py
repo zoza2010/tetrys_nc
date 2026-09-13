@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "lock RaptorQ repair percent (disables auto FEC). "
-            "Omit to sound cover-max, then lock FEC from first-flight need"
+            "Omit to start at cover-max and probe FEC down from first-flight need"
         ),
     )
     args = p.parse_args(argv)

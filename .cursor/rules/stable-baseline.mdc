@@ -14,4 +14,5 @@ alwaysApply: true
 - Do **not** treat later FEC/AIMD/forecast/GRO experiments as safer without a fresh matched A/B vs this SHA.
 - Older SHA `53ce5f6` is the pre-mux locked-850 v2 snapshot (still had `--wan`). v1 gen_xfer `ae7b8cc` (~47–57 MiB/s) is historical only.
 - Если пользователь просит написать какой то код - проверяй его полностью на локальных симуляторах и на wan
+- **После WAN-прогонов** сразу гаси сервер на России: `fuser -k 7494/udp` (не `pkill -f tetrys_nc` — это убивает SSH). Порт должен стать FREE.
 - **Перед каждым WAN-прогоном tetrys** сначала сними C: `scripts/wan_path_probe.sh` (или вручную). Тот же порт/направление: Spain `213.96.39.104` → Russia `185.41.43.122:7494`, `iperf3 -u -R -l 1350`. Минимум **200M** и **800M**. Не суди BlastCc без свежего recv/loss. **Линейка — UDP**: 800M / ~0% loss = канал жирный (tetrys lock `--rate 800 --gen-overhead 24` ≈ 75–79 MiB/s). TCP `-R` на России уже `bbr`, но на этом пути он часто даёт ~250 Mbit из‑за окна — это не C для UDP tetrys. CC без `--rate` обязан целиться в UDP C, не в 200 Mbit после self-congest.

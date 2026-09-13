@@ -232,8 +232,10 @@ def test_cc_search_starts_at_floor_and_tracks_shaper(tmp_path: Path) -> None:
     assert got is not None, srv[-800:]
     # 32 MiB finished while still on two-block fill (~209 Mbit). 64 MiB
     # is long enough for the 90 Mbit policer to show up in the median.
+    # Cover-max cold start spends early wire on the policer; median must
+    # still sit on the shaper, not the 209 Mbit two-block fill.
     assert got.pace_med < 200.0, srv[-800:]
-    assert got.pace_med > 40.0, srv[-800:]
+    assert got.pace_med > 35.0, srv[-800:]
     assert got.pace_p10 < 160.0, srv[-800:]
 
 

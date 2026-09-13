@@ -58,6 +58,55 @@ def test_seed_is_bbr_like_fraction_not_full_cap():
     assert cc.rate == pytest.approx(_START * 0.90)
 
 
+def test_fec_may_lower_only_in_settled_cruise():
+    cc = _cc()
+    assert cc.fec_may_lower is False
+    assert cc.fec_may_lower_floor is False
+    cc.phase = PROBE
+    assert cc.fec_may_raise is True
+    assert cc.fec_may_lower is False
+    cc.phase = CRUISE
+    assert cc.fec_may_lower is True
+    assert cc.fec_may_lower_floor is False
+    rate = 900_000_000 / 8
+    cc.rate = rate
+    cc.last_good = rate
+    for x in (rate * 0.95, rate, rate * 1.02, rate * 0.98):
+        cc.bw.observe(x)
+    assert cc.fec_may_lower_floor is True
+    cc.rate = rate * 0.50
+    assert cc.fec_may_lower is True
+    assert cc.fec_may_lower_floor is False
+    cc.rate = rate * 1.40
+    assert cc.fec_may_lower_floor is False
+    cc.rate = rate * 1.15
+    assert cc.fec_may_lower_floor is True
+
+
+def test_fat_startup_ceiling_stays_near_unique():
+    """`--rate 900` + auto FEC → 8%. CC must not 1.50× that unique."""
+    start = 850_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.min_rtt = 0.08
+    burst = 900_000_000 / 8
+    cc.rate = burst * 0.90
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = burst
+    for x in (burst * 0.95, burst, burst * 1.02):
+        cc.bw.observe(x)
+    assert cc._startup_search_cap(cc.max_bps) <= burst * 1.20
+    assert cc._raise_ceiling() <= burst * 1.20
+    cc.phase = STARTUP
+    assert cc.fec_may_lower is True
+    assert cc.fec_may_lower_floor is True
+    # Edging the limiter above unique must not open 1.50×.
+    cc.rate = burst * 1.12
+    cc.last_send_rate = cc.rate
+    cc.was_fat = True
+    assert cc._startup_search_cap(cc.max_bps) <= burst * 1.20
+    assert cc._raise_ceiling() <= burst * 1.20
+
+
 def test_rtt_from_echo_wraps_32bit():
     now = 100.5
     assert rtt_from_echo(now, _echo(now, 0.08)) == pytest.approx(0.08)
@@ -577,7 +626,7 @@ def test_startup_ceiling_tracks_unique_not_burst_times_gain():
     cc.bw.observe(burst * 0.95)
     cc.bw.observe(burst)
     cc.last_delivery = 2_000_000_000 / 8
-    assert cc._startup_ceiling() <= burst * 1.50
+    assert cc._startup_ceiling() <= burst * 1.20
     assert cc._startup_ceiling() < 2_000_000_000 / 8
 
 
@@ -851,6 +900,14 @@ def _simulate_path(
             delivered = send * (1.0 - loss)
             rtt_now = rtt
             dec = delivered
+        elif mode == "soft":
+            # Spain: ~0% at C, ~5% at 1.25×C (800→1000), queue empty.
+            if send <= c_bps:
+                delivered = send * (1.0 - loss)
+            else:
+                delivered = c_bps + (send - c_bps) * 0.74
+            rtt_now = rtt
+            dec = delivered
         elif mode == "queue":
             delivered = min(send, c_bps) * (1.0 - loss)
             excess = max(0.0, send / max(c_bps, 1.0) - 1.0)
@@ -890,6 +947,276 @@ def test_closed_loop_fat_pipe_settles_near_c_without_sawtooth():
     assert _mbit(med) < 1300.0, _mbit(med)
     assert hi < lo * 2.0, (_mbit(lo), _mbit(hi))
     assert cc._raise_ceiling() < 1_200_000_000 / 8, _mbit(cc._raise_ceiling())
+
+
+def test_loss_grew_on_dropper_knee_not_stable_iid():
+    cc = _search_cc()
+    fat = 900_000_000 / 8
+    cc.send_samples = [
+        (fat * 0.90, fat * 0.90),
+        (fat * 0.95, fat * 0.95),
+        (fat, fat),
+    ]
+    cc.knee_bps = fat
+    cc.loss_knee_n = 2
+    cc.phase = CRUISE
+    cc.rate = 1_000_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = 948_000_000 / 8
+    assert cc._dropper_knee_sample() is True
+    assert cc._loss_grew() is True
+    knee = cc._knee_bps()
+    assert knee is not None
+    assert 850.0 < _mbit(knee) < 950.0
+    iid = _search_cc()
+    frac = 0.77
+    iid.send_samples = [
+        (400_000_000 / 8, 400_000_000 / 8 * frac),
+        (500_000_000 / 8, 500_000_000 / 8 * frac),
+        (600_000_000 / 8, 600_000_000 / 8 * frac),
+    ]
+    iid.rate = 700_000_000 / 8
+    iid.last_send_rate = iid.rate
+    iid.last_delivery = iid.rate * frac
+    assert iid._dropper_knee_sample() is False
+    assert iid._loss_grew() is False
+
+
+def test_loss_grew_ignores_encode_lag_not_dropper():
+    """Spain 2026-09-13: startup_loss_knee snd=764 unq=415 is lag, not C."""
+    cc = _search_cc()
+    cc.knee_bps = 800_000_000 / 8
+    cc.was_fat = True
+    cc.loss_knee_n = 8
+    cc.rate = 910_000_000 / 8
+    cc.last_send_rate = 764_000_000 / 8
+    cc.last_delivery = 415_000_000 / 8
+    for x in (700_000_000 / 8, 750_000_000 / 8, 799_000_000 / 8):
+        cc.bw.observe(x)
+    assert cc._dropper_knee_sample() is False
+    assert cc._loss_grew() is False
+
+
+def test_should_lock_c_when_unique_stalled_and_send_ahead():
+    cc = _search_cc()
+    c = 800_000_000 / 8
+    cc.phase = STARTUP
+    cc.was_fat = True
+    cc.bw_stall_n = 3
+    cc.rate = c * 1.15
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = c
+    for x in (c * 0.95, c * 0.98, c):
+        cc.bw.observe(x)
+    assert cc._clean_pipe() is False
+    assert cc._should_lock_c() is True
+    cc.last_delivery = cc.last_send_rate
+    assert cc._clean_pipe() is True
+    assert cc._should_lock_c() is True
+
+
+def test_lock_knee_sits_on_delivery_when_unique_fell():
+    """Spain: bw=1017, unq=845, snd=1182. Unique fell — lock 845 not 684."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = 684_000_000 / 8
+    cc.rate = 1_170_000_000 / 8
+    cc.last_send_rate = 1_182_000_000 / 8
+    cc.last_delivery = 845_000_000 / 8
+    cc.last_good = cc.rate
+    for x in (1_000_000_000 / 8, 1_010_000_000 / 8, 1_017_000_000 / 8):
+        cc.bw.observe(x)
+    cc._lock_knee(0.0)
+    assert cc.rate == pytest.approx(cc.last_delivery)
+    assert cc.saw_loss_knee is True
+
+
+def test_lock_knee_sits_on_clean_latch_when_unique_tracks_send():
+    """Soft dropper: unique follows send to 1.4×C. Sit on last 0.99, not unique."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    knee = 779_000_000 / 8
+    cc.knee_bps = knee
+    cc.rate = 1_233_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = 1_121_000_000 / 8
+    cc.last_good = cc.rate
+    u = cc.last_delivery
+    for x in (u * 0.95, u * 0.98, u):
+        cc.bw.observe(x)
+    cc._lock_knee(0.0)
+    assert cc.rate == pytest.approx(knee)
+    assert cc.saw_loss_knee is True
+
+
+def test_lock_knee_does_not_sit_above_unique_on_dropper_fringe():
+    """Spain 91 MiB/s: knee 1040 / unq=952 / bw=1001. Sit on 952, not 1040."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = 1_040_000_000 / 8
+    cc.rate = 1_136_000_000 / 8
+    cc.last_send_rate = 1_329_000_000 / 8
+    cc.last_delivery = 952_000_000 / 8
+    cc.last_good = cc.rate
+    for x in (1_000_000_000 / 8, 1_001_000_000 / 8, 1_001_000_000 / 8):
+        cc.bw.observe(x)
+    cc._lock_knee(0.0)
+    assert cc.rate == pytest.approx(cc.last_delivery)
+    assert cc.rate < 1_000_000_000 / 8
+
+
+def test_c_lock_holds_through_hol_unique_cliff():
+    """After lock, HOL unique dip must not wrecked_cut toward ~50 MiB/s."""
+    cc = _search_cc()
+    knee = 857_000_000 / 8
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.saw_loss_knee = True
+    cc.knee_bps = knee
+    cc.rate = knee
+    cc.last_good = knee
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.recv_lag = True
+    cc.last_unique = 32 * 1048576
+    cc.last_delivery = 50_000_000 / 8
+    cc.last_send_rate = knee
+    cc.cliff_n = 4
+    for x in (knee * 0.95, knee, knee * 1.02):
+        cc.bw.observe(x)
+    cc._recover_wrecked(1.0)
+    assert cc.saw_loss_knee is True
+    assert cc.rate == pytest.approx(knee)
+    cc._cut_to_delivery(1.2)
+    assert cc.rate == pytest.approx(knee)
+    cc.on_feedback(
+        5.0,
+        feedback_id=1,
+        unique_bytes=int(50_000_000 / 8),
+        decoded_bytes=0,
+        echo_ts_us=_echo(5.0, 0.08),
+        extra_frac=0.2,
+        window_full=True,
+        sent_bytes=int(knee),
+        source_bytes=int(knee),
+    )
+    cc.on_feedback(
+        5.20,
+        feedback_id=2,
+        unique_bytes=int(50_000_000 / 8 * 0.20),
+        decoded_bytes=0,
+        echo_ts_us=_echo(5.20, 0.08),
+        extra_frac=0.2,
+        window_full=True,
+        sent_bytes=int(knee * 0.20),
+        source_bytes=int(knee * 0.20),
+    )
+    assert cc.saw_loss_knee is True
+    assert cc.rate == pytest.approx(knee)
+    assert "wrecked_cut" not in " ".join(cc._events)
+
+
+def test_c_lock_holds_rate_through_mid_transfer_hol():
+    """Closed-loop: lock near C, then HOL. Stay near C, not ~400 Mbit."""
+    cc = _search_cc()
+    c = 800_000_000 / 8
+    rates = _simulate_path(
+        cc, c_bps=c, mode="soft", duration=16.0, hol_start=8.0, hol_dur=3.0
+    )
+    assert cc.saw_loss_knee is True, cc._events
+    tail = rates[-8:]
+    assert min(tail) > 600_000_000 / 8, (_mbit(min(tail)), cc._events)
+    assert max(tail) < 1_050_000_000 / 8, _mbit(max(tail))
+
+
+def test_hol_on_latched_knee_does_not_ratchet_to_50():
+    """Mid-transfer unique ~400 Mbit is HOL, not C=400. Stay on 850."""
+    cc = _search_cc()
+    knee = 850_000_000 / 8
+    cc.phase = CRUISE
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.knee_bps = knee
+    cc.rate = 950_000_000 / 8
+    cc.last_good = cc.rate
+    cc.last_delivery = 400_000_000 / 8
+    cc.last_send_rate = 200_000_000 / 8
+    cc.recv_lag = True
+    cc._recover_wrecked(1.0)
+    assert cc.rate == pytest.approx(knee)
+    assert cc.knee_bps == pytest.approx(knee)
+    assert cc.saw_loss_knee is True
+    assert cc.last_good >= knee
+
+
+def test_fat_startup_stall_locks_and_does_not_probe():
+    """Fat stall must freeze C immediately — no cruise +10% into the dropper."""
+    cc = _search_cc()
+    c = 800_000_000 / 8
+    rates = _simulate_path(cc, c_bps=c, mode="soft", duration=12.0)
+    assert cc.saw_loss_knee is True, cc._events
+    tail = rates[-8:]
+    assert max(tail) < 1_050_000_000 / 8, _mbit(max(tail))
+    assert max(tail) < min(tail) * 1.12, (_mbit(min(tail)), _mbit(max(tail)))
+
+
+def test_knee_not_latched_on_gro_burst():
+    """Spain: snd=1108 at limiter 855 is ACK burst, not a higher C."""
+    cc = _search_cc()
+    rate = 855_000_000 / 8
+    cc.rate = rate
+    cc.last_send_rate = 1_108_000_000 / 8
+    cc.last_delivery = cc.last_send_rate
+    cc._note_knee()
+    assert cc.knee_bps == 0.0
+    cc.last_send_rate = rate
+    cc.last_delivery = rate
+    cc._note_knee()
+    assert cc.knee_bps == pytest.approx(rate)
+
+
+def test_dropper_knee_ignores_fat_qdelay():
+    """Spain after loss knee: snd=1008/unq=999 drained 950→855 on OOO RTT."""
+    cc = _search_cc()
+    rate = 950_000_000 / 8
+    cc.phase = CRUISE
+    cc.rate = rate
+    cc.last_good = rate
+    cc.saw_loss_knee = True
+    cc.was_fat = True
+    cc.knee_bps = rate
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 10.0
+    cc.last_step_ts = 10.0
+    now = 10.0
+    unique = 0
+    sent = 0
+    for i in range(1, 14):
+        now += 0.12
+        unique += int(rate * 0.12)
+        sent += int(rate * 0.12)
+        _feed(cc, now, i, unique, 0.140, sent=sent, source=sent)
+    assert cc.phase != DRAIN
+    assert cc.rate > rate * 0.95
+
+
+def test_closed_loop_soft_knee_does_not_walk_into_five_percent():
+    """Spain: 800M ~0%, 1000M ~5%, empty queue. Sit near 800, not 1.2 Gbit."""
+    cc = _search_cc()
+    c = 800_000_000 / 8
+    rates = _simulate_path(cc, c_bps=c, mode="soft", duration=20.0)
+    tail = rates[-max(8, len(rates) // 5) :]
+    med = sorted(tail)[len(tail) // 2]
+    assert _mbit(med) > 600.0, _mbit(med)
+    assert _mbit(med) < 1050.0, _mbit(med)
+    tail_hi, tail_lo = max(tail), min(tail)
+    assert tail_hi < tail_lo * 1.15, (_mbit(tail_lo), _mbit(tail_hi), cc.saw_loss_knee)
 
 
 def test_closed_loop_iid_loss_does_not_lock_unique_times_headroom():

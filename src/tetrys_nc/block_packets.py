@@ -10,7 +10,7 @@ MAGIC = 0x54
 VERSION = 2
 MAX_DATAGRAM = 1400
 MAX_DONE_RANGES = 48
-# 64 incomplete (DIR) + 16 first-flight ghosts. 80×8 + 48 ranges still < 1400.
+# 64 incomplete (DIR) + 16 first-flight ghosts. 80×10 + 48 ranges still < 1400.
 MAX_OPEN_BLOCKS = 80
 MAX_GHOST_OPEN = 16
 MAX_RANGE_SPAN = 1_000_000
@@ -19,7 +19,10 @@ _HDR = struct.Struct("!BBBBI")
 _DATA = struct.Struct("!III")
 _FB_BASE = struct.Struct("!IQQIHH")
 _RANGE = struct.Struct("!II")
-_OPEN = struct.Struct("!IHBB")
+# block_id, live unique, first-flight unique at REPAIR_AGE (0xFFFF=not frozen),
+# age_bucket, flags.
+_OPEN = struct.Struct("!IHHBB")
+_OPEN_FLIGHT_NONE = 0xFFFF
 
 
 class BlockPacketType(IntEnum):
@@ -38,6 +41,9 @@ class OpenBlock:
     unique_esi: int
     decode_failed: bool = False
     age_bucket: int = 0
+    # Receiver-local unique among first-flight ESIs at REPAIR_AGE_S.
+    # -1 = not frozen yet (DIR still uses unique_esi).
+    unique_at_flight: int = -1
 
 
 def merge_open_feedback(
@@ -47,10 +53,21 @@ def merge_open_feedback(
     limit: int = MAX_OPEN_BLOCKS,
     ghost_limit: int = MAX_GHOST_OPEN,
 ) -> list[OpenBlock]:
-    """Keep first-flight ghosts in ACK even when the active window is full."""
+    """Keep first-flight ghosts in ACK even when the active window is full.
+
+    Incomplete is oldest-first. If it does not fit, also keep the newest
+    tail IDs so the last blocks cannot fall out of the 80-open datagram.
+    """
     kept_ghosts = list(ghosts[: max(0, min(ghost_limit, limit))])
     room = max(0, limit - len(kept_ghosts))
-    return kept_ghosts + list(incomplete[:room])
+    if len(incomplete) <= room:
+        return kept_ghosts + list(incomplete)
+    tail_keep = min(8, room)
+    head_keep = room - tail_keep
+    head = list(incomplete[:head_keep])
+    head_ids = {item.block_id for item in head}
+    tail = [item for item in incomplete[-tail_keep:] if item.block_id not in head_ids]
+    return kept_ghosts + head + tail
 
 
 @dataclass(slots=True)
@@ -236,6 +253,9 @@ class BlockFeedback:
             _OPEN.pack(
                 item.block_id & 0xFFFFFFFF,
                 min(0xFFFF, max(0, item.unique_esi)),
+                _OPEN_FLIGHT_NONE
+                if item.unique_at_flight < 0
+                else min(0xFFFE, max(0, item.unique_at_flight)),
                 min(255, max(0, item.age_bucket)),
                 1 if item.decode_failed else 0,
             )
@@ -270,8 +290,16 @@ class BlockFeedback:
             off += _RANGE.size
         opened: list[OpenBlock] = []
         for _ in range(nopen):
-            block_id, rx, age, flags = _OPEN.unpack_from(data, off)
-            opened.append(OpenBlock(block_id, rx, bool(flags & 1), age))
+            block_id, rx, flight, age, flags = _OPEN.unpack_from(data, off)
+            opened.append(
+                OpenBlock(
+                    block_id,
+                    rx,
+                    bool(flags & 1),
+                    age,
+                    -1 if flight == _OPEN_FLIGHT_NONE else flight,
+                )
+            )
             off += _OPEN.size
         return cls(
             session,

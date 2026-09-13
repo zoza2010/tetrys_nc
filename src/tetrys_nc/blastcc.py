@@ -1,10 +1,12 @@
 """Rate search: BBR-like phases, filtered delivery, no channel cap.
 
 Unique ESI is delivered fountain symbols, not UDP C. Coverable iid loss
-makes unique/send ~0.75–1.0 with a flat RTT — that is FEC's job, not a
-cut. A policer is unique that does not rise when send rises. A HOL/window
-stall is a unique cliff under a still-high max_bw filter — hold or recover,
-do not lock that trickle as C.
+that is stable as send rises (unique/send ~0.75 at every rate, flat RTT)
+is FEC's job. Loss that grows with send is the knee of C: a dropper does
+not fill a queue, so qdelay stays ~0 and delay-CC keeps probing (Spain
+900 holds / 1000M ~5%). A policer is unique that does not rise when send
+rises. A HOL/window stall is a unique cliff under a still-high max_bw
+filter — hold or recover, do not lock that trickle as C.
 """
 
 from __future__ import annotations
@@ -58,6 +60,20 @@ _ABS_MIN_MBIT = 8.0
 _RTT_BOOTSTRAP_S = 0.08
 # Unique ESI is delivered payload, not source goodput.
 _DELIVERY_HEADROOM = 1.15
+# Channel is holding this send (Spain 800–900 / ~0%). 0.90 still looks
+# "fat" at iperf 1000M / 5% and walks into the dropper.
+_CLEAN_RATIO = 0.97
+# A dropper (Spain 800M ~0% → 1000M ~5%) does not build a queue, so
+# qdelay stays 0. If loss grows with send, that is C — not "FEC's job".
+_LOSS_NOISE = 0.02
+_LOSS_KNEE = 0.03
+# Dropper knee (iperf 1000M ~8%) still follows send. Encoder/window lag
+# does not: Spain startup_loss_knee was snd=764 / unq=415.
+_LOSS_KEEPUP = 0.85
+_LOSS_HOLD = 2
+# Latch the clean send (Spain 800–900 / ~0%). 0.97 walks the latch into
+# the 3% fringe (WAN lock sat at 964 with path_p50=7%).
+_KNEE_GOOD_RATIO = 0.99
 _STEP_MAX = 1.25
 _INFLIGHT_GAIN = 1.25
 _BW_WINDOW = 16
@@ -181,6 +197,10 @@ class BlastCc:
     oversend_n: int = 0
     bw_peak: float = 0.0
     bw_stall_n: int = 0
+    was_fat: bool = False
+    knee_bps: float = 0.0
+    saw_loss_knee: bool = False
+    loss_knee_n: int = 0
     _events: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -226,14 +246,16 @@ class BlastCc:
             return hard
         # Raise ceiling with delivery; never use a low unique-bw sample to
         # yank the rate down. Cuts are delay/policer.
-        return min(
-            hard,
-            max(
-                self.min_bps,
-                self.rate,
-                bw * _DELIVERY_HEADROOM,
-            ),
+        cap = max(
+            self.min_bps,
+            self.rate,
+            bw * _DELIVERY_HEADROOM,
         )
+        if self.saw_loss_knee:
+            knee = self._knee_bps()
+            if knee is not None:
+                cap = min(cap, max(self.rate, knee))
+        return min(hard, cap)
 
     def _startup_search_cap(self, hard: float) -> float:
         bw = self.bw.max_bw
@@ -245,7 +267,14 @@ class BlastCc:
         ref = bw
         if 0 < self.last_delivery <= bw * 1.50:
             ref = max(ref, self.last_delivery)
-        follow = _STARTUP_TRACK if self._iid_like() else _STARTUP_FOLLOW
+        if self.was_fat:
+            follow = _DELIVERY_HEADROOM
+        elif self._fat_pipe() or self.rate <= ref * _DELIVERY_HEADROOM:
+            follow = _DELIVERY_HEADROOM
+        elif self._iid_like():
+            follow = _STARTUP_TRACK
+        else:
+            follow = _STARTUP_FOLLOW
         return min(hard, max(self.min_bps, ref * follow))
 
     def _startup_ceiling(self) -> float:
@@ -263,12 +292,20 @@ class BlastCc:
         bw = self.bw.max_bw
         if bw is None:
             return hard
-        # Fat unique≈send: 1.15× sits near C (~900). Coverable iid
-        # (unique/send ~0.77) needs 1.50× or the search locks unique×1.10.
-        send = self._send_ref()
-        fat = send > 0 and bw >= send * 0.90
-        follow = _DELIVERY_HEADROOM if fat else _STARTUP_TRACK
-        return min(hard, max(self.min_bps, bw * follow))
+        if self.was_fat:
+            follow = _DELIVERY_HEADROOM
+        elif self._fat_pipe() or self.rate <= bw * _DELIVERY_HEADROOM:
+            follow = _DELIVERY_HEADROOM
+        else:
+            follow = _STARTUP_TRACK
+        cap = bw * follow
+        # After loss grew with send, stop probing past the last clean rate.
+        # Do not pin startup climb to the first 8 Mbit 0%-loss sample.
+        if self.saw_loss_knee:
+            knee = self._knee_bps()
+            if knee is not None:
+                cap = min(cap, knee)
+        return min(hard, max(self.min_bps, cap))
 
     def _note_bw(self, settled: bool) -> None:
         bw = self.bw.max_bw
@@ -288,10 +325,86 @@ class BlastCc:
             return False
         return self.rate >= bw * 0.95
 
+    def _fat_pipe(self) -> bool:
+        """Live unique keeps up with flush. Use last_delivery, not max_bw."""
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        got = self.last_delivery
+        if got <= 0 or send <= 0:
+            return False
+        if self._unique_cliff():
+            return False
+        ok = got >= send * 0.90
+        if ok:
+            self.was_fat = True
+        return ok
+
+    def _clean_pipe(self) -> bool:
+        """Send is still in the ~0% region (lock-900), not iperf 1000/5%."""
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        got = self.last_delivery
+        if got <= 0 or send <= 0 or self._unique_cliff():
+            return False
+        return got >= send * _CLEAN_RATIO
+
+    def _should_lock_c(self) -> bool:
+        """Fat path, delivery filter stalled: that is C, including a clean
+        0% plateau. Skipping a clean stall entered cruise and probed +10%
+        into the dropper; HOL then wrecked_cut to ~50 MiB/s.
+        """
+        if not self.was_fat or self._unique_cliff() or self._send_paused():
+            return False
+        if self.bw_stall_n < _BW_STALL:
+            return False
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        got = self.last_delivery
+        if send <= 0 or got <= 0:
+            return False
+        return True
+
+    def _locked_c(self) -> bool:
+        """Already sitting on measured C. HOL dips are not a new cap."""
+        return self.saw_loss_knee and self.knee_bps > 0
+
+    def _hold_locked_c(self) -> None:
+        """`--rate` does not cut because unique cliffed for a round-trip."""
+        if not self._locked_c():
+            return
+        self.rate = self.knee_bps
+        self.last_good = max(self.last_good, self.knee_bps)
+
+    def _near_delivery(self) -> bool:
+        bw = self.bw.max_bw
+        if bw is None or bw <= 0:
+            return False
+        return self.rate <= bw * _DELIVERY_HEADROOM * 1.01
+
     @property
     def fec_may_raise(self) -> bool:
         """FEC may raise only after the path is classified, not while hunting C."""
         return self.phase in (CRUISE, PROBE) and not self._pipe_oversend()
+
+    @property
+    def fec_may_lower(self) -> bool:
+        """Probe-down on a fat pipe like `--rate` (CC off). Hold in drain."""
+        if self._pipe_oversend():
+            return False
+        if self.phase == DRAIN:
+            return False
+        if self.phase == CRUISE:
+            return True
+        return self.phase in (STARTUP, PROBE, MEASURE) and (
+            self._fat_pipe() or self._near_delivery()
+        )
+
+    @property
+    def fec_may_lower_floor(self) -> bool:
+        """Below 18% only when sitting on filtered C, not a 1.4× probe."""
+        if not self.fec_may_lower:
+            return False
+        bw = self.bw.max_bw
+        if bw is None or bw <= 0:
+            return False
+        return self.rate >= bw * 0.85 and self.rate <= bw * _DELIVERY_HEADROOM * 1.01
 
     def pull_events(self) -> list[str]:
         ev, self._events = self._events, []
@@ -316,6 +429,8 @@ class BlastCc:
         if self.phase == MEASURE:
             return min(self._rate_ceiling(), max(self.min_bps, rate))
         floor = max(self.min_bps, self.last_good * _GOOD_FLOOR)
+        if self._locked_c():
+            floor = max(floor, self.knee_bps)
         # Cruise clip includes self.rate so it cannot raise. Probe/startup
         # must use the search cap or iid never climbs off two-block fill.
         if self.phase == PROBE:
@@ -366,7 +481,10 @@ class BlastCc:
 
     def _admit_stall(self) -> bool:
         """HOL/window pause looks like qdelay. It is not a standing queue."""
-        return self._unique_cliff() or self._send_paused()
+        if self._unique_cliff() or self._send_paused():
+            return True
+        # After the dropper knee, RTT noise is reorder. Stay locked.
+        return self.saw_loss_knee
 
     def _pipe_starved(self) -> bool:
         """Less than two blocks in flight. Empty queue cannot be C."""
@@ -475,9 +593,144 @@ class BlastCc:
         ratio_old = max(delivered / send for send, delivered in slower)
         return ratio_now >= ratio_old * 0.92
 
+    @staticmethod
+    def _sample_loss(send: float, delivered: float) -> float:
+        if send <= 0:
+            return 1.0
+        return max(0.0, min(1.0, 1.0 - delivered / send))
+
+    def _dropper_knee_sample(self) -> bool:
+        """One sample looks like C, not encode lag / HOL / stable iid.
+
+        0% at 900 → 5–8% at 1000 still has unique ≈ send. A 2.88× startup
+        step or GRO burst leaves unique at ~0.5× send — that is not C.
+        """
+        if self._unique_cliff() or self._send_paused():
+            return False
+        # A 1.15× startup step with ACK lag looks like 13% loss. Wait until
+        # cruise/probe: unique has plateaued, then a faster send is C.
+        if self.phase == STARTUP:
+            return False
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        got = self.last_delivery
+        if send <= 0 or got <= 0:
+            return False
+        if got < send * _LOSS_KEEPUP:
+            return False
+        loss_now = self._sample_loss(send, got)
+        if self.knee_bps > 0 and send > self.knee_bps * 1.05:
+            if got < self.knee_bps * 0.90:
+                return False
+            return loss_now >= _LOSS_KNEE
+        slower = self._slower_pairs()
+        if len(slower) < 2:
+            return False
+        loss_old = min(self._sample_loss(s, d) for s, d in slower)
+        if loss_now <= loss_old + _LOSS_NOISE:
+            return False
+        return loss_now >= _LOSS_KNEE and loss_now >= loss_old + _LOSS_KNEE
+
+    def _note_loss_knee(self, now: float) -> None:
+        hit = self.phase != STARTUP and (
+            self._should_lock_c() or self._dropper_knee_sample()
+        )
+        if hit:
+            self.loss_knee_n += 1
+        else:
+            self.loss_knee_n = 0
+        if self.loss_knee_n >= _LOSS_HOLD:
+            if not self.saw_loss_knee:
+                self._lock_knee(now)
+            self.saw_loss_knee = True
+
+    def _c_lock_bps(self) -> float | None:
+        """Rate to sit at once unique no longer keeps up.
+
+        Unique fell vs the filter (Spain snd=1182/unq=845, bw=1017): lock
+        live unique — that is recv C. Unique still tracking send into a
+        leaky dropper (sim 1233/1121): lock the last 0.99 latch, not unique.
+        Never sit above live unique: Spain lock-1040 / unq=952 was the 5%
+        fringe (FEC 18%, first_close 89%) vs lock-900 at 4%/98%.
+        """
+        send = self.last_send_rate if self.last_send_rate > 0 else self.rate
+        delivery = self.last_delivery
+        bw = self.bw.max_bw
+        if self._clean_pipe() and send > 0:
+            knee = min(send, self.rate) if self.rate > 0 else send
+        elif (
+            delivery > 0
+            and bw is not None
+            and delivery < bw * _CLEAN_RATIO
+            and not self._unique_cliff()
+        ):
+            knee = delivery
+        elif self.knee_bps > 0:
+            knee = self.knee_bps
+        elif delivery > 0:
+            knee = delivery
+        else:
+            knee = bw
+        if knee is None or knee <= 0:
+            return None
+        if delivery > 0 and not self._clean_pipe():
+            knee = min(knee, delivery)
+        if send > 0 and knee > send:
+            knee = send
+        return knee
+
+    def _lock_knee(self, now: float) -> None:
+        """Sit like `--rate`. Do not keep probing C."""
+        knee = self._c_lock_bps()
+        if knee is None or knee <= 0:
+            return
+        self.knee_bps = knee
+        self.rate = min(self.rate, knee) if self.rate > 0 else knee
+        self.last_good = self.rate
+        self.saw_loss_knee = True
+        self._enter_cruise(now, take_rate=False)
+        self._emit("loss_knee_lock")
+
+    def _loss_grew(self) -> bool:
+        """Loss rose as send rose: past C even when the queue is empty.
+
+        Stable 23% iid is the same at every rate — FEC. 0% at 900 Mbit → 5%
+        at 1000 Mbit is the dropper knee. One lagged unique sample is not.
+        """
+        return self._dropper_knee_sample() and self.loss_knee_n >= _LOSS_HOLD
+
+    def _knee_bps(self) -> float | None:
+        """Highest flush that still had near-zero extra loss (lock-900)."""
+        if self.knee_bps > 0:
+            return self.knee_bps
+        return None
+
+    def _note_knee(self) -> None:
+        if self.saw_loss_knee:
+            return
+        send = self.last_send_rate
+        got = self.last_delivery
+        if send <= 0 or got <= 0 or self._unique_cliff():
+            return
+        # Encode pause: unique can dwarf a tiny limiter sample and look
+        # like 0% loss at 8 Mbit. Only latch while we are actually flushing.
+        if self.rate > 0 and send < self.rate * 0.50:
+            return
+        # GRO/ACK burst (snd=1100 at limiter 855) is not a higher C.
+        if self.rate > 0 and send > self.rate * 1.10:
+            return
+        if got / send >= _KNEE_GOOD_RATIO:
+            self.knee_bps = max(self.knee_bps, min(send, self.rate))
+
     def _over_delivery(self, *, window_full: bool) -> bool:
-        """Policer from elasticity: faster send did not raise unique."""
+        """Policer from elasticity: faster send did not raise unique.
+
+        Rising loss vs a slower send is enough: `_pipe_oversend` is false
+        while unique/send is still 0.95 (coverable), which is how Spain
+        walked 900 → 1.2 Gbit with an empty queue.
+        """
         del window_full
+        if self._loss_grew():
+            return True
         if not self._pipe_oversend():
             return False
         slower = self._slower_pairs()
@@ -488,6 +741,12 @@ class BlastCc:
         return ratio_now < ratio_old * 0.92
 
     def _aim_delivery(self) -> float:
+        if self._locked_c():
+            return self.knee_bps
+        if self._loss_grew():
+            knee = self._knee_bps()
+            if knee is not None:
+                return max(self.min_bps, knee)
         absorbed = self._absorbed_bps()
         if (
             self._unique_cliff()
@@ -513,9 +772,17 @@ class BlastCc:
         self.bw.samples.clear()
         self.bw_peak = 0.0
         self.bw_stall_n = 0
+        self.was_fat = False
+        self.knee_bps = 0.0
+        self.saw_loss_knee = False
+        self.loss_knee_n = 0
         self.send_samples.clear()
 
     def _cut_to_delivery(self, now: float, *, remember: bool = True) -> None:
+        if self._locked_c():
+            self._hold_locked_c()
+            self.last_step_ts = now
+            return
         self.rate = min(self.rate, self._aim_delivery())
         if remember:
             self.last_good = min(self.last_good, self.rate)
@@ -526,6 +793,11 @@ class BlastCc:
         burst sample. Trickle vs HOL only picks the cut: fill vs last_good×0.75.
         A 128 Mbit HOL dip at last_good=600 is not C=210.
         """
+        if self._locked_c():
+            self._hold_locked_c()
+            self.last_step_ts = now
+            self._emit("hold_knee")
+            return
         fill = self._starved_fill_bps()
         live = (
             max(self.min_bps, self.last_delivery * _POLICER_AIM)
@@ -539,6 +811,16 @@ class BlastCc:
             and self.last_delivery > 0
             and self.last_delivery < self.last_good * 0.35
         )
+        # Mid-transfer HOL on a latched plateau (unique ~400 Mbit, not a
+        # 50 Mbit dead window): sit on the knee. Forgetting C ratchets
+        # last_good×0.75 down to ~50 MiB/s.
+        if self.knee_bps > 0 and not trickle:
+            self.rate = self.knee_bps
+            self.last_good = max(self.last_good, self.knee_bps)
+            self.saw_loss_knee = True
+            self.last_step_ts = now
+            self._emit("hol_hold_knee")
+            return
         # Unique cliffed vs the burst filter: that sample is not C.
         # Spain 2026-09-13: unq=235 vs bw=1016 was not a trickle (fill~209),
         # so max_bw stayed 1016 and unique_cliff blocked every later probe.
@@ -730,9 +1012,13 @@ class BlastCc:
             return
         # Unique is path delivery even when decode lags. Confirming a cut
         # still needs decode to recover or a fat unique/send plateau.
+        self._note_knee()
         self.bw.observe(unique_rate)
         if self.phase != MEASURE:
-            self.send_samples.append((self._send_ref(), unique_rate))
+            send_ref = (
+                self.last_send_rate if self.last_send_rate > 0 else self._send_ref()
+            )
+            self.send_samples.append((send_ref, unique_rate))
             if len(self.send_samples) > _BW_WINDOW:
                 del self.send_samples[0]
 
@@ -758,6 +1044,7 @@ class BlastCc:
         self._observe_delivery(
             now, unique_bytes, decoded_bytes, sent_bytes, source_bytes
         )
+        self._note_loss_knee(now)
         self.last_extra = extra_frac
         if self._unique_cliff() and self.recv_lag:
             self.cliff_n += 1
@@ -827,16 +1114,30 @@ class BlastCc:
                 self._emit("startup_cliff_cut")
             elif oversend_held and (settled or self._unique_cliff()):
                 self._start_measure(now)
+            elif settled and policer:
+                self._cut_to_delivery(now)
+                self._enter_cruise(now)
+                self._emit("startup_loss_knee")
             elif at_cap:
                 self._emit("startup_at_cap")
                 self._enter_cruise(now)
             elif self._startup_bw_stalled(settled) and not starved:
                 bw = self.bw.max_bw or self.rate
-                aimed = max(self.min_bps, bw * _POLICER_AIM)
-                if self.rate > aimed:
-                    self.rate = aimed
-                self._emit("startup_stall")
-                self._enter_cruise(now, take_rate=not self.recv_lag)
+                # Fat + unique no longer keeping up: that is C. Lock now so
+                # cruise cannot probe 1.10× into the dropper (Spain 1015→1098,
+                # FEC stuck at 18%). A clean plateau still enters cruise.
+                if self._should_lock_c():
+                    self._emit("startup_stall")
+                    self._lock_knee(now)
+                else:
+                    if self.was_fat:
+                        aimed = max(self.min_bps, bw)
+                    else:
+                        aimed = max(self.min_bps, bw * _POLICER_AIM)
+                    if self.rate > aimed:
+                        self.rate = aimed
+                    self._emit("startup_stall")
+                    self._enter_cruise(now, take_rate=not self.recv_lag)
             elif now - self.last_step_ts >= step_s:
                 self.last_step_ts = now
                 self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
@@ -866,7 +1167,12 @@ class BlastCc:
                     and self.last_delivery < self._starved_fill_bps() * 0.40
                 )
             )
-            if starved and not oversend and empty_pipe:
+            if self._locked_c():
+                # Sit like `--rate`. A HOL unique dip (Spain mid-transfer
+                # ~50 MiB/s) is not a new C — wrecked_cut forgot the knee
+                # and ratcheted last_good×0.75 toward 400 Mbit.
+                self._hold_locked_c()
+            elif starved and not oversend and empty_pipe:
                 # Spain 22 Mbit / open=1: probe +10% and qdelay drain
                 # sat for 40s. Jump toward two-block BDP, then follow.
                 # A 90 Mbit shaper is also "starved" vs 2-block fill — that
@@ -898,8 +1204,11 @@ class BlastCc:
                 self._emit("cruise_cliff_cut")
             elif settled and oversend_held:
                 self._start_measure(now)
+            elif self._should_lock_c():
+                self._lock_knee(now)
             elif (
-                not holding
+                not self.saw_loss_knee
+                and not holding
                 and not policer
                 and not oversend
                 and qdelay < self._qdelay_stop()
@@ -930,9 +1239,14 @@ class BlastCc:
                         self.probe_base = self.rate
                         self.probe_decoded = self.last_decoded_rate
                         self.probe_unique = self.last_delivery
-                        gain = _PROBE_GAIN if plateau else (
-                            _STEP_MAX if follow or below_c else _PROBE_GAIN
-                        )
+                        if self.saw_loss_knee:
+                            gain = _PROBE_GAIN
+                        elif plateau:
+                            gain = _PROBE_GAIN
+                        elif follow or below_c:
+                            gain = _STEP_MAX
+                        else:
+                            gain = _PROBE_GAIN
                         self.rate = min(self._raise_ceiling(), self._nudge(gain))
                         self.probe_until = now + max(0.32, 4.0 * self._rtt_s())
         elif self.phase == PROBE:
@@ -1001,10 +1315,23 @@ class BlastCc:
                     and not self._over_delivery(window_full=window_full)
                 )
                 if better:
-                    if not self.recv_lag:
+                    knee = self._knee_bps()
+                    past_knee = (
+                        self.saw_loss_knee
+                        and knee is not None
+                        and self.rate > knee * 1.05
+                    )
+                    if past_knee:
+                        self.rate = self.probe_base
+                        self._emit("probe_revert knee")
+                        self._enter_cruise(now, take_rate=False)
+                    elif not self.recv_lag:
                         self.last_good = self.rate
-                    self._emit("probe_keep")
-                    self._enter_cruise(now, take_rate=not self.recv_lag)
+                        self._emit("probe_keep")
+                        self._enter_cruise(now, take_rate=not self.recv_lag)
+                    else:
+                        self._emit("probe_keep")
+                        self._enter_cruise(now, take_rate=False)
                 else:
                     self.rate = self.probe_base
                     self._emit("probe_revert no_gain")
