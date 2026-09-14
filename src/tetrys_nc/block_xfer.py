@@ -37,8 +37,6 @@ from .block_packets import (
 )
 from .block_state import (
     BlockGeometry,
-    FEC_FLOOR_PCT,
-    FEC_MAX_PCT,
     FEC_RAPTORQ_MARGIN,
     resolve_fec_cli,
     REPAIR_AGE_S,
@@ -46,7 +44,6 @@ from .block_state import (
     REPAIR_INTERVAL_S,
     TAIL_REPAIR_COOLDOWN_S,
     TAIL_REPAIR_TICK_PER_BLOCK,
-    HOL_EXTRA_FRAC,
     SenderBlockState,
     SenderFeedbackState,
     WAN_ACTIVE_BYTES,
@@ -210,11 +207,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _env_str(name: str, default: str) -> str:
-    raw = os.environ.get(name, "").strip()
-    return raw if raw else default
-
-
 def _pace_limits(rate_mbit: float, *, cc: bool = False) -> tuple[float, float, float]:
     if cc:
         # Search cap is not a path guess. Always above 1 Gbit unless env is
@@ -358,7 +350,6 @@ class BlockSender:
         geometry: BlockGeometry,
         *,
         initial_repair_pct: int,
-        fec_mode: str | None = None,
         min_bps: float,
         max_bps: float,
         start_bps: float,
@@ -399,18 +390,7 @@ class BlockSender:
             if cc_on
             else None
         )
-        fec_mode = (fec_mode or _env_str("TETRYS_FEC_MODE", "quantile")).lower()
-        if fec_mode not in ("fixed", "quantile"):
-            fec_mode = "quantile"
-        fec_floor = int(_env_float("TETRYS_FEC_FLOOR", FEC_FLOOR_PCT))
-        fec_max = int(_env_float("TETRYS_FEC_MAX", FEC_MAX_PCT))
-        self.repair_ctl = make_fec_controller(
-            int(initial_repair_pct),
-            mode=fec_mode,
-            floor_pct=fec_floor,
-            max_pct=fec_max,
-            clamp_cold=fec_mode != "fixed",
-        )
+        self.repair_ctl = make_fec_controller(int(initial_repair_pct))
         self.active: dict[int, SenderBlockState] = {}
         self.enc_cache: dict[int, GenEncoder] = {}
         self.enc_order: list[int] = []
@@ -440,7 +420,6 @@ class BlockSender:
         self.flight_loss_samples: list[float] = []
         self.late_frac_samples: list[float] = []
         self._wait_flight: dict[int, SenderBlockState] = {}
-        self.probe_ids: set[int] = set()
         self.last_unique = 0
         self.source_wire_total = 0
         self.repair_wire_total = 0
@@ -554,18 +533,7 @@ class BlockSender:
         return encoder
 
     def _observe_fec(self, sample) -> None:
-        cc = self.cc
-        busy = self.extra_win.pressure()
-        jammed = self.extra_win.frac >= HOL_EXTRA_FRAC
-        self.repair_ctl.observe_block(
-            sample,
-            allow_up=cc is None or cc.fec_may_raise or jammed,
-            allow_down=(cc is None or cc.fec_may_lower) and not busy and not jammed,
-            allow_down_low=(cc is None or cc.fec_may_lower_floor)
-            and not busy
-            and not jammed,
-            window_busy=jammed,
-        )
+        self.repair_ctl.observe_block(sample)
 
     def _reap_completed(
         self,
@@ -709,6 +677,18 @@ class BlockSender:
         self.timers.repair_s += time.perf_counter() - t_r
         return sent
 
+    def _has_decode_debt(self, opened: dict, now: float) -> bool:
+        """Drip repair as soon as a block is old and not yet first-closed."""
+        need = self.block_k + FEC_RAPTORQ_MARGIN
+        for block_id, state in self.active.items():
+            if now - state.sent_at < REPAIR_AGE_S:
+                continue
+            item = opened.get(block_id)
+            rx = item.unique_esi if item is not None else state.unique_rx
+            if rx < need:
+                return True
+        return False
+
     def _still_needed(self, bid: int) -> bool:
         return (
             self.next_block <= bid < self.total_blocks
@@ -755,10 +735,6 @@ class BlockSender:
 
     def _submit_encode(self, bid: int) -> None:
         pct = self.repair_ctl.encode_pct(bid)
-        if self.repair_ctl.is_down_probe(bid):
-            self.probe_ids.add(bid)
-        else:
-            self.probe_ids.discard(bid)
         fut = self.encode_pool.submit(
             encode_block_job,
             self.file_path_str,
@@ -804,9 +780,7 @@ class BlockSender:
                 initial_repair=budget,
                 repair_emitted=budget,
                 sent_at=time.monotonic(),
-                probe=self.next_block in self.probe_ids,
             )
-            self.probe_ids.discard(self.next_block)
             self.last_encode_pct = int(
                 round(100.0 * budget / max(1, self.geometry.block_k))
             )
@@ -838,8 +812,6 @@ class BlockSender:
                 f"unq={cc.last_delivery * 8 / 1e6:.0f} "
                 f"good={cc.last_good * 8 / 1e6:.0f} "
                 f"ov={int(cc._pipe_oversend())} "
-                f"fec_up={int(cc.fec_may_raise)} "
-                f"fec_dn={int(cc.fec_may_lower)} "
             )
         print(
             f"progress sent={self.next_block}/{self.total_blocks} "
@@ -910,13 +882,14 @@ class BlockSender:
                 admitted = self._admit_source()
 
                 window_full = len(self.active) >= self.geometry.active_blocks
+                drip = tail or window_full or self._has_decode_debt(opened, now)
                 if tail:
                     repair_gap = TAIL_REPAIR_COOLDOWN_S
                 elif window_full:
                     repair_gap = 0.0
                 else:
                     repair_gap = REPAIR_INTERVAL_S
-                if (tail or window_full) and now - self.last_repair_loop >= repair_gap:
+                if drip and now - self.last_repair_loop >= repair_gap:
                     self._repair_tick(
                         opened, now, tail, window_full=window_full
                     )
@@ -1389,7 +1362,6 @@ def run_block_server(
                 file_path,
                 geometry,
                 initial_repair_pct=fec_start,
-                fec_mode=fec_mode,
                 min_bps=min_bps,
                 max_bps=max_bps,
                 start_bps=start_bps,

@@ -1,4 +1,4 @@
-"""Local netem A/B: fixed-24 / fixed-8 / quantile on clean, iid, burst."""
+"""Local netem A/B: fixed-24 vs fixed-8 on clean, iid, burst."""
 
 from __future__ import annotations
 
@@ -13,16 +13,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from tetrys_nc.block_state import (  # noqa: E402
-    adaptive_gate_failures,
-    parse_done_metrics,
-)
+from tetrys_nc.block_state import parse_done_metrics  # noqa: E402
 
 BLOB = ROOT / "testdata" / "blob_256m.bin"
 MODES = (
-    ("fixed-24", "fixed", "24"),
-    ("fixed-8", "fixed", "8"),
-    ("quantile", "quantile", None),
+    ("fixed-24", "24"),
+    ("fixed-8", "8"),
 )
 PROFILES = ("clean-rtt", "lossy", "spain")
 REPEATS = 2
@@ -32,7 +28,7 @@ TIMEOUT = 90
 BASE_PORT = 18200
 
 
-def _run(profile: str, mode: str, overhead: str | None, port: int, work: Path) -> dict:
+def _run(profile: str, overhead: str, port: int, work: Path) -> dict:
     out = work / "recv.bin"
     srv_log = work / "srv.log"
     emu_log = work / "emu.log"
@@ -40,7 +36,6 @@ def _run(profile: str, mode: str, overhead: str | None, port: int, work: Path) -
     env["TETRYS_GSO"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("TETRYS_CC", "0")
-    env["TETRYS_FEC_MODE"] = mode
     py = [sys.executable, "-u", "-m", "tetrys_nc"]
     srv_cmd = py + [
         "server",
@@ -173,7 +168,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="fec-ab-") as tmp:
         tmp_path = Path(tmp)
         for profile in PROFILES:
-            for mode_name, mode, overhead in MODES:
+            for mode_name, overhead in MODES:
                 samples = []
                 for rep in range(REPEATS):
                     n += 1
@@ -185,7 +180,7 @@ def main() -> int:
                         f"{profile} {mode_name} r{rep+1}",
                         flush=True,
                     )
-                    got = _run(profile, mode, overhead, port, work)
+                    got = _run(profile, overhead, port, work)
                     got.update(profile=profile, mode=mode_name, rep=rep + 1)
                     samples.append(got)
                     runs.append(got)
@@ -199,7 +194,7 @@ def main() -> int:
     summary = []
     for profile in PROFILES:
         by_mode = {}
-        for mode_name, _, _ in MODES:
+        for mode_name, _ in MODES:
             chunk = [
                 r
                 for r in runs
@@ -222,32 +217,7 @@ def main() -> int:
                     [float(r["fec_end"]) for r in chunk if r["fec_end"] is not None]
                 ),
             }
-        gates = {}
-        f24 = by_mode["fixed-24"]
-        from tetrys_nc.block_state import FecRunMetrics
-
-        if f24["goodput_med"] is not None and f24["wire_med"] is not None:
-            fixed = FecRunMetrics(
-                f24["goodput_med"],
-                f24["source_med"] or 0.0,
-                f24["repair_med"] or 0.0,
-                tail_s=f24["tail_med"] or 0.0,
-                pace_p10=200.0,
-            )
-            for name in ("fixed-8", "quantile"):
-                m = by_mode[name]
-                if m["goodput_med"] is None:
-                    gates[name] = ["no metrics"]
-                    continue
-                other = FecRunMetrics(
-                    m["goodput_med"],
-                    m["source_med"] or 0.0,
-                    m["repair_med"] or 0.0,
-                    tail_s=m["tail_med"] or 0.0,
-                    pace_p10=200.0,
-                )
-                gates[name] = adaptive_gate_failures(profile, fixed, other, wan_min_mib=0.0)
-        summary.append({"profile": profile, "modes": by_mode, "gates": gates})
+        summary.append({"profile": profile, "modes": by_mode})
     out = {
         "file": str(BLOB.name),
         "size_mib": BLOB.stat().st_size / 1048576,

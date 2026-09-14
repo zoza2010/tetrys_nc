@@ -152,7 +152,6 @@ def test_wan_profiles_transfer_8m(tmp_path: Path, profile: str) -> None:
     port = ports[profile]
     ok, srv, emu = _run_through_netem(
         tmp_path, blob, profile, srv_port=port, timeout=35, rate="200",
-        extra_env={"TETRYS_FEC_MODE": "fixed"},
         gen_overhead="24",
     )
     valid = "valid=True" in emu or (
@@ -182,7 +181,7 @@ def _ensure_blob_8m() -> Path:
 
 
 @pytest.mark.parametrize("profile", ("clean-rtt", "spain"))
-def test_adaptive_fec_clean_and_burst_complete(tmp_path: Path, profile: str) -> None:
+def test_static_fec_clean_and_burst_complete(tmp_path: Path, profile: str) -> None:
     pytest.importorskip("raptorq")
     blob = _ensure_blob_8m()
     ports = {"clean-rtt": 17710, "spain": 17720}
@@ -195,22 +194,11 @@ def test_adaptive_fec_clean_and_burst_complete(tmp_path: Path, profile: str) -> 
         srv_port=ports[profile],
         timeout=35,
         rate="200",
-        extra_env={"TETRYS_FEC_MODE": "quantile"},
     )
     valid = "valid=True" in emu or (
         "queue_drop=0" in emu and "jumbo_drop=0" in emu
     )
-    assert ok, f"{profile} adaptive did not complete\n{emu[-400:]}\n{srv[-400:]}"
+    assert ok, f"{profile} did not complete\n{emu[-400:]}\n{srv[-400:]}"
     assert "done in" in srv, srv[-800:]
     assert "fec=" in srv
     assert valid, f"{profile} netem invalid\n{emu[-400:]}"
-
-
-def test_adaptive_gate_helpers_match_plan():
-    """Matched WAN A/B: parse done-lines then gate quantile vs locked 24%."""
-    from tetrys_nc.block_state import FecRunMetrics, adaptive_gate_failures
-
-    fixed = FecRunMetrics(79.0, 2587.0, 40.0, tail_s=0.8, pace_p10=850.0)
-    adaptive = FecRunMetrics(78.5, 2200.0, 55.0, tail_s=0.7, pace_p10=850.0)
-    assert adaptive_gate_failures("clean-rtt", fixed, adaptive) == []
-    assert adaptive_gate_failures("burst", fixed, adaptive) == []

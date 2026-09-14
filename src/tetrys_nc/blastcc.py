@@ -1,12 +1,15 @@
-"""Rate search: BBR-like phases, filtered delivery, no channel cap.
+"""Rate search: path class first, then BBR-like phases.
 
-Unique ESI is delivered fountain symbols, not UDP C. Coverable iid loss
-that is stable as send rises (unique/send ~0.75 at every rate, flat RTT)
-is FEC's job. Loss that grows with send is the knee of C: a dropper does
-not fill a queue, so qdelay stays ~0 and delay-CC keeps probing (Spain
-900 holds / 1000M ~5%). A policer is unique that does not rise when send
-rises. A HOL/window stall is a unique cliff under a still-high max_bw
-filter — hold or recover, do not lock that trickle as C.
+CC owns the wire rate. FEC is a static first-flight pad plus drip until
+decode — it must not hunt C. Unique ESI is delivered fountain symbols,
+not UDP C.
+
+Path class:
+  queue    — standing RTT inflation with a live pipe (keep qdelay drain)
+  dropper  — first-flight p grows with send, RTT flat; lock last-clean send
+  policer  — send rises, unique does not
+  iid      — p stable as send rises; FEC's job, not a rate cut
+  hol      — unique cliff / send pause; do not lock that trickle as C
 """
 
 from __future__ import annotations
@@ -21,6 +24,13 @@ DRAIN = "drain"
 CRUISE = "cruise"
 PROBE = "probe"
 MEASURE = "measure"
+
+PATH_UNKNOWN = "unknown"
+PATH_IID = "iid"
+PATH_DROPPER = "dropper"
+PATH_POLICER = "policer"
+PATH_QUEUE = "queue"
+PATH_HOL = "hol"
 
 # Queue trip as a fraction of measured min_rtt (80 ms WAN ⇒ 40/15/50 ms).
 _QDELAY_STOP_FRAC = 0.50
@@ -185,6 +195,8 @@ class BlastCc:
     last_fb: int = -1
     last_extra: float = 0.0
     last_path_loss: float | None = None
+    last_qdelay: float = 0.0
+    path_kind: str = PATH_UNKNOWN
     last_sent: int = 0
     last_send_rate: float = 0.0
     last_source: int = 0
@@ -205,6 +217,7 @@ class BlastCc:
     was_fat: bool = False
     knee_bps: float = 0.0
     saw_loss_knee: bool = False
+    dropper_confirmed: bool = False
     loss_knee_n: int = 0
     _events: list[str] = field(default_factory=list)
 
@@ -234,6 +247,10 @@ class BlastCc:
 
     def _rate_ceiling(self) -> float:
         hard = min(self.max_bps, self._inflight_ceiling())
+        # Confirmed dropper only. A soft lock (637 then path_p=0) must
+        # still be allowed to climb; pinning the cap froze WAN at 156/637.
+        if self.dropper_confirmed and self.knee_bps > 0:
+            return min(hard, max(self.min_bps, self.knee_bps))
         if self.phase == STARTUP:
             cap = self._startup_search_cap(hard)
             # One-block unique (~22 Mbit) is not C. Once 16 MiB has landed,
@@ -250,16 +267,12 @@ class BlastCc:
         if bw is None:
             return hard
         # Raise ceiling with delivery; never use a low unique-bw sample to
-        # yank the rate down. Cuts are delay/policer.
+        # yank the rate down. Cuts are delay/policer/dropper.
         cap = max(
             self.min_bps,
             self.rate,
             bw * _DELIVERY_HEADROOM,
         )
-        if self.saw_loss_knee:
-            knee = self._knee_bps()
-            if knee is not None:
-                cap = min(cap, max(self.rate, knee))
         return min(hard, cap)
 
     def _startup_search_cap(self, hard: float) -> float:
@@ -290,7 +303,7 @@ class BlastCc:
         bw = self.bw.max_bw
         if bw is None:
             return hard
-        if self.saw_loss_knee:
+        if self.dropper_confirmed:
             knee = self._knee_bps()
             cap = knee if knee is not None else bw
         else:
@@ -392,46 +405,33 @@ class BlastCc:
         """Already sitting on measured C. HOL dips are not a new cap."""
         return self.saw_loss_knee and self.knee_bps > 0
 
+    def _dropper_frozen(self) -> bool:
+        """A probe already saw first-flight grow with send. Sit like `--rate`."""
+        return self.dropper_confirmed and self._locked_c()
+
+    def _may_search_past_lock(self) -> bool:
+        """Soft lock plus a quiet pipe is a plateau, not C.
+
+        WAN 2026-09-14: loss_knee_lock 637 / path=7.1% lag=1, then
+        path_p50=0% / unique tracking, pace_p10=med=max=637 for the file.
+        HOL unique cliff must still hold the latch (not wrecked_cut).
+        """
+        if self._dropper_frozen():
+            return False
+        if not self._locked_c():
+            return True
+        if self._hol_stall() or self._unique_cliff() or self.path_kind == PATH_QUEUE:
+            return False
+        if self.last_path_loss is not None and self.last_path_loss >= _LOSS_KNEE:
+            return False
+        return True
+
     def _hold_locked_c(self) -> None:
         """`--rate` does not cut because unique cliffed for a round-trip."""
         if not self._locked_c():
             return
         self.rate = self.knee_bps
         self.last_good = max(self.last_good, self.knee_bps)
-
-    def _near_delivery(self) -> bool:
-        bw = self.bw.max_bw
-        if bw is None or bw <= 0:
-            return False
-        return self.rate <= bw * _DELIVERY_HEADROOM * 1.01
-
-    @property
-    def fec_may_raise(self) -> bool:
-        """FEC may raise only after the path is classified, not while hunting C."""
-        return self.phase in (CRUISE, PROBE) and not self._pipe_oversend()
-
-    @property
-    def fec_may_lower(self) -> bool:
-        """Probe-down on a fat pipe like `--rate` (CC off). Hold in drain."""
-        if self._pipe_oversend():
-            return False
-        if self.phase == DRAIN:
-            return False
-        if self.phase == CRUISE:
-            return True
-        return self.phase in (STARTUP, PROBE, MEASURE) and (
-            self._fat_pipe() or self._near_delivery()
-        )
-
-    @property
-    def fec_may_lower_floor(self) -> bool:
-        """Below 18% only when sitting on filtered C, not a 1.4× probe."""
-        if not self.fec_may_lower:
-            return False
-        bw = self.bw.max_bw
-        if bw is None or bw <= 0:
-            return False
-        return self.rate >= bw * 0.85 and self.rate <= bw * _DELIVERY_HEADROOM * 1.01
 
     def pull_events(self) -> list[str]:
         ev, self._events = self._events, []
@@ -449,6 +449,7 @@ class BlastCc:
             f"good={self.last_good * 8 / 1_000_000:.0f} "
             f"knee={self.knee_bps * 8 / 1_000_000:.0f} "
             f"path={(self.last_path_loss or 0.0) * 100:.1f}% "
+            f"kind={self.path_kind} "
             f"lag={int(self.recv_lag)} ov={int(self._pipe_oversend())}"
         )
 
@@ -508,12 +509,45 @@ class BlastCc:
             return True
         return self.last_send_rate < self.rate * 0.30
 
-    def _admit_stall(self) -> bool:
+    def _hol_stall(self) -> bool:
         """HOL/window pause looks like qdelay. It is not a standing queue."""
-        if self._unique_cliff() or self._send_paused():
-            return True
-        # After the dropper knee, RTT noise is reorder. Stay locked.
-        return self.saw_loss_knee
+        return self._unique_cliff() or self._send_paused()
+
+    def _admit_stall(self) -> bool:
+        return self._hol_stall()
+
+    def _standing_queue(self) -> bool:
+        """Persistent RTT inflation with a live pipe. Reorder + HOL is not C.
+
+        A dropper (Spain) keeps qdelay ~0. If the path later becomes a
+        real queue, drain even after a last-clean lock.
+        """
+        if self._hol_stall() or self._pipe_starved():
+            return False
+        if self.high_delay_n < _QDELAY_HOLD:
+            return False
+        if self.last_qdelay < self._qdelay_stop():
+            return False
+        return self.last_delivery > 0
+
+    def _path_class(self) -> str:
+        if self._hol_stall() and (
+            self.last_path_loss is None or self.last_path_loss < _LOSS_NOISE
+        ):
+            return PATH_HOL
+        if self._standing_queue():
+            return PATH_QUEUE
+        if self._path_loss_grew() or self._dropper_knee_sample():
+            return PATH_DROPPER
+        if (
+            self._pipe_oversend()
+            and not self._iid_like()
+            and not self._loss_tracks_send()
+        ):
+            return PATH_POLICER
+        if self._iid_like() and not self._clean_pipe() and not self._path_loss_grew():
+            return PATH_IID
+        return PATH_UNKNOWN
 
     def _pipe_starved(self) -> bool:
         """Less than two blocks in flight. Empty queue cannot be C."""
@@ -636,14 +670,10 @@ class BlastCc:
         """
         if self._unique_cliff() or self._send_paused():
             return False
-        # First-flight still ~0: unique lag is HOL/ACK, not the dropper.
-        # WAN locked 40 Mbit at snd=267/unq=240/path=0%.
-        if self.last_path_loss is not None and self.last_path_loss < _LOSS_KNEE:
+        # Unique/send without first-flight is ACK lag (fixed FEC used to
+        # skip path_loss: WAN locked 66 Mbit at snd=210/unq=194/path=None).
+        if self.last_path_loss is None or self.last_path_loss < _LOSS_KNEE:
             return False
-        # A 1.15× startup step with ACK lag looks like 13% loss. First-flight
-        # loss still lets Startup lock last-clean-send like BBR v2 (high
-        # loss → exit Startup). Unique lag without path_loss stays filtered
-        # by _LOSS_KEEPUP.
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
         got = self.last_delivery
         if send <= 0 or got <= 0:
@@ -724,17 +754,19 @@ class BlastCc:
         delivery = self.last_delivery
         bw = self.bw.max_bw
         knee = self._last_clean_send()
-        # 8 Mbit 0.99 latch vs unique 260 is a ramp leftover, not C.
-        floor = max(self.min_bps, self.start_bps) * 4
+        # 8 Mbit / 66 Mbit 0.99 latch vs unique 194 is a ramp leftover, not C.
         if (
             knee is not None
             and delivery > 0
-            and knee <= floor
             and knee < delivery * 0.50
             and not self._unique_cliff()
+            and (self.last_path_loss is None or self.last_path_loss < _LOSS_KNEE)
         ):
             knee = None
         if knee is None or knee <= 0:
+            # Dirty first-flight: unique/delivery is the dropper recv, not C.
+            if self.last_path_loss is not None and self.last_path_loss >= _LOSS_KNEE:
+                return None
             tracking = (
                 delivery > 0
                 and send > 0
@@ -745,8 +777,8 @@ class BlastCc:
                 knee = send
                 if self.rate > 0 and self.rate >= send * 0.85:
                     knee = min(send, self.rate)
-            elif delivery > 0 and not self._unique_cliff():
-                knee = delivery
+            elif self._clean_pipe() and send > 0:
+                knee = min(send, self.rate) if self.rate > 0 else send
             else:
                 knee = bw
         if knee is None or knee <= 0:
@@ -756,6 +788,7 @@ class BlastCc:
             and knee > send * 1.10
             and not self._send_paused()
             and not self._unique_cliff()
+            and not (delivery > 0 and send < delivery * 0.70)
         ):
             knee = send
         return knee
@@ -768,6 +801,20 @@ class BlastCc:
             if send > 0 and got / send >= _KNEE_GOOD_RATIO:
                 best = send if best is None else max(best, send)
         return best
+
+    def _abort_probe_dropper(self, now: float) -> None:
+        """Probe hit the dropper. Sit on the pre-probe shelf, not HOL send."""
+        base = self.knee_bps if self.knee_bps > 0 else self.probe_base
+        if base > 0:
+            self.knee_bps = base
+            self.rate = base
+            self.last_good = max(self.last_good, base)
+            self.saw_loss_knee = True
+            self.dropper_confirmed = True
+            self._enter_cruise(now, take_rate=False)
+            return
+        self._lock_knee(now)
+        self.dropper_confirmed = True
 
     def _lock_knee(self, now: float) -> None:
         """Sit like `--rate`. Do not keep probing C."""
@@ -878,6 +925,7 @@ class BlastCc:
         self.was_fat = False
         self.knee_bps = 0.0
         self.saw_loss_knee = False
+        self.dropper_confirmed = False
         self.loss_knee_n = 0
         self.send_samples.clear()
         self.path_samples.clear()
@@ -1149,6 +1197,7 @@ class BlastCc:
         raw_rtt = rtt_from_echo(now, echo_ts_us)
         qdelay = self.rtt.observe(now, raw_rtt)
         self.min_rtt = self.rtt.min_rtt
+        self.last_qdelay = qdelay
         if path_loss is not None:
             self.last_path_loss = max(0.0, min(1.0, float(path_loss)))
         self.last_extra = extra_frac
@@ -1182,7 +1231,8 @@ class BlastCc:
             self.high_delay_n = 0
 
         starved = self._pipe_starved()
-        buffer_full = (
+        self.path_kind = self._path_class()
+        buffer_full = self.path_kind == PATH_QUEUE or (
             qdelay >= self._qdelay_stop()
             and self.high_delay_n >= _QDELAY_HOLD
             and not self._admit_stall()
@@ -1220,6 +1270,8 @@ class BlastCc:
                 self.rate = self._clip(self._drain_target())
                 self.last_step_ts = now
                 self._emit("startup_drain qdelay")
+            elif self.path_kind == PATH_DROPPER:
+                self._lock_knee(now)
             elif oversend_held and (self._unique_cliff() or self._limiter_stale()):
                 self._recover_wrecked(now)
                 self._enter_cruise(now, take_rate=False)
@@ -1280,23 +1332,8 @@ class BlastCc:
                     and self.last_delivery < self._starved_fill_bps() * 0.40
                 )
             )
-            if self._locked_c():
-                # Sit like `--rate`. A HOL unique dip (Spain mid-transfer
-                # ~50 MiB/s) is not a new C — wrecked_cut forgot the knee
-                # and ratcheted last_good×0.75 toward 400 Mbit.
-                self._hold_locked_c()
-            elif starved and not oversend and empty_pipe:
-                # Spain 22 Mbit / open=1: probe +10% and qdelay drain
-                # sat for 40s. Jump toward two-block BDP, then follow.
-                # A 90 Mbit shaper is also "starved" vs 2-block fill — that
-                # is C, not an empty pipe. Only fill if unique is a trickle.
-                hard = min(self.max_bps, self._inflight_ceiling())
-                ceiling = min(hard, max(self.rate * _STEP_MAX, self._starved_fill_bps()))
-                if now - self.last_step_ts >= step_s and self.rate < ceiling * 0.98:
-                    self.last_step_ts = now
-                    self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
-                    self._emit("cruise_fill")
-            elif buffer_full:
+            if buffer_full:
+                # Queue can appear after a dropper lock (path change).
                 self.phase = DRAIN
                 self.drain_ts = now
                 self.drain_cuts = 1
@@ -1309,6 +1346,23 @@ class BlastCc:
                 self.last_step_ts = now
                 self.high_delay_n = 0
                 self._emit("cruise_drain qdelay")
+            elif self._locked_c() and not self._may_search_past_lock():
+                # Confirmed dropper, or soft lock while HOL/dirty first-flight.
+                # A quiet pipe after a false knee must fall through to fill/probe.
+                self._hold_locked_c()
+            elif starved and not oversend and empty_pipe:
+                # Spain 22 Mbit / open=1: probe +10% and qdelay drain
+                # sat for 40s. Jump toward two-block BDP, then follow.
+                # A 90 Mbit shaper is also "starved" vs 2-block fill — that
+                # is C, not an empty pipe. Only fill if unique is a trickle.
+                hard = min(self.max_bps, self._inflight_ceiling())
+                ceiling = min(hard, max(self.rate * _STEP_MAX, self._starved_fill_bps()))
+                if now - self.last_step_ts >= step_s and self.rate < ceiling * 0.98:
+                    self.last_step_ts = now
+                    self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
+                    self._emit("cruise_fill")
+            elif self.path_kind == PATH_DROPPER or self._path_loss_grew() or self._loss_grew():
+                self._lock_knee(now)
             elif settled and policer:
                 self._cut_to_delivery(now)
                 self._emit("cruise_policer")
@@ -1317,10 +1371,9 @@ class BlastCc:
                 self._emit("cruise_cliff_cut")
             elif settled and oversend_held:
                 self._start_measure(now)
-            elif self._path_loss_grew() or self._loss_grew():
-                self._lock_knee(now)
             elif (
-                not self.saw_loss_knee
+                self._may_search_past_lock()
+                and self.path_kind not in (PATH_DROPPER, PATH_QUEUE)
                 and not holding
                 and not policer
                 and not oversend
@@ -1352,9 +1405,7 @@ class BlastCc:
                         self.probe_base = self.rate
                         self.probe_decoded = self.last_decoded_rate
                         self.probe_unique = self.last_delivery
-                        if self.saw_loss_knee:
-                            gain = _PROBE_GAIN
-                        elif plateau:
+                        if plateau:
                             gain = _PROBE_GAIN
                         elif follow or below_c:
                             gain = _STEP_MAX
@@ -1374,30 +1425,37 @@ class BlastCc:
                 )
             )
             lag_stuck = recv_lag and not unique_held and not starved
-            if buffer_full or lag_stuck or policer or oversend_held:
+            dropper = self.path_kind == PATH_DROPPER or self._path_loss_grew()
+            if buffer_full or lag_stuck or policer or oversend_held or dropper:
                 why = (
                     "qdelay"
                     if buffer_full
                     else "lag"
                     if lag_stuck
+                    else "dropper"
+                    if dropper
                     else "policer"
                     if policer
                     else "oversend"
                 )
-                if why == "lag" and self.last_good > 0:
-                    fill = self._starved_fill_bps()
-                    self.rate = max(
-                        fill,
-                        min(
-                            self.probe_base,
-                            max(self.last_good, self.probe_base * _DRAIN_GAIN),
-                        ),
-                    )
+                if why == "dropper":
+                    self._emit(f"probe_abort {why}")
+                    self._abort_probe_dropper(now)
                 else:
-                    self.rate = self.probe_base
-                self.measure_holdoff = now + max(0.50, 4.0 * self._rtt_s())
-                self._emit(f"probe_abort {why}")
-                self._enter_cruise(now, take_rate=False)
+                    if why == "lag" and self.last_good > 0:
+                        fill = self._starved_fill_bps()
+                        self.rate = max(
+                            fill,
+                            min(
+                                self.probe_base,
+                                max(self.last_good, self.probe_base * _DRAIN_GAIN),
+                            ),
+                        )
+                    else:
+                        self.rate = self.probe_base
+                    self.measure_holdoff = now + max(0.50, 4.0 * self._rtt_s())
+                    self._emit(f"probe_abort {why}")
+                    self._enter_cruise(now, take_rate=False)
             elif now >= self.probe_until:
                 decode_gained = (
                     self.probe_decoded > 0
@@ -1430,7 +1488,7 @@ class BlastCc:
                 if better:
                     knee = self._knee_bps()
                     past_knee = (
-                        self.saw_loss_knee
+                        self.dropper_confirmed
                         and knee is not None
                         and self.rate > knee * 1.05
                     )

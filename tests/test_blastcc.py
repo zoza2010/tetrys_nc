@@ -8,6 +8,10 @@ from tetrys_nc.blastcc import (
     CRUISE,
     DRAIN,
     MEASURE,
+    PATH_DROPPER,
+    PATH_HOL,
+    PATH_IID,
+    PATH_QUEUE,
     PROBE,
     STARTUP,
     BlastCc,
@@ -61,31 +65,6 @@ def test_seed_is_bbr_like_fraction_not_full_cap():
     assert cc.rate == pytest.approx(_START * 0.90)
 
 
-def test_fec_may_lower_only_in_settled_cruise():
-    cc = _cc()
-    assert cc.fec_may_lower is False
-    assert cc.fec_may_lower_floor is False
-    cc.phase = PROBE
-    assert cc.fec_may_raise is True
-    assert cc.fec_may_lower is False
-    cc.phase = CRUISE
-    assert cc.fec_may_lower is True
-    assert cc.fec_may_lower_floor is False
-    rate = 900_000_000 / 8
-    cc.rate = rate
-    cc.last_good = rate
-    for x in (rate * 0.95, rate, rate * 1.02, rate * 0.98):
-        cc.bw.observe(x)
-    assert cc.fec_may_lower_floor is True
-    cc.rate = rate * 0.50
-    assert cc.fec_may_lower is True
-    assert cc.fec_may_lower_floor is False
-    cc.rate = rate * 1.40
-    assert cc.fec_may_lower_floor is False
-    cc.rate = rate * 1.15
-    assert cc.fec_may_lower_floor is True
-
-
 def test_startup_gain_is_bbr_until_fat():
     """Empty pipe: 2.89× BtlBw. After unique tracks send, walk 1.25×."""
     start = 8_000_000 / 8
@@ -103,7 +82,7 @@ def test_startup_gain_is_bbr_until_fat():
 
 
 def test_fat_startup_ceiling_walks_not_jump():
-    """`--rate 900` + auto FEC. 2.89× until stall; dirty stall 1.15×."""
+    """`--rate 900`. 2.89× until stall; dirty stall 1.15×."""
     start = 850_000_000 / 8
     cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
     cc.min_rtt = 0.08
@@ -119,8 +98,6 @@ def test_fat_startup_ceiling_walks_not_jump():
     assert cc._startup_search_cap(cc.max_bps) <= burst * 1.30
     assert cc._raise_ceiling() <= burst * 1.30
     cc.phase = STARTUP
-    assert cc.fec_may_lower is True
-    assert cc.fec_may_lower_floor is True
     cc.rate = burst * 1.12
     cc.last_send_rate = cc.rate
     cc.was_fat = True
@@ -993,6 +970,12 @@ def test_loss_grew_on_dropper_knee_not_stable_iid():
     cc.rate = 1_000_000_000 / 8
     cc.last_send_rate = cc.rate
     cc.last_delivery = 948_000_000 / 8
+    cc.last_path_loss = 0.05
+    cc.path_samples = [
+        (fat * 0.90, 0.0),
+        (fat * 0.95, 0.005),
+        (fat, 0.01),
+    ]
     assert cc._dropper_knee_sample() is True
     assert cc._loss_grew() is True
     knee = cc._knee_bps()
@@ -1044,6 +1027,22 @@ def test_dropper_knee_ignores_unique_lag_when_first_flight_quiet():
     ]
     assert cc._dropper_knee_sample() is False
     assert cc._path_loss_grew() is False
+
+
+def test_dropper_knee_needs_first_flight():
+    """Fixed FEC used to leave path_loss None; unique lag is not C."""
+    cc = _search_cc()
+    cc.phase = STARTUP
+    cc.rate = 66_000_000 / 8
+    cc.last_send_rate = 210_000_000 / 8
+    cc.last_delivery = 194_000_000 / 8
+    cc.send_samples = [
+        (30_000_000 / 8, 30_000_000 / 8),
+        (40_000_000 / 8, 40_000_000 / 8),
+        (50_000_000 / 8, 50_000_000 / 8),
+    ]
+    assert cc._dropper_knee_sample() is False
+    assert cc._path_class() != PATH_DROPPER
 
 
 def test_should_lock_c_when_unique_stalled_and_send_ahead():
@@ -1176,6 +1175,88 @@ def test_lock_knee_does_not_latch_dropper_fringe():
     assert cc.rate < 1_000_000_000 / 8
 
 
+def test_locked_ceiling_does_not_keep_dropper_walk():
+    """After lock, clip must sit on the knee, not the 1039 Mbit walk."""
+    cc = _search_cc()
+    clean = 900_000_000 / 8
+    cc.phase = CRUISE
+    cc.saw_loss_knee = True
+    cc.dropper_confirmed = True
+    cc.knee_bps = clean
+    cc.rate = 1_039_000_000 / 8
+    cc.last_good = cc.rate
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc._hold_locked_c()
+    cc.rate = cc._clip(cc.rate)
+    assert cc.rate == pytest.approx(clean)
+
+
+def test_path_class_dropper_vs_iid_vs_hol():
+    dropper = _search_cc()
+    clean = 900_000_000 / 8
+    dropper.rate = 1_000_000_000 / 8
+    dropper.last_send_rate = dropper.rate
+    dropper.last_delivery = 948_000_000 / 8
+    dropper.last_path_loss = 0.05
+    dropper.path_samples = [
+        (clean * 0.90, 0.0),
+        (clean * 0.95, 0.005),
+        (clean, 0.01),
+    ]
+    assert dropper._path_class() == PATH_DROPPER
+
+    iid = _search_cc()
+    iid.rate = 700_000_000 / 8
+    iid.last_send_rate = iid.rate
+    iid.last_delivery = iid.rate * 0.80
+    iid.last_path_loss = 0.20
+    iid.path_samples = [
+        (400_000_000 / 8, 0.20),
+        (500_000_000 / 8, 0.19),
+        (600_000_000 / 8, 0.21),
+    ]
+    iid.send_samples = [
+        (400_000_000 / 8, 400_000_000 / 8 * 0.80),
+        (500_000_000 / 8, 500_000_000 / 8 * 0.80),
+        (600_000_000 / 8, 600_000_000 / 8 * 0.80),
+    ]
+    for x in (iid.last_delivery * 0.95, iid.last_delivery, iid.last_delivery):
+        iid.bw.observe(x)
+    assert iid._path_class() == PATH_IID
+
+    hol = _search_cc()
+    hol.rate = 900_000_000 / 8
+    hol.last_send_rate = hol.rate
+    hol.last_delivery = 50_000_000 / 8
+    hol.last_path_loss = 0.0
+    absorbed = 900_000_000 / 8
+    for x in (absorbed * 0.95, absorbed, absorbed * 1.02):
+        hol.bw.observe(x)
+    assert hol._unique_cliff() is True
+    assert hol._path_class() == PATH_HOL
+
+
+def test_standing_queue_drains_after_dropper_lock():
+    """qdelay stays a real-queue detector even after last-clean lock."""
+    cc = _search_cc()
+    knee = 900_000_000 / 8
+    cc.phase = CRUISE
+    cc.saw_loss_knee = True
+    cc.knee_bps = knee
+    cc.rate = knee
+    cc.last_good = knee
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.last_delivery = knee
+    cc.last_send_rate = knee
+    cc.last_qdelay = 0.050
+    cc.high_delay_n = 4
+    assert cc._standing_queue() is True
+    assert cc._path_class() == PATH_QUEUE
+
+
 def test_lock_knee_discards_startup_leftover_latch():
     """WAN: 0.99 latch at 10 Mbit vs unique 260. Must not freeze at 10."""
     cc = _search_cc()
@@ -1191,6 +1272,24 @@ def test_lock_knee_discards_startup_leftover_latch():
         cc.bw.observe(x)
     cc._lock_knee(0.0)
     assert cc.rate > 200_000_000 / 8
+    assert cc.rate == pytest.approx(cc.last_send_rate)
+
+
+def test_lock_knee_discards_mid_ramp_leftover_latch():
+    """WAN static-8: 0.99 latch at 66 Mbit vs unique 194. Must keep climbing."""
+    cc = _search_cc()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = 66_000_000 / 8
+    cc.rate = 66_000_000 / 8
+    cc.last_good = cc.rate
+    cc.last_send_rate = 210_000_000 / 8
+    cc.last_delivery = 194_000_000 / 8
+    cc.last_path_loss = 0.0
+    for x in (180_000_000 / 8, 190_000_000 / 8, 194_000_000 / 8):
+        cc.bw.observe(x)
+    cc._lock_knee(0.0)
+    assert cc.rate > 150_000_000 / 8
     assert cc.rate == pytest.approx(cc.last_send_rate)
 
 
@@ -1243,6 +1342,127 @@ def test_c_lock_holds_through_hol_unique_cliff():
     assert cc.saw_loss_knee is True
     assert cc.rate == pytest.approx(knee)
     assert "wrecked_cut" not in " ".join(cc._events)
+
+
+def test_soft_lock_climbs_when_first_flight_goes_quiet():
+    """WAN 637 lock then path_p=0 must probe, not freeze pace_p10=med=max."""
+    cc = _search_cc()
+    knee = 637_000_000 / 8
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.saw_loss_knee = True
+    cc.dropper_confirmed = False
+    cc.knee_bps = knee
+    cc.rate = knee
+    cc.last_good = knee
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    cc.last_send_rate = knee
+    cc.last_delivery = knee
+    cc.last_path_loss = 0.0
+    cc.recv_lag = False
+    for x in (knee * 0.95, knee, knee * 1.02):
+        cc.bw.observe(x)
+    assert cc._may_search_past_lock() is True
+    assert cc._dropper_frozen() is False
+    _feed(
+        cc,
+        3.0,
+        1,
+        int(knee * 3.0),
+        0.08,
+        sent=int(knee * 3.0),
+        source=int(knee * 3.0),
+        path_loss=0.0,
+        decoded=int(knee * 3.0),
+    )
+    _feed(
+        cc,
+        3.20,
+        2,
+        int(knee * 3.20),
+        0.08,
+        sent=int(knee * 3.20),
+        source=int(knee * 3.20),
+        path_loss=0.0,
+        decoded=int(knee * 3.20),
+    )
+    assert cc.phase == PROBE, (cc.phase, cc.rate, cc._events)
+    assert cc.rate > knee
+
+
+def test_confirmed_dropper_does_not_probe_past_knee():
+    cc = _search_cc()
+    knee = 900_000_000 / 8
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.saw_loss_knee = True
+    cc.dropper_confirmed = True
+    cc.knee_bps = knee
+    cc.rate = knee
+    cc.last_good = knee
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.cruise_ts = 0.0
+    cc.last_send_rate = knee
+    cc.last_delivery = knee
+    cc.last_path_loss = 0.0
+    for x in (knee * 0.95, knee, knee * 1.02):
+        cc.bw.observe(x)
+    assert cc._may_search_past_lock() is False
+    _feed(
+        cc,
+        3.0,
+        1,
+        int(knee * 3.0),
+        0.08,
+        sent=int(knee * 3.0),
+        source=int(knee * 3.0),
+        path_loss=0.0,
+        decoded=int(knee * 3.0),
+    )
+    _feed(
+        cc,
+        3.20,
+        2,
+        int(knee * 3.20),
+        0.08,
+        sent=int(knee * 3.20),
+        source=int(knee * 3.20),
+        path_loss=0.0,
+        decoded=int(knee * 3.20),
+    )
+    assert cc.phase == CRUISE
+    assert cc.rate == pytest.approx(knee)
+
+
+def test_probe_abort_dropper_sits_on_probe_base_not_trickle_send():
+    """WAN 2026-09-14: probe_abort dropper snd=384/unq=727 locked 384."""
+    cc = _search_cc()
+    base = 937_000_000 / 8
+    cc.phase = PROBE
+    cc.was_fat = True
+    cc.saw_loss_knee = True
+    cc.knee_bps = base
+    cc.probe_base = base
+    cc.rate = 1_171_000_000 / 8
+    cc.last_good = base
+    cc.last_send_rate = 384_000_000 / 8
+    cc.last_delivery = 727_000_000 / 8
+    cc.last_path_loss = 0.034
+    for x in (1_000_000_000 / 8, 1_100_000_000 / 8, 1_131_000_000 / 8):
+        cc.bw.observe(x)
+    assert cc._c_lock_bps() == pytest.approx(base)
+    cc._abort_probe_dropper(8.0)
+    assert cc.rate == pytest.approx(base)
+    assert cc.knee_bps == pytest.approx(base)
+    assert cc.dropper_confirmed is True
+    assert cc.phase == CRUISE
 
 
 def test_c_lock_holds_rate_through_mid_transfer_hol():

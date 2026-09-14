@@ -30,22 +30,9 @@ from tetrys_nc.block_packets import (
 )
 from tetrys_nc.block_state import (
     BlockGeometry,
-    FEC_CLEAN_DOWN,
-    FEC_CLEAN_DOWN_LOW,
-    FEC_COLD_PCT,
-    FEC_COVER_MAX,
-    FEC_FLOOR_PCT,
-    FEC_NEED_CAP,
-    FEC_LEVELS,
-    FEC_MIN_TRAIN,
-    FEC_PROBE_PERIOD,
-    FEC_UP_QUANTILE,
-    FEC_SOFT_FLOOR,
-    FEC_WINDOW,
     FLIGHT_AGE_BUCKETS,
     REPAIR_AGE_S,
     REPAIR_COOLDOWN_S,
-    RepairDebtController,
     SenderBlockState,
     SenderFeedbackState,
     TAIL_REPAIR_COOLDOWN_S,
@@ -54,17 +41,12 @@ from tetrys_nc.block_state import (
     WAN_INITIAL_REPAIR_PCT,
     WAN_SYMBOL_SIZE,
     ExtraRepairWindow,
-    FecRunMetrics,
-    adaptive_gate_failures,
-    adaptive_start_pct,
     block_quartile,
     fmt_quartile_counts,
     fmt_quartile_pcts,
     resolve_fec_cli,
     block_loss_frac,
     dir_lightweight,
-    fec_level_ceil_index,
-    fec_level_index,
     fec_pct_for_loss,
     first_flight_unique,
     ghost_flight_ready,
@@ -420,32 +402,6 @@ def test_feedback_client_lost_after_silence():
     st.apply(BlockFeedback(1, 1, 1000, 500), now=10.0)
     assert st.client_lost(11.5, 9.5) is False
     assert st.client_lost(12.1, 9.5) is True
-
-
-def test_repair_debt_controller_ignores_packet_order():
-    ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=24.0)
-    first = ctl.observe(30, 768)
-    second = ctl.observe(30, 768)
-    assert first == second == 16
-
-
-def test_repair_debt_controller_holds_floor_and_slews_up():
-    ctl = RepairDebtController(16.0, min_pct=16.0, max_pct=22.0)
-    for _ in range(40):
-        ctl.observe(0, 768)
-    assert ctl.current == 16
-    jumped = ctl.observe(400, 768)
-    assert jumped == 16
-    for _ in range(3):
-        ctl.observe(400, 768)
-    assert 16 <= ctl.current <= 18
-    ctl2 = RepairDebtController(16.0, min_pct=16.0, max_pct=22.0)
-    for _ in range(80):
-        ctl2.observe(400, 768)
-    assert 16 < ctl2.current <= 22
-    for _ in range(20):
-        ctl2.observe(0, 768)
-    assert ctl2.current <= 18
 
 
 def test_repair_need_is_rank_only():
@@ -982,7 +938,7 @@ def test_slot_freezes_first_flight_not_dir_esi():
 
 
 def test_coverable_path_loss_ignores_hol():
-    ctl = make_fec_controller(24, mode="quantile")
+    ctl = make_fec_controller(24)
     ctl.path_loss.extend([0.10, 0.13, 0.87, 0.12, 0.91, 0.11])
     assert (ctl.path_loss_q(95) or 0.0) > 0.8
     assert (ctl.path_loss_q(50, coverable=True) or 0.0) < 0.15
@@ -1022,7 +978,7 @@ def test_dir_light_round_is_not_cc_pressure():
 
 
 def test_fixed_fec_keeps_requested_percent():
-    ctl = make_fec_controller(14, mode="fixed")
+    ctl = make_fec_controller(14)
     assert ctl.current == 14
     dirty = make_block_sample(_fec_state(500, extra=400, rounds=4), 768, tail=False)
     for _ in range(40):
@@ -1030,32 +986,16 @@ def test_fixed_fec_keeps_requested_percent():
     assert ctl.current == 14
 
 
-def test_fec_level_ceil_covers_need_not_nearest():
-    assert FEC_LEVELS[fec_level_index(25.8, max_pct=32)] == 24
-    assert FEC_LEVELS[fec_level_ceil_index(25.8, max_pct=32)] == 28
-    assert FEC_LEVELS[fec_level_ceil_index(28.5, max_pct=32)] == 32
-    assert FEC_LEVELS[fec_level_ceil_index(24.0, max_pct=32)] == 24
-
-
-def test_quantile_fec_uses_discrete_levels_and_floor():
-    ctl = make_fec_controller(24, mode="quantile")
-    assert ctl.current == 24
-    assert ctl.current in FEC_LEVELS
-    assert FEC_FLOOR_PCT == 4
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 2 + FEC_CLEAN_DOWN_LOW * 4):
-        ctl.observe_block(make_block_sample(_fec_state(940), 768, tail=False))
-    assert ctl.current == 4
-    assert ctl.current in FEC_LEVELS
-
-
-def test_quantile_fec_drops_one_level_after_clean_hysteresis():
-    ctl = make_fec_controller(24, mode="quantile")
-    sample = make_block_sample(_fec_state(940), 768, tail=False)
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN - 2):
-        ctl.observe_block(sample)
-    assert ctl.current == 24
-    ctl.observe_block(sample)
-    assert ctl.current == 18
+def test_fixed_fec_still_records_first_flight_for_cc():
+    """BlastCc classifies dropper vs HOL from path_loss_q, even when FEC is static."""
+    ctl = make_fec_controller(8)
+    clean = make_block_sample(_fec_state(940), 768, tail=False)
+    for _ in range(8):
+        ctl.observe_block(clean)
+    assert ctl.current == 8
+    p50 = ctl.path_loss_q(50)
+    assert p50 is not None
+    assert p50 < 0.05
 
 
 def test_needed_repair_uses_first_flight_not_decode_rank():
@@ -1068,422 +1008,18 @@ def test_needed_repair_uses_first_flight_not_decode_rank():
     assert needed_repair_pct(censored, 768) == 0.0
 
 
-def test_quantile_fec_drops_when_first_flight_is_full():
-    ctl = make_fec_controller(24, mode="quantile")
-    sample = make_block_sample(_fec_state(950, initial_repair=184, extra=0), 768, tail=False)
-    assert sample.needed_repair_pct < 1.0
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN):
-        ctl.observe_block(sample)
-    assert ctl.current == 18
-
-
-def test_quantile_fec_holds_when_first_flight_is_thin():
-    ctl = make_fec_controller(24, mode="quantile")
-    sample = make_block_sample(_fec_state(770, initial_repair=184, extra=0), 768, tail=False)
-    assert sample.needed_repair_pct > 18
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN):
-        ctl.observe_block(sample)
-    assert ctl.current >= 24
-
-
-def test_quantile_fec_light_dir_does_not_block_down():
-    ctl = make_fec_controller(24, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    light = make_block_sample(_fec_state(950, extra=8, rounds=1), 768, tail=False)
-    assert light.dir_pressure() is False
-    for i in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN):
-        ctl.observe_block(light if i % 16 == 0 else close)
-    assert ctl.current < 24
-
-
-def test_quantile_fec_holds_soft_floor_without_rank():
-    """Without a first-flight snapshot, stop at 18% rather than 12/8/4."""
-    ctl = make_fec_controller(24, mode="quantile")
-    state = _fec_state(-1, unique_rx=770, extra=0)
-    state.unique_at_age = -1
-    state.first_deficit = -1
-    sample = make_block_sample(state, 768, tail=False)
-    assert sample.rank_known is False
-    assert FEC_SOFT_FLOOR == 18
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 6):
-        ctl.observe_block(sample)
-    assert ctl.current == 18
-
-
-def test_fec_change_keeps_encoded_prefetch(tmp_path: Path):
-    """A new FEC level must not discard already-encoded source blocks."""
-    geo = BlockGeometry(symbol_size=32, block_k=8, active_bytes=32 * 8 * 4)
-    blob = tmp_path / "blob.bin"
-    blob.write_bytes(os.urandom(geo.block_bytes * 8))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 0))
-    pool = ThreadPoolExecutor(max_workers=2)
-    try:
-        sender = BlockSender(
-            sock,
-            ("127.0.0.1", 9),
-            1,
-            blob,
-            geo,
-            initial_repair_pct=24,
-            min_bps=1e6,
-            max_bps=1e6,
-            start_bps=1e6,
-            ramp_s=0.0,
-            cc_on=False,
-            encode_pool=pool,
-            prefetch_depth=4,
-        )
-        wires = [b"old"]
-        sender.ready[0] = (wires, 99)
-        sender.repair_ctl.level_idx = 0
-        assert sender.repair_ctl.current != 24
-        item = sender.ready.get(0)
-        assert item is not None
-        assert item[1] == 99
-        sender._take_encoded()
-        assert sender.ready[0][1] == 99
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-        sock.close()
-
-
-def test_quantile_fec_does_not_up_without_dir_pressure():
-    """Thin unique with first-close is censoring, not a reason to raise FEC."""
-    ctl = make_fec_controller(8, mode="quantile")
-    thin = make_block_sample(
-        _fec_state(600, initial_repair=62, extra=0, rounds=0), 768, tail=False
-    )
-    assert thin.dir_pressure() is False
-    assert (thin.needed_repair_pct or 0) > 18
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(thin)
-    assert ctl.current == 8
-
-
-def test_quantile_fec_dir_pressure_does_not_block_down_without_storm():
-    """WAN sat at 18% with p95≈7 because one-round DIR zeroed clean_n."""
-    ctl = make_fec_controller(18, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    dirty = make_block_sample(
-        _fec_state(950, extra=80, rounds=1),
-        768,
-        tail=False,
-    )
-    assert dirty.dir_pressure() is True
-    assert dirty.repair_rounds < 3
-    assert (dirty.needed_repair_pct or 0) < 2
-    for i in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN_LOW):
-        ctl.observe_block(dirty if i % 6 == 0 else close)
-    assert ctl.current < 18
-
-
-def test_adaptive_cold_start_is_cover_max_not_floor():
-    assert FEC_COLD_PCT == FEC_COVER_MAX == 32
-    assert adaptive_start_pct(24, "quantile") == 32
-    assert adaptive_start_pct(24, "fixed") == 24
-    assert adaptive_start_pct(8, "quantile") == 32
-    assert adaptive_start_pct(4, "quantile") == 32
-    ctl = make_fec_controller(24, mode="quantile", clamp_cold=True)
-    assert ctl.current == FEC_COVER_MAX
-    assert ctl.sounding is True
-    assert ctl.encode_pct(1) == FEC_COVER_MAX
-    assert ctl.is_down_probe(1) is False
-    assert ctl.is_down_probe(16) is False
-    live = make_fec_controller(24, mode="quantile")
-    assert live.current == 24
-    assert live.sounding is False
-    assert live.is_down_probe(16) is True
-    assert live.encode_pct(16) == 18
-
-
-def test_gen_overhead_locks_fec_omit_runs_autofec():
+def test_gen_overhead_locks_fec_omit_is_static_pad():
     assert resolve_fec_cli(24) == ("fixed", 24)
     assert resolve_fec_cli(8) == ("fixed", 8)
-    assert resolve_fec_cli(None) == ("quantile", 32)
-    locked = make_fec_controller(24, mode="fixed")
+    assert resolve_fec_cli(None) == ("fixed", 8)
+    locked = make_fec_controller(24)
     assert locked.current == 24
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
+    for _ in range(40):
         locked.observe_block(make_block_sample(_fec_state(940), 768, tail=False))
     assert locked.current == 24
 
 
-def test_quantile_fec_isolated_dir_does_not_up():
-    ctl = make_fec_controller(8, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    dirty = _fec_state(620, initial_repair=62, extra=200, rounds=1)
-    sample = make_block_sample(dirty, 768, tail=False)
-    assert sample.dir_pressure() is True
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(close)
-    ctl.observe_block(sample)
-    assert ctl.current == 8
-
-
-def test_quantile_fec_dir_cluster_undercover_ups_without_storm():
-    """DIR pad can close 23% miss in one round; p75 must still leave 4%."""
-    ctl = make_fec_controller(4, mode="quantile", floor_pct=4)
-    assert ctl.current == 4
-    dirty = _fec_state(620, initial_repair=31, extra=200, rounds=1)
-    sample = make_block_sample(dirty, 768, tail=False)
-    assert sample.repair_rounds < 3
-    assert sample.dir_pressure() is True
-    assert (sample.needed_repair_pct or 0) > 18
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(sample)
-    assert ctl.current >= 18
-    assert ctl.current <= FEC_COVER_MAX
-    assert FEC_UP_QUANTILE == 75.0
-
-
-def test_quantile_fec_sparse_dir_tail_does_not_up():
-    """A 5% DIR tail must not walk 12→24 via p95."""
-    ctl = make_fec_controller(12, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    dirty = make_block_sample(
-        _fec_state(620, initial_repair=92, extra=200, rounds=1),
-        768,
-        tail=False,
-    )
-    for i in range(FEC_WINDOW):
-        ctl.observe_block(dirty if i % 20 == 0 else close)
-    assert ctl.current <= 12
-
-
-def test_quantile_fec_floor_walks_on_p95_when_p75_is_zero():
-    """Spain 2026-09-13: hold p95=28% at 4% because p75 stayed 0. Must leave 4%."""
-    ctl = make_fec_controller(4, mode="quantile", floor_pct=4)
-    close = make_block_sample(_fec_state(950, extra=0, initial_repair=31), 768, tail=False)
-    stuck = make_block_sample(
-        _fec_state(620, initial_repair=31, extra=200, rounds=1),
-        768,
-        tail=False,
-    )
-    assert (stuck.needed_repair_pct or 0) > 18
-    for i in range(FEC_MIN_TRAIN + 4):
-        ctl.observe_block(stuck if i % 3 == 0 else close)
-    assert ctl.current > 4
-
-
-def test_quantile_fec_jumps_up_on_storm_dir():
-    ctl = make_fec_controller(4, mode="quantile", floor_pct=4)
-    assert ctl.current == 4
-    dirty = _fec_state(620, initial_repair=31, extra=200, rounds=3)
-    assert needed_repair_pct(dirty, 768) > 18
-    assert make_block_sample(dirty, 768, tail=False).dir_pressure() is True
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(make_block_sample(dirty, 768, tail=False))
-    assert ctl.current >= 18
-    assert ctl.current <= FEC_COVER_MAX
-
-
-def test_quantile_fec_covers_dirty_hour_loss_up_to_32():
-    """23% path loss at 12% FEC needs ~26–30%; cover 24% left that below TCP."""
-    ctl = make_fec_controller(12, mode="quantile")
-    assert ctl.current == 12
-    # 12% blast, ~23% drop: unique ≈ 0.77*(K+R0).
-    dirty = _fec_state(662, initial_repair=92, extra=400, rounds=3)
-    need = needed_repair_pct(dirty, 768)
-    assert 24 < need <= 32
-    assert make_block_sample(dirty, 768, tail=False).dir_pressure() is True
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(make_block_sample(dirty, 768, tail=False))
-    assert ctl.current >= 28
-    assert ctl.current <= FEC_COVER_MAX
-    # After climbing, 24% blast still misses 23% loss (~28% need) → 32%.
-    still = _fec_state(733, initial_repair=184, extra=400, rounds=3)
-    assert needed_repair_pct(still, 768) > 24
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(make_block_sample(still, 768, tail=False))
-    assert ctl.current == 32
-
-
-def test_fec_sounding_keeps_cover_max_on_clean_overcover():
-    ctl = make_fec_controller(4, mode="quantile", clamp_cold=True)
-    assert ctl.encode_pct(0) == FEC_COVER_MAX
-    close = make_block_sample(
-        _fec_state(1010, extra=0, initial_repair=246), 768, tail=False
-    )
-    assert (close.needed_repair_pct or 0) < 1.0
-    for _ in range(FEC_MIN_TRAIN - 1):
-        ctl.observe_block(close)
-        assert ctl.current == FEC_COVER_MAX
-        assert ctl.encode_pct(3) == FEC_COVER_MAX
-        assert ctl.is_down_probe(16) is False
-    ctl.observe_block(close)
-    assert ctl.current == FEC_COVER_MAX
-    assert "armed" in ctl.reason
-    assert ctl.encode_pct(1) == FEC_COVER_MAX
-    assert ctl.encode_pct(16) == 28
-    assert ctl.is_down_probe(16) is True
-    for _ in range(FEC_CLEAN_DOWN):
-        ctl.observe_block(close)
-    assert ctl.current == 28
-
-
-def test_fec_down_probe_is_not_overcover():
-    """encode_pct > current used to tag every sounding block as a probe."""
-    low = make_fec_controller(4, mode="quantile")
-    assert low.is_down_probe(1) is False
-    assert low.is_down_probe(16) is False
-    mid = make_fec_controller(24, mode="quantile")
-    assert mid.encode_pct(1) == 24
-    assert mid.is_down_probe(1) is False
-    assert mid.is_down_probe(16) is True
-    fixed = make_fec_controller(24, mode="fixed")
-    assert fixed.is_down_probe(16) is False
-
-
-def test_fec_does_not_raise_while_hunting_rate():
-    ctl = make_fec_controller(8, mode="quantile")
-    dirty = make_block_sample(
-        _fec_state(620, initial_repair=62, extra=200, rounds=3), 768, tail=False
-    )
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(dirty, allow_up=False)
-    assert ctl.current == 8
-
-
-def test_fec_does_not_down_while_hunting_rate():
-    """Spain 2026-09-13: p95=0 on 32% overcover during CC climb dumped to 4%."""
-    ctl = make_fec_controller(4, mode="quantile", clamp_cold=True)
-    close = make_block_sample(
-        _fec_state(1010, extra=0, initial_repair=246), 768, tail=False
-    )
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 4):
-        ctl.observe_block(close, allow_down=False)
-    assert ctl.current == FEC_COVER_MAX
-    assert "hunt" in ctl.reason
-
-
-def test_fec_holds_soft_floor_until_pace_settled():
-    ctl = make_fec_controller(24, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN * 6 + FEC_CLEAN_DOWN_LOW * 2):
-        ctl.observe_block(close, allow_down_low=False)
-    assert ctl.current == FEC_SOFT_FLOOR
-    assert "floor" in ctl.reason
-
-
-def test_fec_uncoverable_holds_while_hunting():
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
-    for _ in range(48 + 8 * 8):
-        ctl.observe_block(
-            make_block_sample(hole, 768, tail=False), allow_down=False
-        )
-    assert ctl.current == FEC_COVER_MAX
-    assert "uncoverable" in ctl.reason
-
-
-def test_fec_encode_pct_probes_one_level_below():
-    ctl = make_fec_controller(24, mode="quantile")
-    assert FEC_PROBE_PERIOD == 16
-    assert ctl.encode_pct(1) == 24
-    assert ctl.encode_pct(16) == 18
-    fixed = make_fec_controller(24, mode="fixed")
-    assert fixed.encode_pct(16) == 24
-
-
-def test_quantile_fec_probe_fail_blocks_down_below_18():
-    ctl = make_fec_controller(18, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    fail = make_block_sample(
-        _fec_state(700, extra=80, rounds=2), 768, tail=False
-    )
-    fail.probe = True
-    assert fail.dir_pressure() is True
-    ctl.observe_block(fail)
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN_LOW * 2):
-        ctl.observe_block(close)
-    assert ctl.current == 18
-
-
-def test_quantile_fec_probe_ok_allows_down_below_18():
-    ctl = make_fec_controller(18, mode="quantile")
-    close = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    probe = make_block_sample(_fec_state(950, extra=0), 768, tail=False)
-    probe.probe = True
-    ctl.observe_block(probe)
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN_LOW):
-        ctl.observe_block(close)
-    assert ctl.current == 12
-
-
-def test_quantile_fec_trains_coverable_mix_instead_of_cold_hold():
-    """Half uncoverable + coverable ~24% must not freeze below cover."""
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
-    mid = _fec_state(620, initial_repair=92, extra=80, rounds=2)
-    for _ in range(24):
-        ctl.observe_block(make_block_sample(hole, 768, tail=False))
-        ctl.observe_block(make_block_sample(mid, 768, tail=False))
-    assert ctl.current >= 18
-
-
-def test_quantile_fec_holds_when_most_needs_are_uncoverable():
-    """Shaper / 50%+ drop: the 48% cap is not a request for 32% FEC."""
-    ctl = make_fec_controller(4, mode="quantile")
-    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
-    assert needed_repair_pct(hole, 768) >= FEC_NEED_CAP
-    for _ in range(FEC_MIN_TRAIN + 8):
-        ctl.observe_block(make_block_sample(hole, 768, tail=False))
-    assert ctl.current == 4
-    assert "uncoverable" in ctl.reason
-
-
-def test_quantile_fec_walks_down_from_false_32_when_uncoverable():
-    ctl = make_fec_controller(12, mode="quantile", clamp_cold=True)
-    assert ctl.current == 32
-    hole = _fec_state(300, initial_repair=92, extra=400, rounds=3)
-    for _ in range(48 + 8 * 8):
-        ctl.observe_block(make_block_sample(hole, 768, tail=False))
-    assert ctl.current == 4
-
-
-def test_quantile_fec_does_not_raise_for_uncoverable_burst():
-    ctl = make_fec_controller(18, mode="quantile")
-    clean = make_block_sample(_fec_state(950, initial_repair=138, extra=0), 768, tail=False)
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(clean)
-    assert ctl.current == 18
-    burst = _fec_state(420, initial_repair=138, extra=300, rounds=2)
-    assert needed_repair_pct(burst, 768) >= FEC_COVER_MAX
-    for _ in range(12):
-        ctl.observe_block(make_block_sample(burst, 768, tail=False))
-    assert ctl.current <= FEC_COVER_MAX
-    assert ctl.current == 18
-
-
-def test_quantile_fec_window_busy_raises_cover_max():
-    """Spain HOL: xfrac=81% / path 42% / FEC walked 24→18. Jump to cover."""
-    ctl = make_fec_controller(18, mode="quantile")
-    close = make_block_sample(
-        _fec_state(950, initial_repair=138, extra=0), 768, tail=False
-    )
-    hole = make_block_sample(
-        _fec_state(400, initial_repair=138, extra=200, rounds=2), 768, tail=False
-    )
-    for _ in range(FEC_MIN_TRAIN):
-        ctl.observe_block(close)
-    assert ctl.current == 18
-    for _ in range(8):
-        ctl.observe_block(hole, window_busy=True)
-    assert ctl.current == FEC_COVER_MAX
-
-
-def test_quantile_fec_ignores_tail_and_p99_blackout():
-    ctl = make_fec_controller(12, mode="quantile")
-    clean = make_block_sample(_fec_state(940, initial_repair=92), 768, tail=False)
-    for _ in range(FEC_MIN_TRAIN + 4):
-        ctl.observe_block(clean)
-    held = ctl.current
-    ctl.observe_block(make_block_sample(_fec_state(940), 768, tail=True))
-    ctl.observe_block(make_block_sample(_fec_state(0, extra=400, rounds=4), 768, tail=False))
-    assert ctl.current == held
-
-
-def test_select_repair_uses_quantile_dir_pad():
+def test_select_repair_uses_dir_pad():
     now = 10.0
     state = SenderBlockState(1, unique_rx=700, sent_at=9.0)
     opened = {1: OpenBlock(1, 700)}
@@ -1501,30 +1037,18 @@ def test_select_repair_uses_quantile_dir_pad():
 
 
 def test_dir_margin_is_zero_on_clean_and_capped_on_loss():
-    ctl = make_fec_controller(24, mode="quantile")
-    for _ in range(FEC_MIN_TRAIN + 2):
+    ctl = make_fec_controller(24)
+    for _ in range(10):
         ctl.observe_block(make_block_sample(_fec_state(940), 768, tail=False))
     assert ctl.dir_margin(40, 768) == 0
-    lossy = make_fec_controller(24, mode="quantile")
+    lossy = make_fec_controller(24)
     dirty = _fec_state(620, initial_repair=184, extra=400, rounds=2)
-    for _ in range(FEC_MIN_TRAIN + 2):
+    for _ in range(10):
         lossy.observe_block(make_block_sample(dirty, 768, tail=False))
     pad = lossy.dir_margin(40, 768, tick_left=10)
     assert 0 < pad <= 10
     tail_pad = lossy.dir_margin(400, 768, tail=True)
     assert tail_pad <= 48
-
-
-def test_dir_margin_covers_fec_gap_in_one_round():
-    ctl = make_fec_controller(12, mode="quantile")
-    assert ctl.current == 12
-    assert FEC_COVER_MAX == 32
-    dirty = _fec_state(620, initial_repair=92, extra=80, rounds=1)
-    for _ in range(FEC_MIN_TRAIN - 1):
-        ctl.observe_block(make_block_sample(dirty, 768, tail=False))
-    assert ctl.current == 12
-    pad = ctl.dir_margin(40, 768)
-    assert pad == 25
 
 
 def test_fec_pct_for_loss_maps_packet_drop_to_repair():
@@ -1544,64 +1068,9 @@ def test_first_close_still_records_path_loss():
     assert sample.extra_symbols == 0
     assert sample.first_flight_loss is not None
     assert sample.first_flight_loss > 0.05
-    ctl = make_fec_controller(32, mode="quantile")
+    ctl = make_fec_controller(32)
     ctl.observe_block(sample)
     assert ctl.path_loss[-1] == pytest.approx(sample.first_flight_loss)
-
-
-def test_fec_down_uses_path_loss_not_padded_need():
-    """28% blast + 19% drop used to report need~25% and stick at 28%."""
-    k = 768
-    r0 = 215
-    unique = int(round((k + r0) * (1.0 - 0.19)))
-    sample = make_block_sample(
-        _fec_state(unique, extra=0, initial_repair=r0), k, tail=False
-    )
-    assert (sample.needed_repair_pct or 0) > 24
-    assert fec_pct_for_loss(sample.first_flight_loss or 0) < 28
-    ctl = make_fec_controller(28, mode="quantile")
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN):
-        ctl.observe_block(sample, allow_down_low=False)
-    assert ctl.current == 24
-
-
-def test_quantile_fec_does_not_down_below_p95_need():
-    """8% iid looks first-close at 24% FEC; do not walk through the quantile."""
-    ctl = make_fec_controller(24, mode="quantile")
-    mild = make_block_sample(_fec_state(860, initial_repair=184, extra=0), 768, tail=False)
-    assert 10 < (mild.needed_repair_pct or 0) < 14
-    for _ in range(FEC_MIN_TRAIN + FEC_CLEAN_DOWN + FEC_CLEAN_DOWN_LOW * 2):
-        ctl.observe_block(mild)
-    assert ctl.current >= 12
-    assert ctl.current <= 18
-
-
-def test_adaptive_gate_accepts_clean_wire_cut_and_rejects_wan_drop():
-    fixed = FecRunMetrics(
-        goodput_mib=79.0,
-        source_wire_mib=2587.0,
-        repair_wire_mib=40.0,
-        tail_s=0.8,
-        pace_p10=850.0,
-    )
-    good_clean = FecRunMetrics(
-        goodput_mib=80.0,
-        source_wire_mib=2200.0,
-        repair_wire_mib=50.0,
-        tail_s=0.7,
-        pace_p10=850.0,
-    )
-    assert adaptive_gate_failures("clean", fixed, good_clean) == []
-    bad_wan = FecRunMetrics(
-        goodput_mib=70.0,
-        source_wire_mib=2400.0,
-        repair_wire_mib=80.0,
-        tail_s=2.0,
-        pace_p10=700.0,
-    )
-    fails = adaptive_gate_failures("wan-burst", fixed, bad_wan)
-    assert any("goodput" in item for item in fails)
-    assert any("75" in item for item in fails)
 
 
 def test_block_quartile_and_fmt():

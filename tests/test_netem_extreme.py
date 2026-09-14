@@ -163,7 +163,6 @@ def test_extreme_profiles_transfer_8m(tmp_path: Path, profile: str) -> None:
         srv_port=ports[profile],
         timeout=40,
         rate="200",
-        extra_env={"TETRYS_FEC_MODE": "quantile"},
     )
     banner_only = "queue_drop=" not in emu
     valid = banner_only or "valid=True" in emu or (
@@ -223,7 +222,6 @@ def test_cc_search_starts_at_floor_and_tracks_shaper(tmp_path: Path) -> None:
         srv_port=17840,
         timeout=120,
         rate=None,
-        extra_env={"TETRYS_FEC_MODE": "quantile"},
     )
     assert ok, f"shaper CC search failed\n{emu[-400:]}\n{srv[-800:]}"
     assert "start=8Mbit" in srv
@@ -251,7 +249,6 @@ def test_cc_search_tracks_fatter_shaper(tmp_path: Path) -> None:
         srv_port=17850,
         timeout=90,
         rate=None,
-        extra_env={"TETRYS_FEC_MODE": "quantile"},
     )
     assert ok, f"shaper-wan CC search failed\n{emu[-400:]}\n{srv[-800:]}"
     got = parse_done_metrics(srv)

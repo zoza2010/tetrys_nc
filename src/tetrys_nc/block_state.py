@@ -16,8 +16,7 @@ from .block_packets import MAX_OPEN_BLOCKS, BlockFeedback, OpenBlock
 WAN_SYMBOL_SIZE = 1350
 WAN_BLOCK_K = 768
 WAN_ACTIVE_BYTES = 64 * 1024 * 1024
-# Fixed 24% covers ~18% path loss (p/(1-p) ≈ 22%). Dirty-hour iperf at
-# 850 Mbit saw ~23% loss → need ~30%; adaptive cover goes to 32%.
+# Locked `--gen-overhead 24` covers ~18% path loss (p/(1-p)).
 WAN_INITIAL_REPAIR_PCT = 24
 # Fixed 850 Mbit beat 880/920 on this path: extra-repair stays in check.
 WAN_START_MBIT = 850.0
@@ -49,35 +48,15 @@ FLIGHT_AGE_BUCKETS = max(1, int(REPAIR_AGE_S / 0.020))
 # WAN loss bursts; never-heard waits longer for the first RTT.
 CLIENT_GONE_S = 2.0
 CLIENT_NEVER_S = 8.0
-# Discrete adaptive FEC. Floor 4%; `--gen-overhead` locks a single level.
-FEC_LEVELS = (4, 8, 12, 18, 24, 28, 32)
-FEC_FLOOR_PCT = 4
-FEC_MAX_PCT = 32
-# Measurement cap above cover so a 50%+ blackout does not look "coverable".
+# First-flight pad is static (`--gen-overhead` or FEC_STATIC_PCT). DIR
+# drips until decode. CC owns the wire rate.
 FEC_NEED_CAP = 48
-# 32% first-flight covers ~24% path loss. 24% left today's 23% hour
-# in a DIR storm slower than bulk TCP (~23 MiB/s).
+# 32% first-flight covers ~24% path loss (p/(1-p)). HOL cover cap.
 FEC_COVER_MAX = 32
-FEC_QUANTILE = 95.0
-# Up uses a bulk quantile so a 5% DIR tail does not walk 12→24 on a clean path.
-# p95 stays the down floor (do not walk through a real first-flight need).
-FEC_UP_QUANTILE = 75.0
 FEC_WINDOW = 48
-FEC_MIN_TRAIN = 8
-FEC_CLEAN_DOWN = 24
-FEC_CLEAN_DOWN_LOW = 48
-FEC_SOFT_FLOOR = 18
-# Omit `--gen-overhead` to search. Adaptive operates at cover-max, then
-# walks down one probe level at a time when p95 is clean. Overcover
-# first-flights must not lock the floor (need≈0 is not "4% is enough").
-FEC_COLD_PCT = FEC_COVER_MAX
-FEC_PROBE_PERIOD = 16
+FEC_STATIC_PCT = 8
 FEC_RAPTORQ_MARGIN = 2
 DIR_LIGHT_SLACK = 8
-# WAN A/B gates for quantile-only vs locked 24%.
-ADAPTIVE_CLEAN_WIRE_MAX = 0.90
-ADAPTIVE_WAN_GOODPUT_MIN = 0.97
-ADAPTIVE_WAN_MIN_MIB = 75.0
 
 
 @dataclass(slots=True)
@@ -111,7 +90,6 @@ class SenderBlockState:
     rx_at_flight: int = -1
     first_deficit: int = -1
     repair_rounds: int = 0
-    probe: bool = False
     fec_sampled: bool = False
 
     def repair_need(self, block_k: int, margin: int = 2, pad: int = 4) -> int:
@@ -329,38 +307,6 @@ def late_unique(state: SenderBlockState) -> int:
     return max(0, state.unique_rx - got)
 
 
-def fec_level_index(pct: float, *, min_pct: int = FEC_FLOOR_PCT, max_pct: int = FEC_MAX_PCT) -> int:
-    lo = min(min_pct, max_pct)
-    hi = max(min_pct, max_pct)
-    clipped = min(hi, max(lo, pct))
-    best = 0
-    best_dist = abs(FEC_LEVELS[0] - clipped)
-    for i, level in enumerate(FEC_LEVELS):
-        if level < lo or level > hi:
-            continue
-        dist = abs(level - clipped)
-        if dist < best_dist:
-            best, best_dist = i, dist
-    return best
-
-
-def fec_level_ceil_index(
-    pct: float, *, min_pct: int = FEC_FLOOR_PCT, max_pct: int = FEC_MAX_PCT
-) -> int:
-    """Smallest send level that still covers `pct` (round up, not nearest)."""
-    lo = min(min_pct, max_pct)
-    hi = max(min_pct, max_pct)
-    clipped = min(hi, max(lo, pct))
-    last = 0
-    for i, level in enumerate(FEC_LEVELS):
-        if level < lo or level > hi:
-            continue
-        last = i
-        if level >= clipped:
-            return i
-    return last
-
-
 @dataclass(slots=True)
 class BlockLossSample:
     """Per-block telemetry used by FEC/DIR/CC. Tail and incomplete are not trained."""
@@ -375,7 +321,6 @@ class BlockLossSample:
     train: bool
     qdelay_high: bool = False
     rank_known: bool = False
-    probe: bool = False
 
     def dir_pressure(self, dir_pad: int = 4) -> bool:
         """Repeat rounds / growing deficit / decode failure — not one light DIR."""
@@ -416,7 +361,6 @@ def make_block_sample(
         ),
         qdelay_high=qdelay_high,
         rank_known=rank_known,
-        probe=state.probe,
     )
 
 
@@ -478,129 +422,31 @@ class ExtraRepairWindow:
         return (not tail) and self.frac >= EXTRA_FRAC_BUSY
 
 
-@dataclass(slots=True)
-class RepairDebtController:
-    """Initial FEC learned from completed-block repair debt, never packet gaps."""
-
-    pct: float = 20.0
-    up_alpha: float = 0.04
-    down_alpha: float = 0.16
-    slew: float = 1.5
-    min_pct: float = 12.0
-    max_pct: float = 28.0
-    debt_need: int = 4
-    clean_need: int = 8
-    debt_n: int = 0
-    clean_n: int = 0
-
-    def observe(self, extra_symbols: int, block_k: int) -> int:
-        # Hold the configured floor. One dirty block or a tail storm must not
-        # yank primary FEC; only a short streak of extra-repair completions.
-        if extra_symbols <= 0:
-            self.debt_n = 0
-            self.clean_n += 1
-            if self.clean_n >= self.clean_need and self.pct > self.min_pct:
-                nxt = (1.0 - self.down_alpha) * self.pct + self.down_alpha * self.min_pct
-                self.pct = max(self.min_pct, min(self.pct, nxt))
-            return self.current
-        self.clean_n = 0
-        self.debt_n += 1
-        if self.debt_n < self.debt_need:
-            return self.current
-        debt_pct = 100.0 * max(0, extra_symbols) / max(1, block_k)
-        target = min(
-            self.max_pct,
-            max(self.min_pct, min(debt_pct, self.max_pct - 2.0) + 2.0),
-        )
-        if target <= self.pct:
-            return self.current
-        nxt = (1.0 - self.up_alpha) * self.pct + self.up_alpha * target
-        self.pct = min(self.max_pct, max(self.min_pct, min(self.pct + self.slew, nxt)))
-        return self.current
-
-    @property
-    def current(self) -> int:
-        return int(round(min(self.max_pct, max(self.min_pct, self.pct))))
-
 
 @dataclass
-class QuantileFecController:
-    """Discrete FEC from first-flight need. Slow down, bulk-undercover up.
+class FecController:
+    """Static first-flight pad. DIR drips until decode; CC owns wire rate."""
 
-    Adaptive starts at cover-max and probe-down one level at a time.
-    Down uses p95 so a quiet path can leave 24% but not walk through a real
-    need. Up uses p75: DIR pad often closes a 23% miss in one or two rounds,
-    so storm-only (repair_rounds ≥ 3) never left 12%. Isolated DIR / a 5%
-    tail keep p75 at 0 and must not raise.
-    """
-
-    mode: str = "quantile"
-    start_pct: int = WAN_INITIAL_REPAIR_PCT
-    min_pct: int = FEC_FLOOR_PCT
-    max_pct: int = FEC_MAX_PCT
-    level_idx: int = 0
-    clean_n: int = 0
-    probe_fail_at: int = -1
-    reason: str = "cold"
+    start_pct: int = FEC_STATIC_PCT
+    reason: str = "fixed"
     dir_rounds: int = 0
-    measured: bool = False
-    sounding: bool = False
-    needed: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
     path_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
     repair_loss: deque[float] = field(default_factory=lambda: deque(maxlen=FEC_WINDOW))
 
     def __post_init__(self) -> None:
-        self.mode = (self.mode or "quantile").strip().lower()
-        if self.mode not in ("fixed", "quantile"):
-            self.mode = "quantile"
-        if self.mode == "fixed":
-            locked = int(self.start_pct)
-            self.min_pct = self.max_pct = locked
-            self.level_idx = fec_level_index(locked, min_pct=FEC_FLOOR_PCT, max_pct=FEC_MAX_PCT)
-            self.reason = f"fixed {locked}"
-            return
-        self.min_pct = int(min(self.max_pct, max(FEC_LEVELS[0], self.min_pct)))
-        self.max_pct = int(max(self.min_pct, min(FEC_MAX_PCT, self.max_pct)))
-        self.level_idx = fec_level_index(
-            self.start_pct, min_pct=self.min_pct, max_pct=self.max_pct
-        )
-        # Hold cover-max (no down-probes) until first-flight trains.
-        self.sounding = int(self.current) >= int(self._cover_cap())
-        self.reason = f"cold start={self.current} mode={self.mode}"
+        self.start_pct = int(self.start_pct)
+        self.reason = f"fixed {self.start_pct}"
 
     @property
     def current(self) -> int:
-        if self.mode == "fixed":
-            return int(self.start_pct)
-        return int(FEC_LEVELS[self.level_idx])
+        return int(self.start_pct)
 
     def encode_pct(self, block_id: int) -> int:
-        """Most blocks at current; every Nth is a probe one level below.
-
-        Until first-flight trains, stay at cover-max (no down-probes).
-        Sounding overcover is the operating point, not a throwaway blast.
-        """
-        if self.mode == "fixed":
-            return self.current
-        if self.sounding and not self.measured:
-            return self.current
-        if self.level_idx <= 0:
-            return self.current
-        nxt = FEC_LEVELS[self.level_idx - 1]
-        if nxt < self.min_pct:
-            return self.current
-        if block_id % FEC_PROBE_PERIOD == 0:
-            return nxt
+        del block_id
         return self.current
 
-    def is_down_probe(self, block_id: int) -> bool:
-        """True only for an intentional lower-level probe, not overcover."""
-        if self.mode == "fixed":
-            return False
-        return self.encode_pct(block_id) < self.current
-
     def _cover_cap(self) -> int:
-        return min(int(self.max_pct), FEC_COVER_MAX)
+        return FEC_COVER_MAX
 
     def dir_margin(
         self,
@@ -610,7 +456,7 @@ class QuantileFecController:
         tail: bool = False,
         tick_left: int | None = None,
     ) -> int:
-        """ΔR so a low FEC level still closes in one DIR round, not two."""
+        """ΔR so DIR can close a remaining deficit in one round."""
         del block_k
         if deficit <= 0:
             return 0
@@ -622,50 +468,16 @@ class QuantileFecController:
             delta = 0
         else:
             delta = int(math.ceil(deficit * p / max(1e-6, 1.0 - p)))
-        cover = self._cover_cap()
-        sounding = self.sounding and not self.measured
-        if self.mode != "fixed" and not sounding and self.current < cover and p >= 0.03:
-            delta = max(
-                delta,
-                int(math.ceil(deficit * (cover - self.current) / max(1, cover))),
-            )
         cap = TAIL_REPAIR_TICK_PER_BLOCK if tail else REPAIR_TICK_PKTS
         if tick_left is not None:
             cap = min(cap, max(0, tick_left))
         return min(max(0, delta), cap)
 
-    def _skip_outlier(self, needed_pct: float) -> bool:
-        # At the floor a 48% stuck-window sample is the undercover signal,
-        # not an outlier. Skipping it left Spain at 4% / close 67% / 39 MiB/s.
-        if self.current <= self.min_pct:
-            return False
-        if len(self.needed) < FEC_MIN_TRAIN:
-            return False
-        p95 = percentile(list(self.needed), 95) or 0.0
-        p99 = percentile(list(self.needed), 99) or 0.0
-        return needed_pct > max(p99, 2.0 * max(p95, 1.0)) and needed_pct >= 40.0
-
-    def _down_ready(self, sample: BlockLossSample, *, allow_down_low: bool = True) -> bool:
-        """One level at a time; below 18% only with a real first-flight snapshot."""
-        if self.level_idx <= 0:
-            return False
-        nxt = FEC_LEVELS[self.level_idx - 1]
-        if nxt < self.min_pct:
-            return False
-        if nxt < FEC_SOFT_FLOOR and not sample.rank_known:
-            return False
-        if nxt < FEC_SOFT_FLOOR and not allow_down_low:
-            return False
-        if self.probe_fail_at == nxt:
-            return False
-        need = FEC_CLEAN_DOWN_LOW if nxt < FEC_SOFT_FLOOR else FEC_CLEAN_DOWN
-        return self.clean_n >= need
-
     def path_loss_q(self, q: float, *, coverable: bool = False) -> float | None:
         src = list(self.path_loss)
         if coverable:
             cap_p = cover_loss_p(self._cover_cap())
-            src = [p for p in src if p <= cap_p]
+            src = [x for x in src if x <= cap_p]
         if not src:
             return None
         return percentile(src, q)
@@ -675,247 +487,33 @@ class QuantileFecController:
         if not self.path_loss:
             return None
         cap_p = cover_loss_p(self._cover_cap())
-        hol = sum(1 for p in self.path_loss if p > cap_p)
+        hol = sum(1 for x in self.path_loss if x > cap_p)
         return hol / len(self.path_loss)
 
-    def _loss_down_idx(self, cover: int, *, settled: bool) -> int | None:
-        """Level that still covers typical path loss, not overcover need%."""
-        coverable = [p for p in self.path_loss if fec_pct_for_loss(p) <= cover]
-        src = coverable if coverable else list(self.path_loss)
-        if not src:
-            return None
-        qtile = FEC_UP_QUANTILE if settled else FEC_QUANTILE
-        q = percentile(src, qtile) or 0.0
-        return fec_level_ceil_index(
-            fec_pct_for_loss(q), min_pct=self.min_pct, max_pct=cover
-        )
-
-    def _note_probe(self, sample: BlockLossSample) -> None:
-        nxt_pct = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-        if sample.extra_symbols <= 0 and not sample.dir_pressure():
-            if self.probe_fail_at == nxt_pct:
-                self.probe_fail_at = -1
-        else:
-            self.probe_fail_at = nxt_pct
-
-    def observe_block(
-        self,
-        sample: BlockLossSample,
-        *,
-        allow_up: bool = True,
-        allow_down: bool = True,
-        allow_down_low: bool = True,
-        window_busy: bool = False,
-    ) -> int:
+    def observe_block(self, sample: BlockLossSample, **_kwargs) -> int:
         self.dir_rounds += max(0, sample.repair_rounds)
-        if self.mode == "fixed":
-            self.reason = f"fixed {self.current}"
-            return self.current
-        if not sample.train or sample.needed_repair_pct is None:
-            return self.current
-        needed_pct = float(sample.needed_repair_pct)
-        if sample.probe:
-            self._note_probe(sample)
-            if sample.extra_symbols > 0 or sample.dir_pressure():
-                self.reason = f"probe-fail {self.probe_fail_at}%"
-                return self.current
-        if self._skip_outlier(needed_pct) and not window_busy:
-            self.reason = f"skip-outlier need={needed_pct:.1f}"
-            return self.current
-        loss = 0.0 if sample.extra_symbols <= 0 else min(
-            1.0, (sample.needed_repair_pct or 0.0) / 100.0
-        )
-        self.needed.append(needed_pct)
-        self.repair_loss.append(loss)
         if sample.first_flight_loss is not None:
             self.path_loss.append(float(sample.first_flight_loss))
-        if len(self.needed) < FEC_MIN_TRAIN:
-            self.reason = f"sound n={len(self.needed)} hold={self.current}"
-            return self.current
-        cover = self._cover_cap()
-        coverable = [n for n in self.needed if n <= cover]
-        uncov_n = len(self.needed) - len(coverable)
-        # Two repair ticks on a delayed RTT look like a storm on small K.
-        storm = sample.decode_failed or sample.repair_rounds >= 3
-        # Need at the 48% cap is a policer/blackout, not a 32% target.
-        # Chasing it burns repair and first-close stays 0.
-        if uncov_n * 2 >= len(self.needed) and not coverable:
-            # Every sample sits on the need cap. FEC cannot first-close;
-            # CC must cut.
-            self.clean_n += 1
-            nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-            if (
-                allow_down
-                and self.current > self.min_pct
-                and nxt >= self.min_pct
-                and self.clean_n >= 8
-                and (nxt >= FEC_SOFT_FLOOR or allow_down_low)
-            ):
-                self.level_idx -= 1
-                self.clean_n = 0
-                self.probe_fail_at = -1
-                self.measured = True
-                self.reason = (
-                    f"down uncoverable {uncov_n}/{len(self.needed)} -> {self.current}"
-                )
-                return self.current
-            self.measured = True
-            self.reason = (
-                f"hold uncoverable {uncov_n}/{len(self.needed)} {self.current}%"
+        if sample.train and sample.needed_repair_pct is not None:
+            loss = (
+                0.0
+                if sample.extra_symbols <= 0
+                else min(1.0, float(sample.needed_repair_pct) / 100.0)
             )
-            return self.current
-        src = list(self.needed) if (window_busy or not coverable) else coverable
-        q = percentile(src, FEC_QUANTILE) or 0.0
-        q_up = percentile(src, FEC_UP_QUANTILE) or 0.0
-        if (
-            sample.rank_known
-            and storm
-            and needed_pct <= cover
-        ):
-            q = max(q, needed_pct)
-            q_up = max(q_up, needed_pct)
-        target_idx = fec_level_index(q, min_pct=self.min_pct, max_pct=cover)
-        loss_idx = self._loss_down_idx(cover, settled=allow_down_low)
-        if loss_idx is not None:
-            target_idx = loss_idx
-        up_idx = fec_level_ceil_index(q_up, min_pct=self.min_pct, max_pct=cover)
-        if self.sounding and not self.measured:
-            # Arm probes. Keep cover-max: overcover need≈0 is not a floor lock.
-            self.measured = True
-            self.clean_n = 0
-            self.probe_fail_at = -1
-            self.reason = (
-                f"armed p{FEC_QUANTILE:.0f}={q:.1f} hold={self.current}"
-            )
-            return self.current
-        if window_busy and allow_up:
-            want = fec_level_index(float(cover), min_pct=self.min_pct, max_pct=cover)
-            want = max(want, up_idx)
-            if want > self.level_idx:
-                self.level_idx = want
-                self.clean_n = 0
-                self.probe_fail_at = -1
-                self.measured = True
-                self.reason = f"up-window-busy -> {self.current}"
-                return self.current
-        self.measured = True
-        saw_repair = (
-            sample.extra_symbols > 0
-            or sample.repair_rounds >= 1
-            or sample.decode_failed
-        )
-        undercover = (
-            sample.rank_known
-            and q_up > self.current
-            and saw_repair
-        )
-        if allow_up and up_idx > self.level_idx:
-            # Isolated DIR is delay/reorder (p75 stays ~0). Jump on a storm
-            # or when most first-flights in the window needed more FEC.
-            if (storm and sample.dir_pressure()) or undercover:
-                self.level_idx = up_idx
-                self.clean_n = 0
-                self.probe_fail_at = -1
-                why = "up-storm" if storm else "up-undercover"
-                self.reason = (
-                    f"{why} p{FEC_UP_QUANTILE:.0f}={q_up:.1f} -> {self.current}"
-                )
-                return self.current
-        # Stuck window: completed-block p75 stays 0 while p95 already shows
-        # 28% need. Walk one level from the floor so 4% does not HOL the path.
-        if (
-            allow_up
-            and self.current <= self.min_pct
-            and q > self.current
-            and saw_repair
-        ):
-            nxt_idx = min(
-                self.level_idx + 1,
-                fec_level_index(q, min_pct=self.min_pct, max_pct=cover),
-            )
-            if nxt_idx > self.level_idx:
-                self.level_idx = nxt_idx
-                self.clean_n = 0
-                self.probe_fail_at = -1
-                self.reason = f"up-floor p95={q:.1f} -> {self.current}"
-                return self.current
-        # Storm already zeroed clean_n on the way up. One-round DIR (pad,
-        # reorder) must not freeze a high level after the path goes quiet.
-        if storm and sample.dir_pressure():
-            self.clean_n = 0
-        elif not allow_down:
-            # Low-rate overcover must not bank hysteresis for a dump to 4%.
-            self.clean_n = 0
-            self.reason = (
-                f"hold-hunt p{FEC_QUANTILE:.0f}={q:.1f} {self.current}%"
-            )
-            return self.current
-        else:
-            self.clean_n += 1
-        nxt = FEC_LEVELS[self.level_idx - 1] if self.level_idx > 0 else self.current
-        if nxt < FEC_SOFT_FLOOR and not allow_down_low:
-            self.clean_n = 0
-            self.reason = (
-                f"hold-floor p{FEC_QUANTILE:.0f}={q:.1f} {self.current}%"
-            )
-            return self.current
-        if self._down_ready(sample, allow_down_low=allow_down_low) and nxt >= FEC_LEVELS[target_idx]:
-            self.level_idx -= 1
-            self.clean_n = 0
-            self.probe_fail_at = -1
-            self.reason = f"down p{FEC_QUANTILE:.0f}={q:.1f} -> {self.current}"
-            return self.current
-        self.reason = (
-            f"hold p{FEC_QUANTILE:.0f}={q:.1f} {self.current}% "
-            f"clean={self.clean_n}"
-        )
+            self.repair_loss.append(loss)
+        self.reason = f"fixed {self.current}"
         return self.current
 
 
-def adaptive_start_pct(initial: int, mode: str, floor: int = FEC_FLOOR_PCT) -> int:
-    """Fixed mode keeps the lock; adaptive starts at cover-max and probe-down."""
-    if (mode or "").strip().lower() == "fixed":
-        return int(initial)
-    del initial
-    return max(int(floor), int(FEC_COVER_MAX))
-
-
 def resolve_fec_cli(overhead: int | None) -> tuple[str, int]:
-    """`--gen-overhead N` locks FEC; omit it to run adaptive quantile."""
+    """`--gen-overhead N` locks FEC; omit it for a static first-flight pad."""
     if overhead is not None:
         return "fixed", int(overhead)
-    return "quantile", FEC_COLD_PCT
+    return "fixed", FEC_STATIC_PCT
 
 
-def make_fec_controller(
-    initial_repair_pct: int,
-    *,
-    mode: str | None = None,
-    floor_pct: int | None = None,
-    max_pct: int | None = None,
-    clamp_cold: bool = False,
-) -> QuantileFecController:
-    chosen = (mode or "quantile").strip().lower()
-    if chosen not in ("fixed", "quantile"):
-        chosen = "quantile"
-    if chosen == "fixed":
-        return QuantileFecController(
-            mode="fixed",
-            start_pct=int(initial_repair_pct),
-            min_pct=int(initial_repair_pct),
-            max_pct=int(initial_repair_pct),
-        )
-    floor = FEC_FLOOR_PCT if floor_pct is None else int(floor_pct)
-    top = FEC_MAX_PCT if max_pct is None else int(max_pct)
-    start = int(initial_repair_pct)
-    if clamp_cold:
-        start = min(top, adaptive_start_pct(start, chosen, floor))
-    return QuantileFecController(
-        mode=chosen,
-        start_pct=start,
-        min_pct=floor,
-        max_pct=top,
-    )
+def make_fec_controller(initial_repair_pct: int, **_kwargs) -> FecController:
+    return FecController(start_pct=int(initial_repair_pct))
 
 
 def block_quartile(block_id: int, total: int) -> int:
@@ -986,33 +584,3 @@ def parse_done_metrics(log: str) -> FecRunMetrics | None:
         pace_p10=_f(_find(r"pace_p10=([\d.]+|n/a)")),
         pace_med=_f(_find(r"med=([\d.]+)")),
     )
-
-
-def adaptive_gate_failures(
-    profile: str,
-    fixed24: FecRunMetrics,
-    adaptive: FecRunMetrics,
-    *,
-    wan_min_mib: float = ADAPTIVE_WAN_MIN_MIB,
-) -> list[str]:
-    """Quantile-only acceptance vs locked 24%. Empty list means pass."""
-    fails: list[str] = []
-    kind = profile.strip().lower()
-    clean = kind.startswith("clean")
-    if clean:
-        if adaptive.total_wire_mib > fixed24.total_wire_mib * ADAPTIVE_CLEAN_WIRE_MAX:
-            fails.append("clean wire not >=10% below fixed-24")
-    else:
-        if adaptive.goodput_mib < fixed24.goodput_mib * ADAPTIVE_WAN_GOODPUT_MIN:
-            fails.append("WAN/burst median goodput >3% worse than fixed-24")
-        if adaptive.goodput_mib < wan_min_mib:
-            fails.append(f"WAN min goodput below {wan_min_mib:.0f} MiB/s")
-    if adaptive.tail_s > fixed24.tail_s * 1.25 + 0.50:
-        fails.append("tail worse than baseline")
-    if (
-        fixed24.pace_p10 > 0
-        and adaptive.pace_p10 > 0
-        and adaptive.pace_p10 < fixed24.pace_p10 * 0.90
-    ):
-        fails.append("pace_p10 worse than baseline")
-    return fails
