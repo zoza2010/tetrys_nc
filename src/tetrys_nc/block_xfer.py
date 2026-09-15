@@ -353,7 +353,6 @@ class BlockSender:
         min_bps: float,
         max_bps: float,
         start_bps: float,
-        ramp_s: float,
         cc_on: bool,
         encode_pool,
         prefetch_depth: int,
@@ -368,9 +367,7 @@ class BlockSender:
         self.block_k = geometry.block_k
         self.symbol_size = geometry.symbol_size
         self.total_blocks = geometry.total_blocks(self.file_size)
-        self.ramp_s = ramp_s
         self.min_bps = min_bps
-        self.start_bps = start_bps
         self.encode_pool = encode_pool
         self.prefetch_depth = prefetch_depth
         self.feedback = SenderFeedbackState(session_id)
@@ -480,12 +477,6 @@ class BlockSender:
         limiter = self.limiter
         cc = self.cc
         timers = self.timers
-        if self.ramp_s > 0 and cc is None:
-            elapsed = time.monotonic() - self.t0
-            if elapsed < self.ramp_s:
-                limiter.set_rate(
-                    self.start_bps * max(0.05, elapsed / self.ramp_s)
-                )
         for pos in range(0, len(wires), _SEND_CHUNK):
             if cc is not None:
                 self._apply_cc()
@@ -1237,7 +1228,6 @@ def run_block_server(
     initial_repair_pct: int | None = None,
     active_bytes: int = WAN_ACTIVE_BYTES,
     rate_mbit: float | None = None,
-    ramp_s: float = 0.0,
     skip_hash: bool = False,
     once: bool = True,
 ) -> int:
@@ -1365,7 +1355,6 @@ def run_block_server(
                 min_bps=min_bps,
                 max_bps=max_bps,
                 start_bps=start_bps,
-                ramp_s=ramp_s,
                 cc_on=cc_on,
                 encode_pool=encode_pool,
                 prefetch_depth=prefetch_depth,

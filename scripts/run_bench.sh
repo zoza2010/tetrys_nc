@@ -17,7 +17,7 @@ echo "=== 64M gen K=48 ==="
 if [[ -f testdata/blob_1g.bin ]]; then
   echo "=== 1G gen transfer ==="
   "$PY" -m tetrys_nc server --file testdata/blob_1g.bin --port 9123 --skip-hash \
-    --gen-k 48 --gen-overhead 8 --rate 2000 --ramp-s 0 --payload-size 1350 \
+    --gen-k 48 --gen-overhead 8 --rate 2000 --payload-size 1350 \
     >testdata/bench_server.log 2>&1 &
   SPID=$!
   sleep 0.8

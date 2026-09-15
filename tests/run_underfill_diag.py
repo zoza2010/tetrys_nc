@@ -109,8 +109,6 @@ def run_xfer(
             "--skip-hash",
             "--rate",
             "900",
-            "--ramp-s",
-            "0.2",
             "--gen-k",
             "96",
         ],

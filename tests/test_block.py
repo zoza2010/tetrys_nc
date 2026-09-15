@@ -532,7 +532,6 @@ def test_flush_keeps_first_flight_unique(tmp_path: Path):
             min_bps=1e6,
             max_bps=1e6,
             start_bps=1e6,
-            ramp_s=0.0,
             cc_on=False,
             encode_pool=pool,
             prefetch_depth=1,

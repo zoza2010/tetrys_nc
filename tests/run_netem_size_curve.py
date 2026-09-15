@@ -59,8 +59,6 @@ def run_one(blob: Path, profile: str, port: int, timeout: int) -> dict:
             "--skip-hash",
             "--rate",
             "200",
-            "--ramp-s",
-            "0.2",
             "--gen-k",
             "48",
         ],

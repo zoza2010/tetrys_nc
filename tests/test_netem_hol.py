@@ -73,8 +73,6 @@ def test_hol_stall_profile_does_not_freeze_blast(tmp_path: Path) -> None:
             "--skip-hash",
             "--rate",
             "80",
-            "--ramp-s",
-            "0.2",
             "--gen-k",
             "48",
         ],

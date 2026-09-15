@@ -62,12 +62,6 @@ def main(argv: list[str] | None = None) -> int:
         "Omit to search from the stall floor after the first RTT",
     )
     p.add_argument(
-        "--ramp-s",
-        type=float,
-        default=0.0,
-        help="seconds to ease-in pace from 0 to start rate (0=immediate blast)",
-    )
-    p.add_argument(
         "--once",
         action="store_true",
         help="exit after one transfer (default: stay idle and wait for the next client)",
@@ -93,7 +87,6 @@ def main(argv: list[str] | None = None) -> int:
         block_k=args.gen_k,
         initial_repair_pct=args.gen_overhead,
         rate_mbit=args.rate_mbit,
-        ramp_s=args.ramp_s,
         skip_hash=args.skip_hash,
         once=args.once,
     )

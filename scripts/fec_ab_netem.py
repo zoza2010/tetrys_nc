@@ -46,8 +46,6 @@ def _run(profile: str, overhead: str, port: int, work: Path) -> dict:
         "--skip-hash",
         "--rate",
         RATE,
-        "--ramp-s",
-        "0",
         "--gen-k",
         GEN_K,
     ]

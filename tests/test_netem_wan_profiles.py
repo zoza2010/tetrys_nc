@@ -51,8 +51,6 @@ def _run_through_netem(
         "--port",
         str(srv_port),
         "--skip-hash",
-        "--ramp-s",
-        "0.2",
         "--gen-k",
         "48",
     ]

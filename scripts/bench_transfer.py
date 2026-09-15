@@ -56,8 +56,6 @@ def main() -> int:
         str(args.gen_overhead),
         "--rate",
         str(args.rate),
-        "--ramp-s",
-        "0",
         "--payload-size",
         "1350",
     ]
