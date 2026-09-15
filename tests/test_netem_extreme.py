@@ -258,3 +258,26 @@ def test_cc_search_tracks_fatter_shaper(tmp_path: Path) -> None:
     assert got.pace_med > 150.0, srv[-800:]
     # 64 MiB on a 500 Mbit dropper spends most of the run in DIR/HOL tail;
     # the bar is "found the fat shaper", not WAN-length goodput.
+
+
+def test_cc_search_sits_on_spain_policer(tmp_path: Path) -> None:
+    """850 Mbit drop-shaper, empty queue. Must not lock ~200–600."""
+    pytest.importorskip("raptorq")
+    from tetrys_nc.block_state import parse_done_metrics
+
+    blob = _ensure_blob_64m()
+    ok, srv, emu = _run_through_netem(
+        tmp_path,
+        blob,
+        "spain-policer",
+        srv_port=17860,
+        timeout=90,
+        rate=None,
+        gen_overhead="24",
+    )
+    assert ok, f"spain-policer CC search failed\n{emu[-400:]}\n{srv[-800:]}"
+    got = parse_done_metrics(srv)
+    assert got is not None, srv[-800:]
+    assert got.pace_med > 500.0, srv[-800:]
+    assert got.pace_p10 > 200.0, srv[-800:]
+    assert got.pace_med < 1500.0, srv[-800:]

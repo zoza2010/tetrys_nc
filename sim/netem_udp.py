@@ -352,6 +352,17 @@ PROFILES: dict[str, PathSpec] = {
         rate_up=False,
         seed=32,
     ),
+    # Russia↔Spain: ~80 ms RTT, almost no standing queue, UDP policer
+    # ~850–950 Mbit (drops above C, RTT of survivors stays delay_s).
+    "spain-policer": PathSpec(
+        delay_s=0.040,
+        jitter_s=0.001,
+        rate_mbit=850.0,
+        rate_drop=True,
+        rate_down=True,
+        rate_up=False,
+        seed=39,
+    ),
     # Clean first, then the policer engages (phase2 rate drop).
     "shaper-late": PathSpec(
         delay_s=0.050,

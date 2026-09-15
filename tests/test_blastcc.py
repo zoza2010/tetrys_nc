@@ -82,7 +82,7 @@ def test_startup_gain_is_bbr_until_fat():
 
 
 def test_fat_startup_ceiling_walks_not_jump():
-    """`--rate 900`. 2.89× until stall; dirty stall 1.15×."""
+    """Fat pipe walks 1.25×. Dirty stall 1.15×. No second 2.89× into a dropper."""
     start = 850_000_000 / 8
     cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
     cc.min_rtt = 0.08
@@ -93,7 +93,7 @@ def test_fat_startup_ceiling_walks_not_jump():
     for x in (burst * 0.95, burst, burst * 1.02):
         cc.bw.observe(x)
     assert cc._fat_pipe() is True
-    assert cc._startup_gain() == pytest.approx(_STARTUP_GAIN)
+    assert cc._startup_gain() == pytest.approx(1.25)
     cc.bw_stall_n = 3
     assert cc._startup_search_cap(cc.max_bps) <= burst * 1.30
     assert cc._raise_ceiling() <= burst * 1.30
@@ -950,8 +950,8 @@ def test_closed_loop_fat_pipe_settles_near_c_without_sawtooth():
     tail = rates[-max(8, len(rates) // 5) :]
     med = sorted(tail)[len(tail) // 2]
     lo, hi = min(tail), max(tail)
-    assert _mbit(med) > 600.0, _mbit(med)
-    assert _mbit(med) < 1300.0, _mbit(med)
+    assert _mbit(med) > 720.0, _mbit(med)
+    assert _mbit(med) < 1100.0, _mbit(med)
     assert hi < lo * 2.0, (_mbit(lo), _mbit(hi))
     assert cc._raise_ceiling() < 1_200_000_000 / 8, _mbit(cc._raise_ceiling())
 
@@ -1559,8 +1559,8 @@ def test_closed_loop_soft_knee_does_not_walk_into_five_percent():
     rates = _simulate_path(cc, c_bps=c, mode="soft", duration=20.0)
     tail = rates[-max(8, len(rates) // 5) :]
     med = sorted(tail)[len(tail) // 2]
-    assert _mbit(med) > 600.0, _mbit(med)
-    assert _mbit(med) < 1050.0, _mbit(med)
+    assert _mbit(med) > 720.0, _mbit(med)
+    assert _mbit(med) < 980.0, _mbit(med)
     tail_hi, tail_lo = max(tail), min(tail)
     assert tail_hi < tail_lo * 1.15, (_mbit(tail_lo), _mbit(tail_hi), cc.saw_loss_knee)
 
@@ -1574,6 +1574,17 @@ def test_closed_loop_iid_loss_does_not_lock_unique_times_headroom():
     med = sorted(tail)[len(tail) // 2]
     assert _mbit(med) > 650.0, _mbit(med)
     assert max(tail) < min(tail) * 2.0, (_mbit(min(tail)), _mbit(max(tail)))
+
+
+def test_closed_loop_spain_policer_sits_near_850():
+    """Russia↔Spain: empty queue, policer ~850–950. Must not lock ~600."""
+    cc = _search_cc()
+    c = 850_000_000 / 8
+    rates = _simulate_path(cc, c_bps=c, mode="soft", duration=22.0)
+    tail = rates[-max(8, len(rates) // 5) :]
+    med = sorted(tail)[len(tail) // 2]
+    assert 750.0 < _mbit(med) < 980.0, _mbit(med)
+    assert max(tail) < min(tail) * 1.20, (_mbit(min(tail)), _mbit(max(tail)))
 
 
 def test_closed_loop_thin_policer_sits_near_shaper():
@@ -1601,6 +1612,49 @@ def test_closed_loop_hol_dip_does_not_lock_trickle_as_c():
     tail = rates[-12:]
     med = sorted(tail)[len(tail) // 2]
     assert _mbit(med) > 400.0, (_mbit(med), cc.phase)
+
+
+def test_dropper_knee_ignores_stable_coverable_loss_after_fill_latch():
+    """WAN 2026-09-14: knee=197 then path_p50=22% (FEC). Not a new C lock."""
+    cc = _search_cc()
+    fill = 197_000_000 / 8
+    cc.knee_bps = fill
+    cc.rate = 240_000_000 / 8
+    cc.last_send_rate = cc.rate
+    cc.last_delivery = 224_000_000 / 8
+    cc.last_path_loss = 0.222
+    cc.path_samples = [
+        (fill, 0.221),
+        (fill * 1.02, 0.224),
+        (210_000_000 / 8, 0.221),
+    ]
+    for x in (cc.last_delivery * 0.95, cc.last_delivery, cc.last_delivery):
+        cc.bw.observe(x)
+    assert cc._dropper_knee_sample() is False
+    assert cc._path_loss_grew() is False
+
+
+def test_quiet_hol_after_fat_climb_does_not_sit_on_two_block_fill():
+    """WAN: pace 1210 / unq=847 / path=0%, then snd=51. Hold fat, not 197."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    fat = 847_000_000 / 8
+    cc.rate = 1_210_000_000 / 8
+    cc.last_good = start
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.last_path_loss = 0.0
+    cc.recv_lag = True
+    cc.last_unique = 32 * 1048576
+    cc.last_delivery = 48_000_000 / 8
+    cc.last_send_rate = 51_000_000 / 8
+    cc.cliff_n = 4
+    for x in (fat * 0.95, fat, fat * 1.02):
+        cc.bw.observe(x)
+    cc._recover_wrecked(1.0)
+    assert cc.rate > 400_000_000 / 8, _mbit(cc.rate)
+    assert cc.last_good > 400_000_000 / 8, _mbit(cc.last_good)
 
 
 def test_stale_gigabit_filter_does_not_lock_after_window_wreck():
