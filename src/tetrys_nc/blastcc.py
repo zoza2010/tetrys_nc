@@ -247,7 +247,7 @@ class BlastCc:
 
     def _rate_ceiling(self) -> float:
         hard = min(self.max_bps, self._inflight_ceiling())
-        if self.dropper_confirmed and self.knee_bps > 0:
+        if self.dropper_confirmed and self.knee_bps > 0 and not self._is_fill_knee():
             return min(hard, max(self.min_bps, self.knee_bps))
         if self.phase == STARTUP:
             cap = self._startup_search_cap(hard)
@@ -273,7 +273,7 @@ class BlastCc:
         bw = self.bw.max_bw
         if bw is None:
             return hard
-        if self.dropper_confirmed:
+        if self.dropper_confirmed and not self._is_fill_knee():
             knee = self._knee_bps()
             cap = knee if knee is not None else bw
         else:
@@ -338,12 +338,14 @@ class BlastCc:
         return True
 
     def _locked_c(self) -> bool:
-        return self.saw_loss_knee and self.knee_bps > 0
+        return self.saw_loss_knee and self.knee_bps > 0 and not self._is_fill_knee()
 
     def _dropper_frozen(self) -> bool:
         return self.dropper_confirmed and self._locked_c()
 
     def _may_search_past_lock(self) -> bool:
+        if self._on_fill_shelf() or self._is_fill_knee():
+            return True
         if self._dropper_frozen():
             return False
         if not self._locked_c():
@@ -359,6 +361,23 @@ class BlastCc:
             return
         self.rate = self.knee_bps
         self.last_good = max(self.last_good, self.knee_bps)
+
+    @property
+    def fec_may_raise(self) -> bool:
+        """Remote adaptive FEC: do not hunt C with repair on a dropper/policer."""
+        if self._on_fill_shelf():
+            return True
+        if self._dropper_frozen() or self.path_kind == PATH_POLICER:
+            return False
+        return self.path_kind != PATH_HOL
+
+    @property
+    def fec_may_lower(self) -> bool:
+        return self._clean_pipe() and not self._hol_stall()
+
+    @property
+    def fec_may_lower_floor(self) -> bool:
+        return self.fec_may_lower
 
     def pull_events(self) -> list[str]:
         ev, self._events = self._events, []
@@ -384,7 +403,7 @@ class BlastCc:
         if self.phase == MEASURE:
             return min(self._rate_ceiling(), max(self.min_bps, rate))
         floor = max(self.min_bps, self.last_good * _GOOD_FLOOR)
-        if self._locked_c():
+        if self._locked_c() and not self._is_fill_knee():
             floor = max(floor, self.knee_bps)
         if self.phase == PROBE:
             return min(self._raise_ceiling(), max(floor, rate))
@@ -422,7 +441,13 @@ class BlastCc:
         return self.last_send_rate < self.rate * 0.30
 
     def _hol_stall(self) -> bool:
-        return self._unique_cliff() or self._send_paused()
+        if self._unique_cliff():
+            return True
+        if not self._send_paused():
+            return False
+        if self.rate > 0 and self.last_delivery >= self.rate * _IID_RATIO:
+            return False
+        return True
 
     def _admit_stall(self) -> bool:
         return self._hol_stall()
@@ -462,6 +487,17 @@ class BlastCc:
 
     def _starved_fill_bps(self) -> float:
         return max(self.min_bps, 2 * _BLOCK_BYTES / self._rtt_s())
+
+    def _on_fill_shelf(self) -> bool:
+        """Two-block BDP (~210 Mbit at 80 ms). Unique cannot exceed send here."""
+        fill = self._starved_fill_bps()
+        return fill * 0.80 <= self.rate <= fill * 1.30
+
+    def _is_fill_knee(self) -> bool:
+        if self.knee_bps <= 0:
+            return False
+        fill = self._starved_fill_bps()
+        return fill * 0.80 <= self.knee_bps <= fill * 1.30
 
     def _drain_target(self) -> float:
         cut = self.rate * _DRAIN_GAIN
@@ -599,9 +635,10 @@ class BlastCc:
         else:
             self.loss_knee_n = 0
         if self.loss_knee_n >= _LOSS_HOLD:
+            if self._on_fill_shelf():
+                return
             if not self.saw_loss_knee:
                 self._lock_knee(now)
-            self.saw_loss_knee = True
 
     def _c_lock_bps(self) -> float | None:
         send = self.last_send_rate if self.last_send_rate > 0 else self.rate
@@ -674,6 +711,15 @@ class BlastCc:
 
     def _abort_probe_dropper(self, now: float) -> None:
         base = self.knee_bps if self.knee_bps > 0 else self.probe_base
+        fill = self._starved_fill_bps()
+        if base > 0 and base <= fill * 1.30:
+            self.dropper_confirmed = False
+            self.saw_loss_knee = False
+            self.knee_bps = 0.0
+            self.rate = max(base, fill)
+            self._enter_cruise(now, take_rate=False)
+            self._emit("probe_abort fill_knee")
+            return
         if base > 0:
             self.knee_bps = base
             self.rate = base
@@ -688,6 +734,13 @@ class BlastCc:
     def _lock_knee(self, now: float) -> None:
         knee = self._c_lock_bps()
         if knee is None or knee <= 0:
+            return
+        fill = self._starved_fill_bps()
+        if knee <= fill * 1.30:
+            if self.rate < knee:
+                self.rate = knee
+                self.last_good = max(self.last_good, knee)
+            self.last_step_ts = now
             return
         self.knee_bps = knee
         self.rate = knee
@@ -718,7 +771,9 @@ class BlastCc:
         if self.last_path_loss is not None and self.last_path_loss >= _LOSS_KNEE:
             return
         if got / send >= _KNEE_GOOD_RATIO:
-            self.knee_bps = max(self.knee_bps, min(send, self.rate))
+            latched = min(send, self.rate)
+            if latched > self._starved_fill_bps() * 1.30:
+                self.knee_bps = max(self.knee_bps, latched)
 
     def _note_path_sample(self) -> None:
         if self.last_path_loss is None:
@@ -1113,6 +1168,17 @@ class BlastCc:
         )
         if buffer_full:
             self._begin_drain(now, cruise=True)
+        elif self._on_fill_shelf() and not self._pipe_oversend():
+            hard = min(self.max_bps, self._inflight_ceiling())
+            ceiling = min(hard, max(self.rate * _STEP_MAX, self._starved_fill_bps() * _STARTUP_GAIN))
+            if now - self.last_step_ts >= step_s and self.rate < ceiling * 0.98:
+                self.last_step_ts = now
+                self.dropper_confirmed = False
+                self.saw_loss_knee = False
+                if self._is_fill_knee():
+                    self.knee_bps = 0.0
+                self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
+                self._emit("cruise_fill")
         elif self._locked_c() and not self._may_search_past_lock():
             self._hold_locked_c()
         elif starved := (self._pipe_starved() and not self._pipe_oversend() and empty_pipe):
@@ -1123,7 +1189,10 @@ class BlastCc:
                 self.last_step_ts = now
                 self.rate = min(ceiling, self._nudge(_STARTUP_GAIN))
                 self._emit("cruise_fill")
-        elif self.path_kind == PATH_DROPPER or self._path_loss_grew() or self._loss_grew():
+        elif (
+            not self._on_fill_shelf()
+            and (self.path_kind == PATH_DROPPER or self._path_loss_grew() or self._loss_grew())
+        ):
             self._lock_knee(now)
         elif settled and policer:
             self._cut_to_delivery(now)

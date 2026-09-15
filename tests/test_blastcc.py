@@ -1441,6 +1441,82 @@ def test_confirmed_dropper_does_not_probe_past_knee():
     assert cc.rate == pytest.approx(knee)
 
 
+def test_fill_shelf_lock_is_not_c_even_if_dropper_confirmed():
+    """WAN 2026-09-15: pace=218 good=218 path_p50=24%→0%. Two-block fill is not C."""
+    cc = _search_cc()
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    fill = cc._starved_fill_bps()
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.saw_loss_knee = True
+    cc.dropper_confirmed = True
+    cc.knee_bps = fill
+    cc.rate = fill
+    cc.last_good = fill
+    cc.cruise_ts = 0.0
+    cc.last_step_ts = 0.0
+    cc.last_unique = 32 * 1048576
+    cc.last_send_rate = 0.0
+    cc.last_delivery = fill
+    cc.last_path_loss = 0.0
+    cc.recv_lag = False
+    for x in (fill * 0.95, fill, fill * 1.02):
+        cc.bw.observe(x)
+    assert cc._on_fill_shelf() is True
+    assert cc._is_fill_knee() is True
+    assert cc._locked_c() is False
+    assert cc._may_search_past_lock() is True
+    assert cc._hol_stall() is False
+    now = 3.0
+    unique = 32 * 1048576
+    sent = unique
+    fb = 1
+    for _ in range(8):
+        now += 0.16
+        unique += int(cc.rate * 0.16)
+        sent += int(cc.rate * 0.16)
+        _feed(
+            cc,
+            now,
+            fb,
+            unique,
+            0.08,
+            sent=sent,
+            source=sent,
+            path_loss=0.0,
+            decoded=unique,
+        )
+        fb += 1
+    assert cc.rate > fill * 1.20, _mbit(cc.rate)
+
+
+def test_closed_loop_fill_shelf_climbs_to_fat_policer():
+    """Stuck at two-block fill with a confirmed knee; C is 800."""
+    cc = _search_cc()
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    fill = 2 * 1048576 / 0.08
+    cc.phase = CRUISE
+    cc.rate = fill
+    cc.last_good = fill
+    cc.knee_bps = fill
+    cc.saw_loss_knee = True
+    cc.dropper_confirmed = True
+    cc.was_fat = True
+    cc.cruise_ts = 0.0
+    cc.last_unique = 32 * 1048576
+    c = 800_000_000 / 8
+    rates = _simulate_path(cc, c_bps=c, mode="policer", duration=16.0)
+    tail = rates[-max(8, len(rates) // 5) :]
+    med = sorted(tail)[len(tail) // 2]
+    assert _mbit(med) > 500.0, (_mbit(med), cc.dropper_confirmed)
+
+
 def test_probe_abort_dropper_sits_on_probe_base_not_trickle_send():
     """WAN 2026-09-14: probe_abort dropper snd=384/unq=727 locked 384."""
     cc = _search_cc()
