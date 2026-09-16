@@ -29,6 +29,7 @@ from .block_packets import (
     BlockFin,
     BlockMeta,
     BlockReady,
+    BlockUploadReady,
     OpenBlock,
     merge_open_feedback,
     pack_data_packets,
@@ -257,12 +258,13 @@ def _make_encode_pool(workers: int):
     return ThreadPoolExecutor(max_workers=workers)
 
 
-def _wait_block_ready(
+def _wait_hello(
     sock: socket.socket,
     geometry: BlockGeometry,
     active_cap: int,
     timeout_s: float | None,
-) -> tuple[tuple[str, int], int, str] | None:
+) -> tuple[tuple[str, int], int, str, bool] | None:
+    """Wait for READY (download) or UPLOAD. Last flag is True for upload."""
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while deadline is None or time.monotonic() < deadline:
         readable, _, _ = select.select([sock], [], [], 0.5)
@@ -273,12 +275,17 @@ def _wait_block_ready(
             packet = parse_packet(raw)
         except (BlockingIOError, ValueError):
             continue
-        if isinstance(packet, BlockReady):
+        if isinstance(packet, (BlockReady, BlockUploadReady)):
             geometry.active_bytes = min(
                 active_cap,
                 max(2 * geometry.block_bytes, packet.active_bytes),
             )
-            return addr, packet.session_id, packet.rel_path
+            return (
+                addr,
+                packet.session_id,
+                packet.rel_path,
+                isinstance(packet, BlockUploadReady),
+            )
     return None
 
 
@@ -302,6 +309,105 @@ def _safe_join(root: Path, rel: str) -> Path | None:
     if path is None or not path.is_file():
         return None
     return path
+
+
+def _safe_dest(root: Path, rel: str) -> Path | None:
+    """Write destination under root; file or dir may not exist yet."""
+    path = _safe_path(root, rel)
+    if path is None:
+        return None
+    if path == root.resolve():
+        return None
+    return path
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _error_meta(
+    session_id: int,
+    message: str,
+    symbol_size: int,
+    block_k: int,
+    fec: int,
+    active_bytes: int,
+) -> bytes:
+    name = message if message.startswith("!") else f"!{message}"
+    return BlockMeta(
+        session_id, 0, name, symbol_size, block_k, fec, active_bytes, ""
+    ).pack()
+
+
+def _wait_upload_meta(
+    sock: socket.socket,
+    session_id: int,
+    timeout_s: float,
+) -> tuple[BlockMeta | None, list[bytes]]:
+    """Wait for the client's file META; buffer DATA/FIN/object packets."""
+    deadline = time.monotonic() + timeout_s
+    buffered: list[bytes] = []
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([sock], [], [], 0.5)
+        if not readable:
+            continue
+        try:
+            raw, _ = sock.recvfrom(4096)
+            packet = parse_packet(raw)
+        except (BlockingIOError, ValueError):
+            continue
+        if getattr(packet, "session_id", None) != session_id:
+            continue
+        if isinstance(packet, BlockUploadReady):
+            continue
+        if isinstance(packet, BlockMeta):
+            if packet.file_name.startswith("!"):
+                continue
+            return packet, buffered
+        buffered.append(raw)
+    return None, buffered
+
+
+def _resolve_upload_sources(
+    sources: list[Path],
+) -> tuple[str, Path | list[tuple[str, Path]]]:
+    paths = list(sources)
+    if not paths:
+        raise FileNotFoundError("upload requires a local file")
+    if len(paths) == 1:
+        path = paths[0]
+        if path.is_file():
+            return "file", path.resolve()
+        if path.is_dir():
+            files = [
+                (child.name, child.resolve())
+                for child in sorted(path.iterdir())
+                if child.is_file() and not child.name.startswith(".")
+            ]
+            if not files:
+                raise FileNotFoundError(f"empty directory: {path}")
+            return "mux", files
+        raise FileNotFoundError(path)
+    files: list[tuple[str, Path]] = []
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        files.append((path.name, path.resolve()))
+    return "mux", files
+
+
+def _default_upload_remote(
+    kind: str, sources: list[Path], target: Path | list[tuple[str, Path]]
+) -> str:
+    if kind == "file":
+        return Path(target).name
+    if len(sources) == 1 and sources[0].is_dir():
+        name = sources[0].name
+        return name or "upload"
+    return "upload"
 
 
 def _resolve_ready(
@@ -987,6 +1093,7 @@ class BlockReceiver:
         output: Path,
         *,
         file_progress: bool,
+        close_sock: bool = True,
     ) -> None:
         self.sock = sock
         self.server = server
@@ -994,6 +1101,7 @@ class BlockReceiver:
         self.meta = meta
         self.output = output
         self.file_progress = file_progress
+        self.close_sock = close_sock
         self.geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
         self.total_blocks = self.geometry.total_blocks(meta.file_size)
         self.slots: dict[int, GenReceiveSlot] = {}
@@ -1156,7 +1264,7 @@ class BlockReceiver:
             sys.stdout.write("\x1b[1A\x1b[2K")
         print(line, flush=True)
 
-    def run(self) -> int:
+    def run(self, primed: list[bytes] | None = None) -> int:
         meta = self.meta
         output = self.output
         print(
@@ -1171,7 +1279,22 @@ class BlockReceiver:
         self.t0 = time.monotonic()
         self.rate_t = self.t0
         sock = self.sock
+
+        def _handle(raw: bytes) -> None:
+            try:
+                packet = parse_packet(raw)
+            except ValueError:
+                return
+            if getattr(packet, "session_id", None) != self.session_id:
+                return
+            if isinstance(packet, BlockData):
+                self._on_data(packet, raw)
+            elif isinstance(packet, BlockFin):
+                self.fin_seen = True
+
         try:
+            for raw in primed or ():
+                _handle(raw)
             while len(self.done) < self.total_blocks:
                 readable, _, _ = select.select([sock], [], [], 0.01)
                 if readable:
@@ -1180,16 +1303,7 @@ class BlockReceiver:
                     except BlockingIOError:
                         batch = []
                     for raw in batch:
-                        try:
-                            packet = parse_packet(raw)
-                        except ValueError:
-                            continue
-                        if getattr(packet, "session_id", None) != self.session_id:
-                            continue
-                        if isinstance(packet, BlockData):
-                            self._on_data(packet, raw)
-                        elif isinstance(packet, BlockFin):
-                            self.fin_seen = True
+                        _handle(raw)
                 self._send_feedback()
                 self._log(time.monotonic())
             self._send_feedback(force=True)
@@ -1200,8 +1314,11 @@ class BlockReceiver:
         finally:
             for slot in self.slots.values():
                 slot.close()
-            os.close(self.fd)
-            sock.close()
+            if self.fd >= 0:
+                os.close(self.fd)
+                self.fd = -1
+            if self.close_sock:
+                sock.close()
 
         elapsed = max(time.monotonic() - self.t0, 1e-6)
         if meta.sha256_hex:
@@ -1217,6 +1334,97 @@ class BlockReceiver:
         return 0
 
 
+def _recv_upload(
+    sock: socket.socket,
+    client,
+    session_id: int,
+    rel: str,
+    root: Path,
+    geometry: BlockGeometry,
+    *,
+    symbol_size: int,
+    block_k: int,
+    fec_start: int,
+) -> None:
+    dest = _safe_dest(root, rel)
+    if dest is None:
+        print(f"reject UPLOAD path={rel!r}", flush=True)
+        _send_copies(
+            sock,
+            client,
+            _error_meta(
+                session_id,
+                "upload rejected: invalid path",
+                symbol_size,
+                block_k,
+                fec_start,
+                geometry.active_bytes,
+            ),
+        )
+        return
+    ack = BlockMeta(
+        session_id,
+        0,
+        rel.replace("\\", "/"),
+        symbol_size,
+        block_k,
+        fec_start,
+        geometry.active_bytes,
+        "",
+    ).pack()
+    _send_copies(sock, client, ack)
+    meta, primed = _wait_upload_meta(sock, session_id, 30.0)
+    if meta is None:
+        print(f"timeout waiting for upload META path={rel!r}", flush=True)
+        return
+    if meta.file_name == MUX_META_NAME:
+        from .object_xfer import consume_object_stream
+
+        if dest.exists() and not dest.is_dir():
+            print(f"reject UPLOAD dest is not a directory path={rel!r}", flush=True)
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        print(
+            f"recv mux upload files dest={dest} from {client[0]}:{client[1]}",
+            flush=True,
+        )
+        consume_object_stream(
+            sock,
+            client,
+            session_id,
+            meta,
+            dest,
+            timeout_s=180.0,
+            close_sock=False,
+            primed=primed,
+        )
+        return
+    if dest.exists() and dest.is_dir():
+        print(f"reject UPLOAD dest is a directory path={rel!r}", flush=True)
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(f"{dest.name}.part.{session_id}")
+    print(
+        f"recv upload {rel} size={meta.file_size} from {client[0]}:{client[1]}",
+        flush=True,
+    )
+    try:
+        BlockReceiver(
+            sock,
+            client,
+            session_id,
+            meta,
+            part,
+            file_progress=False,
+            close_sock=False,
+        ).run(primed=primed)
+        os.replace(part, dest)
+        print(f"stored {dest}", flush=True)
+    except BaseException:
+        _unlink_quiet(part)
+        raise
+
+
 def run_block_server(
     host: str,
     port: int,
@@ -1230,6 +1438,7 @@ def run_block_server(
     rate_mbit: float | None = None,
     skip_hash: bool = False,
     once: bool = True,
+    allow_upload: bool = False,
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
     root = root.resolve()
@@ -1243,7 +1452,7 @@ def run_block_server(
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_RCVBUF, 16 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
     sock.bind((host, port))
     sock.setblocking(False)
     print(
@@ -1256,6 +1465,7 @@ def run_block_server(
         f"cc={'blast' if cc_on else 'off'} "
         f"fec={fec_start}% "
         f"mode={fec_mode} "
+        f"upload={'on' if allow_upload else 'off'} "
         f"enc_workers={workers} prefetch={prefetch_depth}",
         flush=True,
     )
@@ -1265,12 +1475,44 @@ def run_block_server(
     try:
         while True:
             print("waiting for READY", flush=True)
-            got = _wait_block_ready(
+            got = _wait_hello(
                 sock, geometry, active_cap, 60.0 if once else None
             )
             if got is None:
                 raise TimeoutError("server timed out waiting for READY")
-            client, session_id, rel_path = got
+            client, session_id, rel_path, is_upload = got
+            if is_upload:
+                rel = (rel_path or "").strip()
+                if not allow_upload:
+                    print(f"reject UPLOAD path={rel!r} (disabled)", flush=True)
+                    _send_copies(
+                        sock,
+                        client,
+                        _error_meta(
+                            session_id,
+                            "upload rejected: uploads disabled",
+                            symbol_size,
+                            block_k,
+                            fec_start,
+                            geometry.active_bytes,
+                        ),
+                    )
+                    continue
+                _recv_upload(
+                    sock,
+                    client,
+                    session_id,
+                    rel,
+                    root,
+                    geometry,
+                    symbol_size=symbol_size,
+                    block_k=block_k,
+                    fec_start=fec_start,
+                )
+                if once:
+                    break
+                print("idle — waiting for READY", flush=True)
+                continue
             rel = rel_path or default_file
             asked = _resolve_ready(root, rel)
             if asked is None:
@@ -1318,6 +1560,9 @@ def run_block_server(
                     initial_repair_pct=fec_start,
                     start_bps=start_bps,
                     close_sock=False,
+                    cc_on=cc_on,
+                    min_bps=min_bps,
+                    max_bps=max_bps,
                 )
                 if once:
                     break
@@ -1430,3 +1675,140 @@ def run_block_client(
     return BlockReceiver(
         sock, server, session_id, meta, output, file_progress=file_progress
     ).run()
+
+
+def run_block_upload_client(
+    host: str,
+    port: int,
+    sources: list[Path] | Path,
+    *,
+    remote: str = "",
+    active_bytes: int = WAN_ACTIVE_BYTES,
+    symbol_size: int = WAN_SYMBOL_SIZE,
+    block_k: int = WAN_BLOCK_K,
+    initial_repair_pct: int | None = None,
+    rate_mbit: float | None = None,
+    skip_hash: bool = False,
+) -> int:
+    source_list = [sources] if isinstance(sources, Path) else list(sources)
+    kind, target = _resolve_upload_sources(source_list)
+    dest = (remote or "").strip().replace("\\", "/").rstrip("/")
+    if not dest:
+        dest = _default_upload_remote(kind, source_list, target)
+
+    geometry = BlockGeometry(symbol_size, block_k, active_bytes)
+    workers = _encode_workers()
+    prefetch_depth = min(64, max(geometry.active_blocks, 32))
+    cc_on = rate_mbit is None
+    min_bps, max_bps, start_bps = _pace_limits(
+        0.0 if cc_on else rate_mbit, cc=cc_on
+    )
+    _fec_mode, fec_start = resolve_fec_cli(initial_repair_pct)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)
+    try_set_buffer(sock, socket.SO_RCVBUF, 16 * 1024 * 1024)
+    sock.setblocking(False)
+    server = (host, port)
+    session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
+    hello = BlockUploadReady(session_id, active_bytes, dest).pack()
+    _send_copies(sock, server, hello)
+    print(f"uploading {dest} to udp://{host}:{port}", flush=True)
+
+    ack: BlockMeta | None = None
+    deadline = time.monotonic() + 30.0
+    while ack is None and time.monotonic() < deadline:
+        readable, _, _ = select.select([sock], [], [], 0.5)
+        if not readable:
+            sock.sendto(hello, server)
+            continue
+        try:
+            raw, _ = sock.recvfrom(4096)
+            packet = parse_packet(raw)
+        except (BlockingIOError, ValueError):
+            continue
+        if isinstance(packet, BlockMeta) and packet.session_id == session_id:
+            ack = packet
+    if ack is None:
+        sock.close()
+        raise TimeoutError("client timed out waiting for upload accept")
+    if ack.file_name.startswith("!"):
+        sock.close()
+        msg = ack.file_name[1:].lstrip()
+        if "uploads disabled" in msg:
+            raise PermissionError(msg)
+        raise ValueError(msg)
+
+    encode_pool = None
+    try:
+        if kind == "mux":
+            from .object_xfer import ObjectSession, queue_disk_files, run_object_session
+
+            if not isinstance(target, list):
+                raise TypeError("mux upload expected a file list")
+            obj_session = ObjectSession()
+            queue_disk_files(obj_session, target)
+            meta = BlockMeta(
+                session_id,
+                obj_session.nbytes,
+                MUX_META_NAME,
+                symbol_size,
+                block_k,
+                fec_start,
+                geometry.active_bytes,
+                f"n={obj_session.nobj}",
+            ).pack()
+            _send_copies(sock, server, meta)
+            return run_object_session(
+                sock,
+                server,
+                session_id,
+                obj_session,
+                geometry=geometry,
+                initial_repair_pct=fec_start,
+                start_bps=start_bps,
+                close_sock=False,
+                cc_on=cc_on,
+                min_bps=min_bps,
+                max_bps=max_bps,
+            )
+        if not isinstance(target, Path):
+            raise TypeError("file upload expected a path")
+        file_path = target
+        file_size = file_path.stat().st_size
+        digest = "" if skip_hash else _hash_file(file_path)
+        meta = BlockMeta(
+            session_id,
+            file_size,
+            dest,
+            symbol_size,
+            block_k,
+            fec_start,
+            geometry.active_bytes,
+            digest,
+        ).pack()
+        _send_copies(sock, server, meta)
+        encode_pool = _make_encode_pool(workers)
+        sender = BlockSender(
+            sock,
+            server,
+            session_id,
+            file_path,
+            geometry,
+            initial_repair_pct=fec_start,
+            min_bps=min_bps,
+            max_bps=max_bps,
+            start_bps=start_bps,
+            cc_on=cc_on,
+            encode_pool=encode_pool,
+            prefetch_depth=prefetch_depth,
+        )
+        aborted = sender.run()
+        if aborted:
+            return 1
+        sender.print_done()
+        return 0
+    finally:
+        if encode_pool is not None:
+            encode_pool.shutdown(wait=False, cancel_futures=True)
+        sock.close()

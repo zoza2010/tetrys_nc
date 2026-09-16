@@ -40,6 +40,7 @@ from .block_state import (
     select_repair_candidates,
 )
 from .block_xfer import _pace_limits
+from .blastcc import BlastCc, _SEED_FRAC
 from .gen_raptor import GenEncoder, GenReceiveSlot
 from .netutil import recv_datagrams, send_datagrams, try_set_buffer
 from .object_frames import FRAME_HDR, BlockFill, ObjectCursor, is_pack_name, split_for_session, unpack_block, unpack_files
@@ -268,6 +269,7 @@ def run_object_server(
         initial_repair_pct=initial_repair_pct,
         start_bps=start_bps,
         close_sock=True,
+        cc_on=False,
     )
 
 
@@ -290,13 +292,28 @@ def run_object_session(
     initial_repair_pct: int,
     start_bps: float,
     close_sock: bool = False,
+    cc_on: bool = False,
+    min_bps: float = 0.0,
+    max_bps: float = 0.0,
 ) -> int:
     block_k = geometry.block_k
     symbol_size = geometry.symbol_size
-    limiter = RateLimiter(start_bps)
+    cc = (
+        BlastCc(
+            max_bps=max_bps,
+            start_bps=start_bps,
+            min_bps=min_bps,
+            active_bytes=geometry.active_bytes,
+        )
+        if cc_on
+        else None
+    )
+    limiter = RateLimiter(start_bps if not cc_on else start_bps * _SEED_FRAC)
     feedback = SenderFeedbackState(session_id)
     stop, client_fin = threading.Event(), threading.Event()
     t0 = time.monotonic()
+    sent_bytes = 0
+    source_bytes = 0
 
     def feedback_loop() -> None:
         while not stop.is_set():
@@ -338,11 +355,39 @@ def run_object_session(
             client,
         )
 
-    def send_wires(wires: list[bytes]) -> None:
+    def apply_cc() -> None:
+        if cc is None:
+            return
+        _completed, _opened, unique_rx, decoded, echo_ts, fb_id = feedback.snapshot()
+        limiter.set_rate(
+            cc.on_feedback(
+                time.monotonic(),
+                feedback_id=fb_id,
+                unique_bytes=unique_rx,
+                decoded_bytes=decoded,
+                echo_ts_us=echo_ts,
+                extra_frac=0.0,
+                window_full=len(active) >= geometry.active_blocks,
+                sent_bytes=sent_bytes,
+                source_bytes=source_bytes,
+            )
+        )
+        for line in cc.pull_events():
+            print(line, flush=True)
+
+    def send_wires(wires: list[bytes], *, repair: bool = False) -> None:
+        nonlocal sent_bytes, source_bytes
         for i in range(0, len(wires), _SEND_CHUNK):
+            if cc is not None:
+                apply_cc()
+                limiter.set_rate(cc.on_timer(time.monotonic()))
             batch = wires[i : i + _SEND_CHUNK]
             limiter.consume(sum(map(len, batch)))
             send_datagrams(sock, client, batch, chunk=_SEND_CHUNK)
+            amount = sum(map(len, batch))
+            sent_bytes += amount
+            if not repair:
+                source_bytes += amount
 
     def repair_tick(opened, now: float, tail: bool) -> None:
         cooldown_s = TAIL_REPAIR_COOLDOWN_S if tail else REPAIR_COOLDOWN_S
@@ -363,7 +408,10 @@ def run_object_session(
             if not new_packets:
                 continue
             stamp = int(now * 1_000_000) & 0xFFFFFFFF
-            send_wires(pack_data_packets(session_id, block_id, new_packets, prev, stamp))
+            send_wires(
+                pack_data_packets(session_id, block_id, new_packets, prev, stamp),
+                repair=True,
+            )
             state.repair_emitted += len(new_packets)
             state.last_repair_ts = now
             sent += len(new_packets)
@@ -381,6 +429,8 @@ def run_object_session(
                     flush=True,
                 )
                 break
+            if cc is not None:
+                apply_cc()
             for block_id in [b for b in active if b in completed]:
                 active.pop(block_id)
                 enc_cache.pop(block_id, None)
@@ -421,7 +471,9 @@ def run_object_session(
     if not aborted:
         print(
             f"done in {elapsed:.2f}s — mux blocks={next_block} "
-            f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload",
+            f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload "
+            f"cc={'blast' if cc is not None else 'off'} "
+            f"pace={limiter.rate * 8 / 1e6:.0f}Mbit",
             flush=True,
         )
     return 0
@@ -642,6 +694,7 @@ def consume_object_stream(
     *,
     close_sock: bool = True,
     file_progress: bool = False,
+    primed: list[bytes] | None = None,
 ) -> int:
 
     geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
@@ -719,7 +772,53 @@ def consume_object_stream(
                 slot.close()
             slot_seen.pop(bid, None)
 
+    def on_packet(raw: bytes) -> None:
+        nonlocal unique, last_echo, total_blocks
+        try:
+            packet = parse_packet(raw)
+        except ValueError:
+            return
+        if getattr(packet, "session_id", None) != session_id:
+            return
+        if isinstance(packet, ObjectOpen) and packet.obj_id not in sink.names:
+            sink.open(packet.obj_id, packet.name, packet.size)
+        elif isinstance(packet, ObjectFin):
+            sink.fin(packet.obj_id, packet.name, packet.size)
+        elif isinstance(packet, BlockData):
+            slot = slots.get(packet.block_id)
+            if packet.block_id in done:
+                if slot is None:
+                    return
+                before = slot.symbols_rx
+                slot.add_packet(packet.payload, packet.esi)
+                if slot.symbols_rx > before:
+                    unique += len(raw)
+                return
+            if slot is None:
+                slot = GenReceiveSlot(
+                    packet.block_id,
+                    gen_k=meta.block_k,
+                    symbol_size=meta.symbol_size,
+                    block_bytes=geometry.block_bytes,
+                    tlen=geometry.block_bytes,
+                )
+                slots[packet.block_id] = slot
+                slot_seen[packet.block_id] = time.monotonic()
+            before = slot.symbols_rx
+            decoded = slot.add_packet(packet.payload, packet.esi)
+            if slot.symbols_rx == before:
+                return
+            unique += len(raw)
+            last_echo = packet.send_ts_us
+            if decoded is not None:
+                sink.ingest(decoded[: geometry.block_bytes])
+                done.add(packet.block_id)
+        elif isinstance(packet, BlockFin):
+            total_blocks = packet.total_blocks
+
     try:
+        for raw in primed or ():
+            on_packet(raw)
         while True:
             if select.select([sock], [], [], 0.02)[0]:
                 try:
@@ -727,47 +826,7 @@ def consume_object_stream(
                 except BlockingIOError:
                     batch = []
                 for raw in batch:
-                    try:
-                        packet = parse_packet(raw)
-                    except ValueError:
-                        continue
-                    if getattr(packet, "session_id", None) != session_id:
-                        continue
-                    if isinstance(packet, ObjectOpen) and packet.obj_id not in sink.names:
-                        sink.open(packet.obj_id, packet.name, packet.size)
-                    elif isinstance(packet, ObjectFin):
-                        sink.fin(packet.obj_id, packet.name, packet.size)
-                    elif isinstance(packet, BlockData):
-                        slot = slots.get(packet.block_id)
-                        if packet.block_id in done:
-                            if slot is None:
-                                continue
-                            before = slot.symbols_rx
-                            slot.add_packet(packet.payload, packet.esi)
-                            if slot.symbols_rx > before:
-                                unique += len(raw)
-                            continue
-                        if slot is None:
-                            slot = GenReceiveSlot(
-                                packet.block_id,
-                                gen_k=meta.block_k,
-                                symbol_size=meta.symbol_size,
-                                block_bytes=geometry.block_bytes,
-                                tlen=geometry.block_bytes,
-                            )
-                            slots[packet.block_id] = slot
-                            slot_seen[packet.block_id] = time.monotonic()
-                        before = slot.symbols_rx
-                        decoded = slot.add_packet(packet.payload, packet.esi)
-                        if slot.symbols_rx == before:
-                            continue
-                        unique += len(raw)
-                        last_echo = packet.send_ts_us
-                        if decoded is not None:
-                            sink.ingest(decoded[: geometry.block_bytes])
-                            done.add(packet.block_id)
-                    elif isinstance(packet, BlockFin):
-                        total_blocks = packet.total_blocks
+                    on_packet(raw)
             send_feedback()
             now = time.monotonic()
             if file_progress:

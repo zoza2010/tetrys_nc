@@ -76,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
             "Omit for a static 8 percent pad plus drip until the block decodes"
         ),
     )
+    p.add_argument(
+        "--allow-upload",
+        action="store_true",
+        help="accept client uploads into --dir",
+    )
     args = p.parse_args(argv)
     root, default_file = _root_and_default(args.dir, args.file)
     return run_block_server(
@@ -89,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         rate_mbit=args.rate_mbit,
         skip_hash=args.skip_hash,
         once=args.once,
+        allow_upload=args.allow_upload,
     )
 
 

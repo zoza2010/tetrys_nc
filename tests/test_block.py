@@ -19,6 +19,7 @@ from tetrys_nc.block_packets import (
     BlockFin,
     BlockMeta,
     BlockReady,
+    BlockUploadReady,
     MAX_GHOST_OPEN,
     MAX_OPEN_BLOCKS,
     OpenBlock,
@@ -61,11 +62,13 @@ from tetrys_nc.block_state import (
 from tetrys_nc.block_xfer import (
     BlockSender,
     _pace_limits,
+    _safe_dest,
     _safe_join,
     encode_block_job,
     rebuild_block_encoder,
     run_block_client,
     run_block_server,
+    run_block_upload_client,
 )
 from tetrys_nc.gen_raptor import GenEncoder, GenReceiveSlot
 
@@ -73,6 +76,7 @@ from tetrys_nc.gen_raptor import GenEncoder, GenReceiveSlot
 def test_wire_roundtrips_and_rejects_wrong_version():
     packets = [
         BlockReady(9, 64 << 20),
+        BlockUploadReady(9, 64 << 20, "put.bin"),
         BlockMeta(9, 1234, "blob.bin", 1350, 768, 14, 64 << 20, "ab"),
         BlockData(9, 7, 3, b"x" * 100, 55),
         BlockFeedback(
@@ -136,6 +140,8 @@ def test_parse_packet_rejects_unknown_version():
     assert parse_packet(ready) == BlockReady(9, 64 << 20)
     named = BlockReady(9, 64 << 20, "testdata/blob.bin")
     assert parse_packet(named.pack()) == named
+    uploaded = BlockUploadReady(9, 64 << 20, "put.bin")
+    assert parse_packet(uploaded.pack()) == uploaded
     with pytest.raises(ValueError):
         parse_packet(b"\x54\x09\x30\x00" + bytes(8))
 
@@ -149,6 +155,16 @@ def test_safe_join_stays_under_root(tmp_path: Path):
     assert _safe_join(tmp_path, "/etc/passwd") is None
     assert _safe_join(tmp_path, "") is None
     assert _safe_join(tmp_path, "missing.bin") is None
+
+
+def test_safe_dest_allows_missing_file(tmp_path: Path):
+    dest = tmp_path / "sub" / "out.bin"
+    assert _safe_dest(tmp_path, "sub/out.bin") == dest.resolve()
+    assert _safe_dest(tmp_path, "../evil.bin") is None
+    assert _safe_dest(tmp_path, "/etc/passwd") is None
+    assert _safe_dest(tmp_path, "") is None
+    assert _safe_dest(tmp_path, ".") is None
+    assert _safe_dest(tmp_path, "a\x00b") is None
 
 
 def test_feedback_state_is_idempotent_and_monotonic():
@@ -229,15 +245,14 @@ def test_merge_open_feedback_keeps_ghosts_when_window_is_full():
     assert MAX_GHOST_OPEN == 16
 
 
-def test_merge_open_feedback_keeps_newest_when_incomplete_overflows():
+def test_merge_open_feedback_drops_newest_incomplete_when_full():
     incomplete = [OpenBlock(i, 400) for i in range(80)]
     ghosts = [OpenBlock(1000 + i, 900, age_bucket=6) for i in range(16)]
     opened = merge_open_feedback(incomplete, ghosts)
     ids = {item.block_id for item in opened}
     assert {1000 + i for i in range(16)} <= ids
     assert {0, 1, 2} <= ids
-    assert {77, 78, 79} <= ids
-    assert 70 not in ids
+    assert 79 not in ids
     assert len(opened) == MAX_OPEN_BLOCKS
 
 
@@ -864,6 +879,314 @@ def test_server_stops_when_client_silent(tmp_path: Path, monkeypatch: pytest.Mon
     thread.join(timeout=3.0)
     assert not errors, errors[0]
     assert not thread.is_alive()
+
+
+def _upload_kwargs(**extra):
+    kw = dict(
+        symbol_size=256,
+        block_k=64,
+        initial_repair_pct=14,
+        active_bytes=4 << 20,
+        rate_mbit=400,
+        skip_hash=True,
+        allow_upload=True,
+    )
+    kw.update(extra)
+    return kw
+
+
+def test_loopback_upload_is_byte_correct(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    root = tmp_path / "srv"
+    root.mkdir()
+    payload = os.urandom(3 * 64 * 256 + 17)
+    src.write_bytes(payload)
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server("127.0.0.1", port, root, **_upload_kwargs())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=False)
+    thread.start()
+    time.sleep(0.05)
+    run_block_upload_client(
+        "127.0.0.1",
+        port,
+        src,
+        remote="out.bin",
+        **{k: v for k, v in _upload_kwargs().items() if k != "allow_upload"},
+    )
+    thread.join(timeout=8)
+    assert not errors, errors[0]
+    assert (root / "out.bin").read_bytes() == payload
+    assert not list(root.glob("*.part.*"))
+
+
+def test_loopback_upload_creates_subdir(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    root = tmp_path / "srv"
+    root.mkdir()
+    payload = os.urandom(2 * 64 * 256 + 9)
+    src.write_bytes(payload)
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server("127.0.0.1", port, root, **_upload_kwargs())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=False)
+    thread.start()
+    time.sleep(0.05)
+    run_block_upload_client(
+        "127.0.0.1",
+        port,
+        src,
+        remote="nested/out.bin",
+        **{k: v for k, v in _upload_kwargs().items() if k != "allow_upload"},
+    )
+    thread.join(timeout=8)
+    assert not errors, errors[0]
+    assert (root / "nested" / "out.bin").read_bytes() == payload
+
+
+def test_loopback_upload_rejects_path_traversal(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    src.write_bytes(os.urandom(64 * 256))
+    root = tmp_path / "srv"
+    root.mkdir()
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1", port, root, once=False, **_upload_kwargs()
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    client_kw = {k: v for k, v in _upload_kwargs().items() if k != "allow_upload"}
+    with pytest.raises(ValueError, match="upload rejected"):
+        run_block_upload_client(
+            "127.0.0.1", port, src, remote="../evil.bin", **client_kw
+        )
+    with pytest.raises(ValueError, match="upload rejected"):
+        run_block_upload_client(
+            "127.0.0.1", port, src, remote="/etc/passwd", **client_kw
+        )
+    with pytest.raises(ValueError, match="upload rejected"):
+        run_block_upload_client(
+            "127.0.0.1", port, src, remote="a\x00b", **client_kw
+        )
+    assert not errors, errors[0]
+    assert list(root.iterdir()) == []
+
+
+def test_loopback_upload_rejected_when_disabled(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    src.write_bytes(os.urandom(64 * 256))
+    root = tmp_path / "srv"
+    root.mkdir()
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1",
+                port,
+                root,
+                once=False,
+                symbol_size=256,
+                block_k=64,
+                initial_repair_pct=14,
+                active_bytes=4 << 20,
+                rate_mbit=400,
+                skip_hash=True,
+                allow_upload=False,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    with pytest.raises(PermissionError, match="uploads disabled"):
+        run_block_upload_client(
+            "127.0.0.1",
+            port,
+            src,
+            remote="out.bin",
+            symbol_size=256,
+            block_k=64,
+            initial_repair_pct=14,
+            active_bytes=4 << 20,
+            rate_mbit=400,
+            skip_hash=True,
+        )
+    assert not errors, errors[0]
+    assert list(root.iterdir()) == []
+
+
+def test_loopback_upload_mux_directory(tmp_path: Path):
+    src = tmp_path / "many"
+    src.mkdir()
+    blobs = {f"f{i}.bin": os.urandom(800 + i) for i in range(12)}
+    for name, data in blobs.items():
+        (src / name).write_bytes(data)
+    root = tmp_path / "srv"
+    root.mkdir()
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server("127.0.0.1", port, root, **_upload_kwargs())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=False)
+    thread.start()
+    time.sleep(0.05)
+    run_block_upload_client(
+        "127.0.0.1",
+        port,
+        src,
+        remote="got",
+        **{k: v for k, v in _upload_kwargs().items() if k != "allow_upload"},
+    )
+    thread.join(timeout=15)
+    assert not errors, errors[0]
+    out = root / "got"
+    got = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert got == blobs
+
+
+def test_loopback_upload_mux_file_list(tmp_path: Path):
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(b"aaa" * 400)
+    b.write_bytes(b"bbb" * 500)
+    root = tmp_path / "srv"
+    root.mkdir()
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server("127.0.0.1", port, root, **_upload_kwargs())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=False)
+    thread.start()
+    time.sleep(0.05)
+    run_block_upload_client(
+        "127.0.0.1",
+        port,
+        [a, b],
+        remote="pair",
+        **{k: v for k, v in _upload_kwargs().items() if k != "allow_upload"},
+    )
+    thread.join(timeout=15)
+    assert not errors, errors[0]
+    out = root / "pair"
+    got = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert got == {"a.bin": a.read_bytes(), "b.bin": b.read_bytes()}
+
+
+def test_loopback_upload_cc_single_and_mux(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    payload = os.urandom(3 * 64 * 256 + 17)
+    src.write_bytes(payload)
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    a.write_bytes(os.urandom(64 * 256 + 3))
+    b.write_bytes(os.urandom(64 * 256 + 9))
+    root = tmp_path / "srv"
+    root.mkdir()
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+    cc_kw = dict(
+        symbol_size=256,
+        block_k=64,
+        initial_repair_pct=14,
+        active_bytes=4 << 20,
+        rate_mbit=None,
+        skip_hash=True,
+    )
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1", port, root, once=False, allow_upload=True, **cc_kw
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    run_block_upload_client(
+        "127.0.0.1", port, src, remote="cc.bin", **cc_kw
+    )
+    run_block_upload_client(
+        "127.0.0.1", port, [a, b], remote="ccmux", **cc_kw
+    )
+    deadline = time.monotonic() + 5.0
+    out = root / "ccmux"
+    while time.monotonic() < deadline:
+        if out.is_dir():
+            names = {p.name for p in out.iterdir() if p.is_file()}
+            if names == {"a.bin", "b.bin"}:
+                break
+        time.sleep(0.05)
+    assert not errors, errors[0]
+    assert (root / "cc.bin").read_bytes() == payload
+    got = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert got == {"a.bin": a.read_bytes(), "b.bin": b.read_bytes()}
+
+
+def test_loopback_upload_then_download(tmp_path: Path):
+    src = tmp_path / "src.bin"
+    dst = tmp_path / "dst.bin"
+    root = tmp_path / "srv"
+    root.mkdir()
+    payload = os.urandom(2 * 64 * 256 + 11)
+    src.write_bytes(payload)
+    port = _free_udp_port()
+    errors: list[BaseException] = []
+
+    def server() -> None:
+        try:
+            run_block_server(
+                "127.0.0.1", port, root, once=False, **_upload_kwargs()
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    time.sleep(0.05)
+    client_kw = {k: v for k, v in _upload_kwargs().items() if k != "allow_upload"}
+    run_block_upload_client(
+        "127.0.0.1", port, src, remote="stored.bin", **client_kw
+    )
+    run_block_client(
+        "127.0.0.1", port, dst, remote="stored.bin", active_bytes=4 << 20
+    )
+    assert not errors, errors[0]
+    assert dst.read_bytes() == payload
 
 
 def _fec_state(

@@ -33,6 +33,7 @@ class BlockPacketType(IntEnum):
     FIN = 0x34
     OBJ_OPEN = 0x35
     OBJ_FIN = 0x36
+    UPLOAD = 0x37
 
 
 @dataclass(slots=True, frozen=True)
@@ -53,21 +54,9 @@ def merge_open_feedback(
     limit: int = MAX_OPEN_BLOCKS,
     ghost_limit: int = MAX_GHOST_OPEN,
 ) -> list[OpenBlock]:
-    """Keep first-flight ghosts in ACK even when the active window is full.
-
-    Incomplete is oldest-first. If it does not fit, also keep the newest
-    tail IDs so the last blocks cannot fall out of the 80-open datagram.
-    """
-    kept_ghosts = list(ghosts[: max(0, min(ghost_limit, limit))])
-    room = max(0, limit - len(kept_ghosts))
-    if len(incomplete) <= room:
-        return kept_ghosts + list(incomplete)
-    tail_keep = min(8, room)
-    head_keep = room - tail_keep
-    head = list(incomplete[:head_keep])
-    head_ids = {item.block_id for item in head}
-    tail = [item for item in incomplete[-tail_keep:] if item.block_id not in head_ids]
-    return kept_ghosts + head + tail
+    """Ghosts first (decoded, still in REPAIR_AGE), then oldest incomplete."""
+    ghosts = list(ghosts[: min(ghost_limit, limit)])
+    return ghosts + list(incomplete[: max(0, limit - len(ghosts))])
 
 
 @dataclass(slots=True)
@@ -99,6 +88,39 @@ class BlockReady:
         nlen = struct.unpack_from("!H", data, 12)[0]
         if len(data) < 14 + nlen:
             raise ValueError("READY path truncated")
+        path = data[14 : 14 + nlen].decode("utf-8")
+        return cls(session, active, path)
+
+
+@dataclass(slots=True)
+class BlockUploadReady:
+    session_id: int
+    active_bytes: int
+    rel_path: str = ""
+
+    def pack(self) -> bytes:
+        name = self.rel_path.encode("utf-8")[:1200]
+        return (
+            _HDR.pack(
+                MAGIC, VERSION, BlockPacketType.UPLOAD, 0, self.session_id & 0xFFFFFFFF
+            )
+            + struct.pack("!IH", self.active_bytes & 0xFFFFFFFF, len(name))
+            + name
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockUploadReady:
+        _require(data, 12, BlockPacketType.UPLOAD)
+        session = struct.unpack_from("!I", data, 4)[0]
+        active = struct.unpack_from("!I", data, 8)[0]
+        if len(data) <= 12:
+            return cls(session, active, "")
+        if len(data) == 13 + data[12]:
+            path = data[13 : 13 + data[12]].decode("utf-8")
+            return cls(session, active, path)
+        nlen = struct.unpack_from("!H", data, 12)[0]
+        if len(data) < 14 + nlen:
+            raise ValueError("UPLOAD path truncated")
         path = data[14 : 14 + nlen].decode("utf-8")
         return cls(session, active, path)
 
@@ -404,6 +426,7 @@ def parse_packet(data: bytes):
         BlockPacketType.FIN: BlockFin,
         BlockPacketType.OBJ_OPEN: ObjectOpen,
         BlockPacketType.OBJ_FIN: ObjectFin,
+        BlockPacketType.UPLOAD: BlockUploadReady,
     }[kind]
     return cls.unpack(data)
 
