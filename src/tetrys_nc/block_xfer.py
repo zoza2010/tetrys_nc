@@ -47,6 +47,7 @@ from .block_packets import (
 )
 from .block_state import (
     BlockGeometry,
+    CLIENT_GONE_S,
     FEC_RAPTORQ_MARGIN,
     resolve_fec_cli,
     REPAIR_AGE_S,
@@ -689,6 +690,7 @@ class BlockSender:
         self.feedback = SenderFeedbackState(session_id)
         self.stop = threading.Event()
         self.client_fin = threading.Event()
+        self.peer_hello = threading.Event()
         pace = start_bps if not cc_on else start_bps * _SEED_FRAC
         self.limiter = RateLimiter(
             pace, burst_s=_env_float("TETRYS_BURST_S", 0.008)
@@ -764,6 +766,13 @@ class BlockSender:
                     and packet.ok
                 ):
                     self.client_fin.set()
+                elif type(packet) in _HELLO_KIND:
+                    # New session hello (cancel+retry). Ignore same-session
+                    # READY/UPLOAD retransmits still in flight after handshake.
+                    if getattr(packet, "session_id", None) != self.session_id:
+                        self.peer_hello.set()
+                        self.stop.set()
+                        return
 
     def _apply_cc(self) -> None:
         """Push the latest ACK into BlastCc. Admit can block the main loop."""
@@ -1178,6 +1187,10 @@ class BlockSender:
                     self.aborted = True
                     print("abort — user cancelled", flush=True)
                     break
+                if self.peer_hello.is_set():
+                    self.aborted = True
+                    print("abort — new READY while sending", flush=True)
+                    break
                 if self.feedback.client_lost(now, self.t0):
                     self.aborted = True
                     print(
@@ -1378,6 +1391,8 @@ class BlockReceiver:
         self.slot_seen: dict[int, float] = {}
         self.fd = -1
         self.fec_pct = int(meta.initial_repair_pct)
+        self.peer_hello = False
+        self.last_rx = 0.0
 
     def _send_feedback(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -1543,8 +1558,31 @@ class BlockReceiver:
             flush=True,
         )
         output.parent.mkdir(parents=True, exist_ok=True)
+        if self.progress is not None:
+            _emit_progress(self.progress, f"alloc {output.name}…")
         self.fd = os.open(output, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o644)
+        # Sparse pre-size; check abort in case cancel landed during open.
+        if _abort_requested(self.should_abort):
+            os.close(self.fd)
+            self.fd = -1
+            try:
+                output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("abort — user cancelled", flush=True)
+            return 1
         os.ftruncate(self.fd, meta.file_size)
+        if _abort_requested(self.should_abort):
+            os.close(self.fd)
+            self.fd = -1
+            try:
+                output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("abort — user cancelled", flush=True)
+            return 1
+        if self.progress is not None:
+            _emit_progress(self.progress, f"receiving {output.name}…")
         self.t0 = time.monotonic()
         self.rate_t = self.t0
         sock = self.sock
@@ -1554,9 +1592,16 @@ class BlockReceiver:
                 packet = parse_packet(raw)
             except ValueError:
                 return
+            if type(packet) in _HELLO_KIND:
+                # New session hello while this receive is still open (cancel+retry).
+                # Same-session UPLOAD/READY retransmits after ACK must be ignored.
+                if getattr(packet, "session_id", None) != self.session_id:
+                    self.peer_hello = True
+                return
             if getattr(packet, "session_id", None) != self.session_id:
                 return
             if isinstance(packet, BlockData):
+                self.last_rx = time.monotonic()
                 self._on_data(packet, raw)
             elif isinstance(packet, BlockFin):
                 self.fin_seen = True
@@ -1566,9 +1611,22 @@ class BlockReceiver:
             for raw in primed or ():
                 _handle(raw)
             while len(self.done) < self.total_blocks:
-                if _abort_requested(self.should_abort):
+                if _abort_requested(self.should_abort) or self.peer_hello:
                     aborted = True
                     break
+                now = time.monotonic()
+                # Server-side receive (shared sock): bail if the peer vanished so
+                # the next READY is not stuck behind a dead upload.
+                if not self.close_sock:
+                    if self.last_rx > 0.0:
+                        idle_from, idle_lim = self.last_rx, CLIENT_GONE_S
+                    else:
+                        # Encode/startup can take a few seconds before first DATA.
+                        idle_from, idle_lim = self.t0, 30.0
+                    if now - idle_from > idle_lim:
+                        aborted = True
+                        print("abort — upload peer silent", flush=True)
+                        break
                 readable, _, _ = select.select([sock], [], [], 0.01)
                 if readable:
                     try:
@@ -1599,7 +1657,8 @@ class BlockReceiver:
                 output.unlink(missing_ok=True)
             except OSError:
                 pass
-            print("abort — user cancelled", flush=True)
+            why = "new READY" if self.peer_hello else "user cancelled"
+            print(f"abort — {why}", flush=True)
             return 1
 
         elapsed = max(time.monotonic() - self.t0, 1e-6)
@@ -1963,13 +2022,21 @@ def run_block_client(
     )
     ready = BlockReady(session_id, active_bytes, remote).pack()
     _send_copies(sock, server, ready)
+    if progress is not None:
+        _emit_progress(progress, "waiting for META…")
 
     meta: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
+    last_prog = 0.0
     while meta is None and time.monotonic() < deadline:
         if _abort_requested(should_abort):
             sock.close()
             return 1
+        now = time.monotonic()
+        if progress is not None and now - last_prog >= 0.5:
+            left = max(0.0, deadline - now)
+            _emit_progress(progress, f"waiting for META… ({left:.0f}s)")
+            last_prog = now
         readable, _, _ = select.select([sock], [], [], 0.5)
         if not readable:
             sock.sendto(ready, server)
@@ -1987,6 +2054,11 @@ def run_block_client(
     if meta.file_name.startswith("!"):
         sock.close()
         raise FileNotFoundError(meta.file_name[1:].lstrip())
+    if progress is not None:
+        _emit_progress(
+            progress,
+            f"META {meta.file_name} {_client_size(meta.file_size)} — opening…",
+        )
     if meta.file_name == MUX_META_NAME:
         from .object_xfer import consume_object_stream
 
@@ -2065,13 +2137,21 @@ def run_block_upload_client(
     hello = BlockUploadReady(session_id, active_bytes, dest).pack()
     _send_copies(sock, server, hello)
     print(f"uploading {dest} to udp://{host}:{port}", flush=True)
+    if progress is not None:
+        _emit_progress(progress, "waiting for upload ACK…")
 
     ack: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
+    last_prog = 0.0
     while ack is None and time.monotonic() < deadline:
         if _abort_requested(should_abort):
             sock.close()
             return 1
+        now = time.monotonic()
+        if progress is not None and now - last_prog >= 0.5:
+            left = max(0.0, deadline - now)
+            _emit_progress(progress, f"waiting for upload ACK… ({left:.0f}s)")
+            last_prog = now
         readable, _, _ = select.select([sock], [], [], 0.5)
         if not readable:
             sock.sendto(hello, server)
@@ -2092,6 +2172,8 @@ def run_block_upload_client(
         if "uploads disabled" in msg:
             raise PermissionError(msg)
         raise ValueError(msg)
+    if progress is not None:
+        _emit_progress(progress, f"ACK ok — sending {dest}…")
 
     encode_pool = None
     try:

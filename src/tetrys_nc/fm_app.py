@@ -40,30 +40,56 @@ class TransferState:
         self.rc = 0
         self.error = ""
         self._abort = False
+        self._epoch = 0
 
-    def begin(self) -> None:
+    def begin(self) -> int:
         with self.lock:
+            self._epoch += 1
+            epoch = self._epoch
             self.active = True
             self.done = False
             self.rc = 0
             self.error = ""
             self.line = "starting…"
             self._abort = False
+            return epoch
 
     def progress(self, line: str) -> None:
         with self.lock:
             self.line = line
 
-    def should_abort(self) -> bool:
+    def should_abort(self, epoch: int | None = None) -> bool:
         with self.lock:
+            if epoch is not None and epoch != self._epoch:
+                return True
             return self._abort
+
+    def abort_check(self, epoch: int):
+        """Callback bound to one worker generation."""
+
+        def _check() -> bool:
+            return self.should_abort(epoch)
+
+        return _check
 
     def request_abort(self) -> None:
         with self.lock:
             self._abort = True
 
-    def finish(self, rc: int, error: str = "") -> None:
+    def abandon(self) -> None:
+        """UI cancel: free the FM immediately; invalidate the in-flight worker."""
         with self.lock:
+            self._abort = True
+            self.active = False
+            self.done = False
+            self.error = ""
+            self.line = "aborted"
+            self._epoch += 1
+
+    def finish(self, rc: int, error: str = "", *, epoch: int | None = None) -> None:
+        with self.lock:
+            if epoch is not None and epoch != self._epoch:
+                return
             self.rc = rc
             self.error = error
             self.done = True
@@ -428,8 +454,9 @@ def build_app(
                     self.action_cancel()
 
             def action_cancel(self) -> None:
-                xfer.request_abort()
-                # Dismiss immediately — worker may be stuck in encode/read/send.
+                # Free UI immediately; bump epoch so a stale worker cannot
+                # re-lock F5 / overwrite a newer transfer.
+                xfer.abandon()
                 try:
                     if self.app._progress_modal is self:  # type: ignore[attr-defined]
                         self.app._progress_modal = None  # type: ignore[attr-defined]
@@ -438,7 +465,7 @@ def build_app(
                     pass
                 try:
                     self.app._status().write(  # type: ignore[attr-defined]
-                        "[yellow]cancel requested — aborting…[/yellow]"
+                        "[yellow]cancelled[/yellow]"
                     )
                 except Exception:
                     pass
@@ -575,8 +602,8 @@ def build_app(
                 try:
                     xfer.progress(f"deleting {len(names)} item(s)…")
                     for i, name in enumerate(names, 1):
-                        if xfer.should_abort():
-                            xfer.finish(1, "aborted")
+                        if xfer.should_abort(epoch):
+                            xfer.finish(1, "aborted", epoch=epoch)
                             return
                         xfer.progress(f"[{i}/{len(names)}] {name}")
                         if kind == "local":
@@ -584,11 +611,11 @@ def build_app(
                         else:
                             remote_rm(host, port, f"{cwd}/{name}".strip("/"))
                     panel.marked.clear()
-                    xfer.finish(0)
+                    xfer.finish(0, epoch=epoch)
                 except Exception as exc:
-                    xfer.finish(1, str(exc))
+                    xfer.finish(1, str(exc), epoch=epoch)
 
-            xfer.begin()
+            epoch = xfer.begin()
             modal = self.ProgressModal(title, detail)
             self._progress_modal = modal
             self._busy_kind = "delete"
@@ -702,6 +729,7 @@ def build_app(
             skip = self.skip_hash
 
             def worker() -> None:
+                abort = xfer.abort_check(epoch)
                 try:
                     if src.kind == "local" and dst.kind == "remote":
                         rc = copy_local_to_remote(
@@ -711,7 +739,7 @@ def build_app(
                             names,
                             remote_dir=dst.cwd,
                             progress=xfer.progress,
-                            should_abort=xfer.should_abort,
+                            should_abort=abort,
                             rate_mbit=rate,
                             skip_hash=skip,
                             symbol_size=WAN_SYMBOL_SIZE,
@@ -727,23 +755,23 @@ def build_app(
                             remotes,
                             Path(dst.cwd),
                             progress=xfer.progress,
-                            should_abort=xfer.should_abort,
+                            should_abort=abort,
                         )
                     else:
-                        xfer.finish(1, "copy only between local and remote")
+                        xfer.finish(1, "copy only between local and remote", epoch=epoch)
                         return
-                    if xfer.should_abort():
-                        xfer.finish(1, "aborted")
+                    if abort():
+                        xfer.finish(1, "aborted", epoch=epoch)
                     elif rc == 0:
-                        xfer.finish(0)
+                        xfer.finish(0, epoch=epoch)
                     else:
-                        xfer.finish(rc, f"rc={rc}")
+                        xfer.finish(rc, f"rc={rc}", epoch=epoch)
                 except InterruptedError:
-                    xfer.finish(1, "aborted")
+                    xfer.finish(1, "aborted", epoch=epoch)
                 except Exception as exc:
-                    xfer.finish(1, str(exc))
+                    xfer.finish(1, str(exc), epoch=epoch)
 
-            xfer.begin()
+            epoch = xfer.begin()
             modal = self.ProgressModal(title, detail)
             self._progress_modal = modal
             self._busy_kind = "copy"
