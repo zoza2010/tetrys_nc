@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from pathlib import Path
 
 from .block_packets import (
@@ -102,7 +103,8 @@ def mux_progress_lines(
     inst_bps: float = 0.0,
 ) -> list[str]:
     """Two TTY lines: group totals, then the in-flight file name as the label."""
-    col = 16
+    col = 12
+    bar_w = 18
     denom = expected_bytes if expected_bytes > 0 else max(decoded, 1)
     group_frac = min(1.0, decoded / denom)
     if expected_files > 0:
@@ -110,22 +112,22 @@ def mux_progress_lines(
     else:
         files_txt = f"{finished} files "
     group = (
-        f"{'total':<{col}} [{_bar(group_frac)}] {100.0 * group_frac:5.1f}% "
+        f"{'total':<{col}} [{_bar(group_frac, bar_w)}] {100.0 * group_frac:5.1f}% "
         f"{files_txt}{_fmt_size(decoded)}/{_fmt_size(expected_bytes)}"
-        f"  {_fmt_rate(inst_bps)}"
+        f" {_fmt_rate(inst_bps)}"
     )
     if current is None:
-        cur = f"{'—':<{col}} [{_bar(0.0)}]"
+        cur = f"{'—':<{col}} [{_bar(0.0, bar_w)}]"
     else:
         name, wrote, size, _done = current
         cap = size if size > 0 else max(wrote, 1)
         frac = min(1.0, wrote / cap)
         label = (_short_obj_name(name) or "file")[:col]
         cur = (
-            f"{label:<{col}} [{_bar(frac)}] {100.0 * frac:5.1f}% "
+            f"{label:<{col}} [{_bar(frac, bar_w)}] {100.0 * frac:5.1f}% "
             f"{_fmt_size(wrote)}/{_fmt_size(size)}"
         )
-    return [f"{group:<96}", f"{cur:<96}"]
+    return [group, cur]
 
 
 def _redraw_file_bars(lines: list[str], prev_rows: int) -> int:
@@ -144,9 +146,29 @@ def _redraw_file_bars(lines: list[str], prev_rows: int) -> int:
     return n
 
 
+def _safe_relpath(name: str) -> str:
+    """Keep nested object paths; reject abs / parent / empty segments."""
+    raw = name.replace("\\", "/").strip()
+    if not raw or raw.startswith("/"):
+        raise ValueError(f"invalid object name {name!r}")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if not part or part == ".":
+            continue
+        if part == ".." or "\x00" in part:
+            raise ValueError(f"invalid object name {name!r}")
+        parts.append(part[:200])
+    if not parts:
+        raise ValueError(f"invalid object name {name!r}")
+    joined = "/".join(parts)
+    return joined[:240]
+
+
 def _safe_name(name: str) -> str:
-    base = Path(name).name
-    return base if base and base not in {".", ".."} else f"obj_{abs(hash(name)) & 0xFFFF:x}"
+    try:
+        return _safe_relpath(name)
+    except ValueError:
+        return f"obj_{abs(hash(name)) & 0xFFFF:x}"
 
 
 def _udp(host: str | None, port: int | None, *, snd: int, rcv: int) -> socket.socket:
@@ -176,8 +198,8 @@ class ObjectSession:
         self.nbytes = 0
 
     def put(self, name: str, data: bytes) -> int:
-        safe = Path(name).name
-        if not safe or safe in {".", ".."}:
+        safe = _safe_relpath(name)
+        if not safe:
             raise ValueError("invalid object name")
         with self._lock:
             if self._closed:
@@ -273,13 +295,70 @@ def run_object_server(
     )
 
 
-def queue_disk_files(session: ObjectSession, files: list[tuple[str, Path]]) -> int:
-    blobs = [(name, path.read_bytes()) for name, path in files]
+def queue_disk_files(
+    session: ObjectSession,
+    files: list[tuple[str, Path]],
+    *,
+    should_abort: Callable[[], bool] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> int:
+    total = len(files)
+    blobs: list[tuple[str, bytes]] = []
+    for i, (name, path) in enumerate(files, 1):
+        if should_abort is not None:
+            try:
+                if should_abort():
+                    raise InterruptedError("abort — user cancelled")
+            except InterruptedError:
+                raise
+            except Exception:
+                pass
+        if progress is not None:
+            try:
+                progress(f"reading [{i}/{total}] {Path(name).name}")
+            except Exception:
+                pass
+        blobs.append((name, _read_bytes_abortable(path, should_abort)))
     packed = split_for_session(blobs)
     for name, blob in packed:
+        if should_abort is not None:
+            try:
+                if should_abort():
+                    raise InterruptedError("abort — user cancelled")
+            except InterruptedError:
+                raise
+            except Exception:
+                pass
         session.put(name, blob)
     session.close()
     return len(files)
+
+
+def _read_bytes_abortable(
+    path: Path, should_abort: Callable[[], bool] | None
+) -> bytes:
+    """Read a file in chunks so Cancel can interrupt multi-GiB uploads."""
+    chunk = 8 << 20
+    parts: list[bytes] = []
+    with path.open("rb") as fh:
+        while True:
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        raise InterruptedError("abort — user cancelled")
+                except InterruptedError:
+                    raise
+                except Exception:
+                    pass
+            block = fh.read(chunk)
+            if not block:
+                break
+            parts.append(block)
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+    return b"".join(parts)
 
 
 def run_object_session(
@@ -295,6 +374,8 @@ def run_object_session(
     cc_on: bool = False,
     min_bps: float = 0.0,
     max_bps: float = 0.0,
+    progress: Callable[[str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> int:
     block_k = geometry.block_k
     symbol_size = geometry.symbol_size
@@ -339,6 +420,8 @@ def run_object_session(
     next_block = 0
     last_repair = 0.0
     announced: set[int] = set()
+    last_progress = 0.0
+    total_payload = max(1, session.nbytes)
 
     def announce(cursor: ObjectCursor) -> None:
         if cursor.obj_id in announced:
@@ -378,6 +461,14 @@ def run_object_session(
     def send_wires(wires: list[bytes], *, repair: bool = False) -> None:
         nonlocal sent_bytes, source_bytes
         for i in range(0, len(wires), _SEND_CHUNK):
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        raise InterruptedError("abort — user cancelled")
+                except InterruptedError:
+                    raise
+                except Exception:
+                    pass
             if cc is not None:
                 apply_cc()
                 limiter.set_rate(cc.on_timer(time.monotonic()))
@@ -422,6 +513,26 @@ def run_object_session(
         while not client_fin.is_set():
             completed, opened, *_ = feedback.snapshot()
             now = time.monotonic()
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        aborted = True
+                        print("abort — user cancelled", flush=True)
+                        break
+                except Exception:
+                    pass
+            if progress is not None and now - last_progress >= 0.15:
+                frac = min(1.0, source_bytes / total_payload)
+                try:
+                    progress(
+                        f"mux upload [{'█' * int(frac * 22)}{'░' * (22 - int(frac * 22))}] "
+                        f"{100.0 * frac:5.1f}%  {source_bytes / 1048576:.1f}/"
+                        f"{total_payload / 1048576:.1f}MiB  blocks={next_block}  "
+                        f"objs={len(announced)}/{session.nobj}"
+                    )
+                except Exception:
+                    pass
+                last_progress = now
             if feedback.client_lost(now, t0):
                 aborted = True
                 print(
@@ -435,23 +546,43 @@ def run_object_session(
                 active.pop(block_id)
                 enc_cache.pop(block_id, None)
             admitted = False
-            while len(active) < geometry.active_blocks:
-                payload, current = _fill_block(geometry, session, current, announce, finish)
-                if payload is None:
-                    break
-                encoder = GenEncoder(payload, symbol_size, initial_repair_pct)
-                stamp = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
-                send_wires(pack_data_packets(session_id, next_block, encoder.packets(), 0, stamp))
-                enc_cache[next_block] = encoder
-                active[next_block] = SenderBlockState(
-                    next_block, initial_repair=encoder.repair_budget,
-                    repair_emitted=encoder.repair_budget, sent_at=now,
-                )
-                next_block += 1
-                admitted = True
+            try:
+                while len(active) < geometry.active_blocks:
+                    if should_abort is not None and should_abort():
+                        raise InterruptedError("abort — user cancelled")
+                    payload, current = _fill_block(
+                        geometry, session, current, announce, finish
+                    )
+                    if payload is None:
+                        break
+                    encoder = GenEncoder(payload, symbol_size, initial_repair_pct)
+                    stamp = int(time.monotonic() * 1_000_000) & 0xFFFFFFFF
+                    send_wires(
+                        pack_data_packets(
+                            session_id, next_block, encoder.packets(), 0, stamp
+                        )
+                    )
+                    enc_cache[next_block] = encoder
+                    active[next_block] = SenderBlockState(
+                        next_block,
+                        initial_repair=encoder.repair_budget,
+                        repair_emitted=encoder.repair_budget,
+                        sent_at=now,
+                    )
+                    next_block += 1
+                    admitted = True
+            except InterruptedError:
+                aborted = True
+                print("abort — user cancelled", flush=True)
+                break
             tail = session.idle(current)
             if active and (tail or now - last_repair >= REPAIR_INTERVAL_S):
-                repair_tick(opened, now, tail)
+                try:
+                    repair_tick(opened, now, tail)
+                except InterruptedError:
+                    aborted = True
+                    print("abort — user cancelled", flush=True)
+                    break
                 last_repair = now
             if tail and next_block > 0:
                 sock.sendto(BlockFin(session_id, next_block).pack(), client)
@@ -468,14 +599,15 @@ def run_object_session(
         if close_sock:
             sock.close()
     elapsed = max(time.monotonic() - t0, 1e-6)
-    if not aborted:
-        print(
-            f"done in {elapsed:.2f}s — mux blocks={next_block} "
-            f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload "
-            f"cc={'blast' if cc is not None else 'off'} "
-            f"pace={limiter.rate * 8 / 1e6:.0f}Mbit",
-            flush=True,
-        )
+    if aborted:
+        return 1
+    print(
+        f"done in {elapsed:.2f}s — mux blocks={next_block} "
+        f"{next_block * geometry.block_bytes / elapsed / 1048576:.1f} MiB/s payload "
+        f"cc={'blast' if cc is not None else 'off'} "
+        f"pace={limiter.rate * 8 / 1e6:.0f}Mbit",
+        flush=True,
+    )
     return 0
 
 
@@ -511,7 +643,9 @@ class _Sink:
             return self._fds[obj_id]
         while len(self._fds) >= 64:
             os.close(self._fds.popitem(last=False)[1])
-        fd = os.open(self.dir / self.names[obj_id], os.O_CREAT | os.O_RDWR, 0o644)
+        dest = self.dir / self.names[obj_id]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(dest, os.O_CREAT | os.O_RDWR, 0o644)
         if obj_id not in self._truncated:
             if self.sizes.get(obj_id, 0) > 0:
                 os.ftruncate(fd, self.sizes[obj_id])
@@ -559,6 +693,7 @@ class _Sink:
             if old != safe:
                 src, dst = self.dir / old, self.dir / safe
                 if src.exists() and src != dst:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
                     src.replace(dst)
                 self.names[obj_id] = safe
         self.sizes[obj_id] = size
@@ -627,10 +762,12 @@ class _Sink:
         return self._bar_snap
 
     def explode_packs(self) -> None:
-        for path in list(self.dir.iterdir()):
+        for path in list(self.dir.rglob("*")):
             if path.is_file() and is_pack_name(path.name):
                 for fname, blob in unpack_files(path.read_bytes()):
-                    (self.dir / _safe_name(fname)).write_bytes(blob)
+                    dest = self.dir / _safe_relpath(fname)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(blob)
                 path.unlink()
 
     def close(self) -> None:
@@ -694,6 +831,8 @@ def consume_object_stream(
     *,
     close_sock: bool = True,
     file_progress: bool = False,
+    progress: Callable[[str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
     primed: list[bytes] | None = None,
 ) -> int:
 
@@ -829,6 +968,29 @@ def consume_object_stream(
                     on_packet(raw)
             send_feedback()
             now = time.monotonic()
+            if should_abort is not None:
+                try:
+                    if should_abort():
+                        raise TimeoutError("abort — user cancelled")
+                except TimeoutError:
+                    raise
+                except Exception:
+                    pass
+            if progress is not None and now - last_draw >= 0.15:
+                inst = sample_rate(now, sink.decoded)
+                group, current = mux_progress_lines(
+                    decoded=sink.decoded,
+                    expected_bytes=expected_bytes,
+                    finished=len(sink.finished),
+                    expected_files=expected_files,
+                    current=sink.current_progress(),
+                    inst_bps=inst,
+                )
+                try:
+                    progress(f"{group.strip()}\n{current.strip()}")
+                except Exception:
+                    pass
+                last_draw = now
             if file_progress:
                 inst = sample_rate(now, sink.decoded)
                 if tty and now - last_draw >= 0.05:
@@ -874,6 +1036,8 @@ def consume_object_stream(
                 break
             if time.monotonic() - t0 > timeout_s:
                 raise TimeoutError("object-mux client timed out")
+        sink.check()
+        sink.explode_packs()
         send_feedback(force=True)
         _burst(sock, server, BlockFin(session_id, total_blocks or 0).pack(), 16)
         if file_progress and tty:
@@ -895,10 +1059,8 @@ def consume_object_stream(
         sink.close()
         if close_sock:
             sock.close()
-    sink.check()
-    sink.explode_packs()
-    nfiles = sum(1 for p in output_dir.iterdir() if p.is_file())
-    nbytes = sum(p.stat().st_size for p in output_dir.iterdir() if p.is_file())
+    nfiles = sum(1 for p in output_dir.rglob("*") if p.is_file())
+    nbytes = sum(p.stat().st_size for p in output_dir.rglob("*") if p.is_file())
     elapsed = max(time.monotonic() - t0, 1e-6)
     print(
         f"done in {elapsed:.2f}s — goodput {nbytes / elapsed / 1048576:.2f} MiB/s — "

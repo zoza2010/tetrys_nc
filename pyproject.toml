@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "raptorq>=2",
+    "textual>=0.80",
 ]
 
 [project.scripts]
 tetrys-server = "tetrys_nc.server:main"
 tetrys-client = "tetrys_nc.client:main"
+tetrys-fm = "tetrys_nc.fm_app:main"
 
 [build-system]
 requires = ["hatchling"]

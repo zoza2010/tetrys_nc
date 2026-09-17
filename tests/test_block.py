@@ -14,12 +14,19 @@ import pytest
 pytest.importorskip("raptorq")
 
 from tetrys_nc.block_packets import (
+    BlockAck,
     BlockData,
     BlockFeedback,
     BlockFin,
+    BlockListEnt,
+    BlockListReq,
     BlockMeta,
+    BlockMkdir,
+    BlockPunch,
     BlockReady,
+    BlockUnlink,
     BlockUploadReady,
+    VfsEntry,
     MAX_GHOST_OPEN,
     MAX_OPEN_BLOCKS,
     OpenBlock,
@@ -77,6 +84,18 @@ def test_wire_roundtrips_and_rejects_wrong_version():
     packets = [
         BlockReady(9, 64 << 20),
         BlockUploadReady(9, 64 << 20, "put.bin"),
+        BlockListReq(9, "inbox"),
+        BlockMkdir(9, "inbox"),
+        BlockUnlink(9, "inbox/a.bin"),
+        BlockAck(9, True, "ok"),
+        BlockAck(9, False, "not found"),
+        BlockPunch(),
+        BlockListEnt(
+            9,
+            0,
+            True,
+            [VfsEntry("a.bin", False, 12, 1_700_000_000), VfsEntry("inbox", True, 0, 1)],
+        ),
         BlockMeta(9, 1234, "blob.bin", 1350, 768, 14, 64 << 20, "ab"),
         BlockData(9, 7, 3, b"x" * 100, 55),
         BlockFeedback(

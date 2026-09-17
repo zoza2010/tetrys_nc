@@ -79,9 +79,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--allow-upload",
         action="store_true",
-        help="accept client uploads into --dir",
+        help="accept client uploads, mkdir, and rm under --dir",
+    )
+    p.add_argument(
+        "--punch",
+        default="",
+        metavar="HOST:PORT",
+        help="send NAT keepalives to HOST:PORT so a NATed server is reachable",
     )
     args = p.parse_args(argv)
+    punch_peer = None
+    if args.punch:
+        host, _, port_s = args.punch.rpartition(":")
+        if not host or not port_s.isdigit():
+            p.error("--punch expects HOST:PORT")
+        punch_peer = (host, int(port_s))
     root, default_file = _root_and_default(args.dir, args.file)
     return run_block_server(
         args.host,
@@ -95,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_hash=args.skip_hash,
         once=args.once,
         allow_upload=args.allow_upload,
+        punch_peer=punch_peer,
     )
 
 

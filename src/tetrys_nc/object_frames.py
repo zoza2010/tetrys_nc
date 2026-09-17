@@ -136,7 +136,9 @@ class BlockFill:
 def pack_files(files: list[tuple[str, bytes]]) -> bytes:
     buf = bytearray(PACK_MAGIC) + _HDR.pack(len(files))
     for name, data in files:
-        raw = Path(name).name.encode("utf-8")[:255]
+        raw = name.replace("\\", "/").encode("utf-8")[:255]
+        if not raw or b".." in raw.split(b"/"):
+            raw = Path(name).name.encode("utf-8")[:255] or b"obj"
         buf += _ENT.pack(len(raw), len(data)) + raw + data
     return bytes(buf)
 
@@ -188,7 +190,7 @@ def split_for_session(
             flush()
             objects.append((name, data))
             continue
-        extra = 2 + 8 + min(255, len(Path(name).name.encode("utf-8"))) + len(data)
+        extra = 2 + 8 + min(255, len(name.replace("\\", "/").encode("utf-8"))) + len(data)
         if batch and batch_bytes + extra > pack_max:
             flush()
         batch.append((name, data))

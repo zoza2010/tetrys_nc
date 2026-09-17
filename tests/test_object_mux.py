@@ -107,6 +107,10 @@ def test_session_put_after_close_raises():
 def test_session_rejects_path_escape():
     with pytest.raises(ValueError):
         ObjectSession().put("..", b"x")
+    with pytest.raises(ValueError):
+        ObjectSession().put("../etc/passwd", b"x")
+    # Nested relative paths are allowed for recursive mux.
+    assert ObjectSession().put("sub/a.bin", b"x") == 1
 
 
 def test_object_mux_loopback_and_late_enqueue(tmp_path: Path):

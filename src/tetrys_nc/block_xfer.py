@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import (
     CancelledError,
     Future,
@@ -24,13 +25,21 @@ from pathlib import Path
 
 from .block_packets import (
     MUX_META_NAME,
+    BlockAck,
     BlockData,
     BlockFeedback,
     BlockFin,
+    BlockListEnt,
+    BlockListReq,
     BlockMeta,
+    BlockMkdir,
+    BlockPunch,
     BlockReady,
+    BlockUnlink,
     BlockUploadReady,
     OpenBlock,
+    VfsEntry,
+    _pack_list_entries,
     merge_open_feedback,
     pack_data_packets,
     parse_packet,
@@ -73,6 +82,14 @@ _TAIL_IDLE_S = 5.0
 _FIN_INTERVAL_S = 0.05
 _ENCODER_CACHE = 64
 _SEND_CHUNK = 64
+_MAX_VFS_ENTRIES = 4096
+_HELLO_KIND = {
+    BlockReady: "download",
+    BlockUploadReady: "upload",
+    BlockListReq: "list",
+    BlockMkdir: "mkdir",
+    BlockUnlink: "unlink",
+}
 
 _worker_mm: mmap.mmap | None = None
 _worker_path: str | None = None
@@ -136,6 +153,43 @@ def _client_size(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f}KiB"
     return f"{n}B"
+
+
+def _file_progress_line(
+    name: str,
+    done_bytes: int,
+    total_bytes: int,
+    done_blocks: int,
+    total_blocks: int,
+    inst_bps: float,
+    fec_pct: int,
+) -> str:
+    frac = done_bytes / max(1, total_bytes)
+    return (
+        f"{name[:28]:<28} [{_client_bar(frac, 18)}] "
+        f"{100.0 * frac:5.1f}% "
+        f"{_client_size(done_bytes)}/{_client_size(total_bytes)}  "
+        f"{done_blocks}/{total_blocks}  {_client_rate(inst_bps)} "
+        f"fec={fec_pct}%"
+    )
+
+
+def _emit_progress(cb: Callable[[str], None] | None, line: str) -> None:
+    if cb is None:
+        return
+    try:
+        cb(line)
+    except Exception:
+        pass
+
+
+def _abort_requested(cb: Callable[[], bool] | None) -> bool:
+    if cb is None:
+        return False
+    try:
+        return bool(cb())
+    except Exception:
+        return False
 
 
 def _block_data(
@@ -263,11 +317,21 @@ def _wait_hello(
     geometry: BlockGeometry,
     active_cap: int,
     timeout_s: float | None,
-) -> tuple[tuple[str, int], int, str, bool] | None:
-    """Wait for READY (download) or UPLOAD. Last flag is True for upload."""
+    punch_peer: tuple[str, int] | None = None,
+) -> tuple[tuple[str, int], int, str, str] | None:
+    """Wait for READY, UPLOAD, LIST, MKDIR, or UNLINK."""
     deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    punch = BlockPunch().pack() if punch_peer is not None else None
+    last_punch = 0.0
     while deadline is None or time.monotonic() < deadline:
-        readable, _, _ = select.select([sock], [], [], 0.5)
+        now = time.monotonic()
+        if punch is not None and punch_peer is not None and now - last_punch >= 0.4:
+            try:
+                sock.sendto(punch, punch_peer)
+            except OSError:
+                pass
+            last_punch = now
+        readable, _, _ = select.select([sock], [], [], 0.4)
         if not readable:
             continue
         try:
@@ -275,17 +339,15 @@ def _wait_hello(
             packet = parse_packet(raw)
         except (BlockingIOError, ValueError):
             continue
+        kind = _HELLO_KIND.get(type(packet))
+        if kind is None:
+            continue
         if isinstance(packet, (BlockReady, BlockUploadReady)):
             geometry.active_bytes = min(
                 active_cap,
                 max(2 * geometry.block_bytes, packet.active_bytes),
             )
-            return (
-                addr,
-                packet.session_id,
-                packet.rel_path,
-                isinstance(packet, BlockUploadReady),
-            )
+        return addr, packet.session_id, packet.rel_path, kind
     return None
 
 
@@ -326,6 +388,142 @@ def _unlink_quiet(path: Path) -> None:
         path.unlink()
     except OSError:
         pass
+
+
+def _norm_rel(rel: str) -> str:
+    return (rel or "").strip().replace("\\", "/").strip("/")
+
+
+def _safe_list_path(root: Path, rel: str) -> Path | None:
+    rel = _norm_rel(rel)
+    if rel in {"", "."}:
+        return root.resolve()
+    return _safe_path(root, rel)
+
+
+def _skip_vfs_name(name: str) -> bool:
+    return name.startswith(".") or ".part." in name
+
+
+def _vfs_entries(root: Path, rel: str) -> list[VfsEntry] | None:
+    """One-level listing for FM panels (not a flattened recursive tree)."""
+    base = _safe_list_path(root, rel)
+    if base is None or not base.exists():
+        return None
+    out: list[VfsEntry] = []
+
+    def add(path: Path, name: str, is_dir: bool) -> None:
+        try:
+            st = path.stat()
+        except OSError:
+            return
+        out.append(
+            VfsEntry(
+                name,
+                is_dir,
+                0 if is_dir else st.st_size,
+                int(st.st_mtime),
+            )
+        )
+
+    if base.is_file():
+        add(base, _norm_rel(rel) or base.name, False)
+        return out
+    if not base.is_dir():
+        return None
+    try:
+        children = sorted(base.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return out
+    for child in children:
+        if len(out) >= _MAX_VFS_ENTRIES:
+            break
+        if _skip_vfs_name(child.name):
+            continue
+        try:
+            if child.is_dir() and not child.is_symlink():
+                add(child, child.name, True)
+            elif child.is_file():
+                add(child, child.name, False)
+        except OSError:
+            continue
+    return out
+
+
+def _collect_tree_files(base: Path) -> list[tuple[str, Path]]:
+    """Recursive files under base as (posix-relpath, path). Empty dirs omitted."""
+    base = base.resolve()
+    files: list[tuple[str, Path]] = []
+    for path in sorted(base.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if _skip_vfs_name(path.name) or any(
+            _skip_vfs_name(part) for part in path.relative_to(base).parts
+        ):
+            continue
+        rel = path.relative_to(base).as_posix()
+        files.append((rel, path))
+        if len(files) >= _MAX_VFS_ENTRIES:
+            break
+    return files
+
+
+def _vfs_mkdir(root: Path, rel: str) -> str | None:
+    path = _safe_dest(root, _norm_rel(rel))
+    if path is None:
+        return "invalid path"
+    try:
+        path.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        return "exists"
+    except FileNotFoundError:
+        return "parent missing"
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _vfs_unlink(root: Path, rel: str) -> str | None:
+    path = _safe_dest(root, _norm_rel(rel))
+    if path is None:
+        return "invalid path"
+    if not path.exists():
+        return "not found"
+    try:
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink()
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _send_ack(
+    sock: socket.socket,
+    addr,
+    session_id: int,
+    ok: bool,
+    message: str = "",
+) -> None:
+    _send_copies(sock, addr, BlockAck(session_id, ok, message).pack())
+
+
+def _serve_list(
+    sock: socket.socket,
+    client,
+    session_id: int,
+    rel: str,
+    root: Path,
+) -> None:
+    entries = _vfs_entries(root, rel)
+    if entries is None:
+        print(f"reject LIST path={rel!r}", flush=True)
+        _send_ack(sock, client, session_id, False, f"not found: {rel}")
+        return
+    print(f"list path={rel!r} n={len(entries)}", flush=True)
+    for wire in _pack_list_entries(session_id, entries):
+        _send_copies(sock, client, wire)
 
 
 def _error_meta(
@@ -382,20 +580,25 @@ def _resolve_upload_sources(
         if path.is_file():
             return "file", path.resolve()
         if path.is_dir():
-            files = [
-                (child.name, child.resolve())
-                for child in sorted(path.iterdir())
-                if child.is_file() and not child.name.startswith(".")
-            ]
+            files = _collect_tree_files(path)
             if not files:
                 raise FileNotFoundError(f"empty directory: {path}")
             return "mux", files
         raise FileNotFoundError(path)
     files: list[tuple[str, Path]] = []
     for path in paths:
-        if not path.is_file():
+        if path.is_file():
+            files.append((path.name, path.resolve()))
+        elif path.is_dir():
+            prefix = path.name
+            for rel, child in _collect_tree_files(path):
+                files.append((f"{prefix}/{rel}", child))
+        else:
             raise FileNotFoundError(path)
-        files.append((path.name, path.resolve()))
+    if not files:
+        raise FileNotFoundError("upload sources empty")
+    if len(files) == 1 and len(paths) == 1 and paths[0].is_file():
+        return "file", files[0][1]
     return "mux", files
 
 
@@ -423,11 +626,7 @@ def _resolve_ready(
         if path.is_file():
             return "file", path
         if path.is_dir():
-            files = [
-                (child.name, child)
-                for child in sorted(path.iterdir())
-                if child.is_file() and not child.name.startswith(".")
-            ]
+            files = _collect_tree_files(path)
             return ("mux", files) if files else None
         return None
     files: list[tuple[str, Path]] = []
@@ -435,8 +634,15 @@ def _resolve_ready(
         path = _safe_join(root, part)
         if path is None:
             return None
-        files.append((Path(part).name, path))
-    return "mux", files
+        if path.is_file():
+            files.append((_norm_rel(part), path))
+        elif path.is_dir():
+            prefix = _norm_rel(part)
+            for child_rel, child in _collect_tree_files(path):
+                files.append((f"{prefix}/{child_rel}", child))
+        else:
+            return None
+    return ("mux", files) if files else None
 
 
 def _send_copies(sock: socket.socket, addr, payload: bytes, n: int = 8) -> None:
@@ -462,11 +668,15 @@ class BlockSender:
         cc_on: bool,
         encode_pool,
         prefetch_depth: int,
+        progress: Callable[[str], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> None:
         self.sock = sock
         self.client = client
         self.session_id = session_id
         self.file_path = file_path
+        self.progress = progress
+        self.should_abort = should_abort
         self.file_path_str = str(file_path)
         self.file_size = file_path.stat().st_size
         self.geometry = geometry
@@ -528,6 +738,7 @@ class BlockSender:
         self.repair_wire_total = 0
         self.last_repair_loop = 0.0
         self.last_log = 0.0
+        self.last_progress = 0.0
         self.mm: mmap.mmap | None = None
 
     def _feedback_loop(self) -> None:
@@ -584,6 +795,9 @@ class BlockSender:
         cc = self.cc
         timers = self.timers
         for pos in range(0, len(wires), _SEND_CHUNK):
+            if _abort_requested(self.should_abort):
+                self.aborted = True
+                raise InterruptedError("abort — user cancelled")
             if cc is not None:
                 self._apply_cc()
                 limiter.set_rate(cc.on_timer(time.monotonic()))
@@ -960,6 +1174,10 @@ class BlockSender:
                     self.feedback.snapshot()
                 )
                 now = time.monotonic()
+                if _abort_requested(self.should_abort):
+                    self.aborted = True
+                    print("abort — user cancelled", flush=True)
+                    break
                 if self.feedback.client_lost(now, self.t0):
                     self.aborted = True
                     print(
@@ -974,27 +1192,47 @@ class BlockSender:
                 tail = self.next_block >= self.total_blocks
                 if tail and self.tail_started is None:
                     self.tail_started = now
-                self._reap_completed(completed, opened, tail=tail)
-                self._submit_ahead()
-                admitted = self._admit_source()
+                try:
+                    self._reap_completed(completed, opened, tail=tail)
+                    self._submit_ahead()
+                    admitted = self._admit_source()
 
-                window_full = len(self.active) >= self.geometry.active_blocks
-                drip = tail or window_full or self._has_decode_debt(opened, now)
-                if tail:
-                    repair_gap = TAIL_REPAIR_COOLDOWN_S
-                elif window_full:
-                    repair_gap = 0.0
-                else:
-                    repair_gap = REPAIR_INTERVAL_S
-                if drip and now - self.last_repair_loop >= repair_gap:
-                    self._repair_tick(
-                        opened, now, tail, window_full=window_full
-                    )
-                    self.last_repair_loop = now
+                    window_full = len(self.active) >= self.geometry.active_blocks
+                    drip = tail or window_full or self._has_decode_debt(opened, now)
+                    if tail:
+                        repair_gap = TAIL_REPAIR_COOLDOWN_S
+                    elif window_full:
+                        repair_gap = 0.0
+                    else:
+                        repair_gap = REPAIR_INTERVAL_S
+                    if drip and now - self.last_repair_loop >= repair_gap:
+                        self._repair_tick(
+                            opened, now, tail, window_full=window_full
+                        )
+                        self.last_repair_loop = now
+                except InterruptedError:
+                    self.aborted = True
+                    print("abort — user cancelled", flush=True)
+                    break
 
                 if now - self.last_log >= 1.0:
                     self._log_progress(now, completed, opened, unique_rx, decoded)
                     self.last_log = now
+                if self.progress is not None and now - self.last_progress >= 0.1:
+                    elapsed = max(now - self.t0, 1e-6)
+                    _emit_progress(
+                        self.progress,
+                        _file_progress_line(
+                            self.file_path.name,
+                            decoded,
+                            self.file_size,
+                            len(completed),
+                            self.total_blocks,
+                            decoded / elapsed,
+                            self.repair_ctl.current,
+                        ),
+                    )
+                    self.last_progress = now
 
                 if self.next_block >= self.total_blocks:
                     if now - self.last_fin_ts >= _FIN_INTERVAL_S:
@@ -1028,6 +1266,20 @@ class BlockSender:
             self.mm.close()
             fh.close()
             self.mm = None
+        if self.progress is not None and not self.aborted:
+            elapsed = max(time.monotonic() - self.t0, 1e-6)
+            _emit_progress(
+                self.progress,
+                _file_progress_line(
+                    self.file_path.name,
+                    self.file_size,
+                    self.file_size,
+                    self.total_blocks,
+                    self.total_blocks,
+                    self.file_size / elapsed,
+                    self.repair_ctl.current,
+                ),
+            )
         return self.aborted
 
     def print_done(self) -> None:
@@ -1094,6 +1346,8 @@ class BlockReceiver:
         *,
         file_progress: bool,
         close_sock: bool = True,
+        progress: Callable[[str], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> None:
         self.sock = sock
         self.server = server
@@ -1102,6 +1356,8 @@ class BlockReceiver:
         self.output = output
         self.file_progress = file_progress
         self.close_sock = close_sock
+        self.progress = progress
+        self.should_abort = should_abort
         self.geometry = BlockGeometry(meta.symbol_size, meta.block_k, meta.active_bytes)
         self.total_blocks = self.geometry.total_blocks(meta.file_size)
         self.slots: dict[int, GenReceiveSlot] = {}
@@ -1219,23 +1475,29 @@ class BlockReceiver:
             self.rate_t, self.rate_b = now, self.decoded_bytes
         elif now > self.t0:
             self.inst_bps = self.decoded_bytes / (now - self.t0)
+        name = Path(meta.file_name).name or self.output.name
+        bar = _file_progress_line(
+            name,
+            self.decoded_bytes,
+            meta.file_size,
+            len(self.done),
+            self.total_blocks,
+            self.inst_bps,
+            self.fec_pct,
+        )
+        if self.progress is not None and now - self.last_log >= 0.1:
+            _emit_progress(self.progress, bar)
+            self.last_log = now
+            return
         if self.file_progress:
-            name = Path(meta.file_name).name or self.output.name
-            line = (
-                f"{name[:36]:<36} [{_client_bar(self.decoded_bytes / max(1, meta.file_size))}] "
-                f"{100.0 * self.decoded_bytes / max(1, meta.file_size):5.1f}% "
-                f"{_client_size(self.decoded_bytes)}/{_client_size(meta.file_size)}  "
-                f"{len(self.done)}/{self.total_blocks}  {_client_rate(self.inst_bps)} "
-                f"fec={self.fec_pct}%"
-            )
             if sys.stdout.isatty() and now - self.last_log >= 0.05:
                 if self.bar_shown:
                     sys.stdout.write("\x1b[1A\x1b[2K")
-                print(line, flush=True)
+                print(bar, flush=True)
                 self.bar_shown = True
                 self.last_log = now
             elif not sys.stdout.isatty() and now - self.last_log >= 1.0:
-                print(line, flush=True)
+                print(bar, flush=True)
                 self.last_log = now
         elif now - self.last_log >= 1.0:
             elapsed = max(now - self.t0, 1e-6)
@@ -1252,14 +1514,21 @@ class BlockReceiver:
             self.last_log = now
 
     def _print_complete_bar(self) -> None:
+        name = Path(self.meta.file_name).name or self.output.name
+        line = _file_progress_line(
+            name,
+            self.meta.file_size,
+            self.meta.file_size,
+            self.total_blocks,
+            self.total_blocks,
+            self.inst_bps,
+            self.fec_pct,
+        )
+        if self.progress is not None:
+            _emit_progress(self.progress, line)
+            return
         if not self.file_progress:
             return
-        name = Path(self.meta.file_name).name or self.output.name
-        line = (
-            f"{name[:36]:<36} [{_client_bar(1.0)}] 100.0% "
-            f"{_client_size(self.meta.file_size)}/{_client_size(self.meta.file_size)}  "
-            f"{self.total_blocks}/{self.total_blocks}  {_client_rate(self.inst_bps)}"
-        )
         if sys.stdout.isatty() and self.bar_shown:
             sys.stdout.write("\x1b[1A\x1b[2K")
         print(line, flush=True)
@@ -1292,10 +1561,14 @@ class BlockReceiver:
             elif isinstance(packet, BlockFin):
                 self.fin_seen = True
 
+        aborted = False
         try:
             for raw in primed or ():
                 _handle(raw)
             while len(self.done) < self.total_blocks:
+                if _abort_requested(self.should_abort):
+                    aborted = True
+                    break
                 readable, _, _ = select.select([sock], [], [], 0.01)
                 if readable:
                     try:
@@ -1306,11 +1579,12 @@ class BlockReceiver:
                         _handle(raw)
                 self._send_feedback()
                 self._log(time.monotonic())
-            self._send_feedback(force=True)
-            self._print_complete_bar()
-            for _ in range(16):
-                sock.sendto(BlockFin(self.session_id, self.total_blocks).pack(), self.server)
-                time.sleep(0.005)
+            if not aborted:
+                self._send_feedback(force=True)
+                self._print_complete_bar()
+                for _ in range(16):
+                    sock.sendto(BlockFin(self.session_id, self.total_blocks).pack(), self.server)
+                    time.sleep(0.005)
         finally:
             for slot in self.slots.values():
                 slot.close()
@@ -1319,6 +1593,14 @@ class BlockReceiver:
                 self.fd = -1
             if self.close_sock:
                 sock.close()
+
+        if aborted:
+            try:
+                output.unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("abort — user cancelled", flush=True)
+            return 1
 
         elapsed = max(time.monotonic() - self.t0, 1e-6)
         if meta.sha256_hex:
@@ -1439,6 +1721,7 @@ def run_block_server(
     skip_hash: bool = False,
     once: bool = True,
     allow_upload: bool = False,
+    punch_peer: tuple[str, int] | None = None,
 ) -> int:
     geometry = BlockGeometry(symbol_size, block_k, active_bytes)
     root = root.resolve()
@@ -1466,6 +1749,8 @@ def run_block_server(
         f"fec={fec_start}% "
         f"mode={fec_mode} "
         f"upload={'on' if allow_upload else 'off'} "
+        f"vfs=on "
+        f"punch={punch_peer[0]+':'+str(punch_peer[1]) if punch_peer else 'off'} "
         f"enc_workers={workers} prefetch={prefetch_depth}",
         flush=True,
     )
@@ -1476,12 +1761,45 @@ def run_block_server(
         while True:
             print("waiting for READY", flush=True)
             got = _wait_hello(
-                sock, geometry, active_cap, 60.0 if once else None
+                sock,
+                geometry,
+                active_cap,
+                60.0 if once else None,
+                punch_peer=punch_peer,
             )
             if got is None:
                 raise TimeoutError("server timed out waiting for READY")
-            client, session_id, rel_path, is_upload = got
-            if is_upload:
+            client, session_id, rel_path, kind = got
+            if kind == "list":
+                _serve_list(sock, client, session_id, rel_path, root)
+                if once:
+                    break
+                print("idle — waiting for READY", flush=True)
+                continue
+            if kind in {"mkdir", "unlink"}:
+                rel = _norm_rel(rel_path)
+                if not allow_upload:
+                    print(f"reject {kind.upper()} path={rel!r} (disabled)", flush=True)
+                    _send_ack(
+                        sock, client, session_id, False, "uploads disabled"
+                    )
+                    continue
+                err = (
+                    _vfs_mkdir(root, rel)
+                    if kind == "mkdir"
+                    else _vfs_unlink(root, rel)
+                )
+                if err:
+                    print(f"reject {kind.upper()} path={rel!r} ({err})", flush=True)
+                    _send_ack(sock, client, session_id, False, err)
+                else:
+                    print(f"{kind} {rel}", flush=True)
+                    _send_ack(sock, client, session_id, True, "ok")
+                if once:
+                    break
+                print("idle — waiting for READY", flush=True)
+                continue
+            if kind == "upload":
                 rel = (rel_path or "").strip()
                 if not allow_upload:
                     print(f"reject UPLOAD path={rel!r} (disabled)", flush=True)
@@ -1630,19 +1948,28 @@ def run_block_client(
     remote: str = "",
     active_bytes: int = WAN_ACTIVE_BYTES,
     file_progress: bool = False,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+    progress: Callable[[str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_RCVBUF, 128 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_SNDBUF, 8 * 1024 * 1024)
-    sock.setblocking(False)
-    server = (host, port)
-    session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
+    sock, server, session_id = _client_udp(
+        host,
+        port,
+        bind_port=bind_port,
+        wait_punch=wait_punch,
+        snd=8 * 1024 * 1024,
+        rcv=128 * 1024 * 1024,
+    )
     ready = BlockReady(session_id, active_bytes, remote).pack()
     _send_copies(sock, server, ready)
 
     meta: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
     while meta is None and time.monotonic() < deadline:
+        if _abort_requested(should_abort):
+            sock.close()
+            return 1
         readable, _, _ = select.select([sock], [], [], 0.5)
         if not readable:
             sock.sendto(ready, server)
@@ -1670,18 +1997,27 @@ def run_block_client(
         return consume_object_stream(
             sock, server, session_id, meta, output, timeout_s=180.0,
             close_sock=True, file_progress=file_progress,
+            progress=progress, should_abort=should_abort,
         )
 
     return BlockReceiver(
-        sock, server, session_id, meta, output, file_progress=file_progress
+        sock,
+        server,
+        session_id,
+        meta,
+        output,
+        file_progress=file_progress,
+        progress=progress,
+        should_abort=should_abort,
     ).run()
 
 
 def run_block_upload_client(
     host: str,
     port: int,
-    sources: list[Path] | Path,
+    sources: list[Path] | Path | None = None,
     *,
+    files: list[tuple[str, Path]] | None = None,
     remote: str = "",
     active_bytes: int = WAN_ACTIVE_BYTES,
     symbol_size: int = WAN_SYMBOL_SIZE,
@@ -1689,9 +2025,22 @@ def run_block_upload_client(
     initial_repair_pct: int | None = None,
     rate_mbit: float | None = None,
     skip_hash: bool = False,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+    progress: Callable[[str], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> int:
-    source_list = [sources] if isinstance(sources, Path) else list(sources)
-    kind, target = _resolve_upload_sources(source_list)
+    if files is not None:
+        if not files:
+            raise FileNotFoundError("upload file list empty")
+        kind: str = "mux"
+        target: Path | list[tuple[str, Path]] = files
+        source_list: list[Path] = []
+    else:
+        if sources is None:
+            raise FileNotFoundError("upload requires a local file")
+        source_list = [sources] if isinstance(sources, Path) else list(sources)
+        kind, target = _resolve_upload_sources(source_list)
     dest = (remote or "").strip().replace("\\", "/").rstrip("/")
     if not dest:
         dest = _default_upload_remote(kind, source_list, target)
@@ -1705,12 +2054,14 @@ def run_block_upload_client(
     )
     _fec_mode, fec_start = resolve_fec_cli(initial_repair_pct)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try_set_buffer(sock, socket.SO_SNDBUF, 128 * 1024 * 1024)
-    try_set_buffer(sock, socket.SO_RCVBUF, 16 * 1024 * 1024)
-    sock.setblocking(False)
-    server = (host, port)
-    session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
+    sock, server, session_id = _client_udp(
+        host,
+        port,
+        bind_port=bind_port,
+        wait_punch=wait_punch,
+        snd=128 * 1024 * 1024,
+        rcv=16 * 1024 * 1024,
+    )
     hello = BlockUploadReady(session_id, active_bytes, dest).pack()
     _send_copies(sock, server, hello)
     print(f"uploading {dest} to udp://{host}:{port}", flush=True)
@@ -1718,6 +2069,9 @@ def run_block_upload_client(
     ack: BlockMeta | None = None
     deadline = time.monotonic() + 30.0
     while ack is None and time.monotonic() < deadline:
+        if _abort_requested(should_abort):
+            sock.close()
+            return 1
         readable, _, _ = select.select([sock], [], [], 0.5)
         if not readable:
             sock.sendto(hello, server)
@@ -1747,7 +2101,17 @@ def run_block_upload_client(
             if not isinstance(target, list):
                 raise TypeError("mux upload expected a file list")
             obj_session = ObjectSession()
-            queue_disk_files(obj_session, target)
+            try:
+                queue_disk_files(
+                    obj_session,
+                    target,
+                    should_abort=should_abort,
+                    progress=progress,
+                )
+            except InterruptedError:
+                return 1
+            if _abort_requested(should_abort):
+                return 1
             meta = BlockMeta(
                 session_id,
                 obj_session.nbytes,
@@ -1771,6 +2135,8 @@ def run_block_upload_client(
                 cc_on=cc_on,
                 min_bps=min_bps,
                 max_bps=max_bps,
+                progress=progress,
+                should_abort=should_abort,
             )
         if not isinstance(target, Path):
             raise TypeError("file upload expected a path")
@@ -1802,6 +2168,8 @@ def run_block_upload_client(
             cc_on=cc_on,
             encode_pool=encode_pool,
             prefetch_depth=prefetch_depth,
+            progress=progress,
+            should_abort=should_abort,
         )
         aborted = sender.run()
         if aborted:
@@ -1812,3 +2180,172 @@ def run_block_upload_client(
         if encode_pool is not None:
             encode_pool.shutdown(wait=False, cancel_futures=True)
         sock.close()
+
+
+def _client_udp(
+    host: str,
+    port: int,
+    *,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+    snd: int = 8 * 1024 * 1024,
+    rcv: int = 8 * 1024 * 1024,
+    punch_timeout_s: float = 20.0,
+) -> tuple[socket.socket, tuple[str, int], int]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try_set_buffer(sock, socket.SO_SNDBUF, snd)
+    try_set_buffer(sock, socket.SO_RCVBUF, rcv)
+    if wait_punch and not bind_port:
+        bind_port = port
+    if bind_port:
+        sock.bind(("", bind_port))
+    sock.setblocking(False)
+    server = (host, port)
+    if wait_punch:
+        deadline = time.monotonic() + punch_timeout_s
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([sock], [], [], 0.4)
+            if not readable:
+                continue
+            try:
+                raw, addr = sock.recvfrom(4096)
+                parse_packet(raw)
+            except (BlockingIOError, ValueError):
+                continue
+            server = addr
+            print(f"punch from {addr[0]}:{addr[1]}", flush=True)
+            break
+        else:
+            sock.close()
+            raise TimeoutError("client timed out waiting for NAT punch")
+    session_id = random.SystemRandom().randrange(1, 0xFFFFFFFF)
+    return sock, server, session_id
+
+
+def _wait_session_packet(
+    sock: socket.socket,
+    session_id: int,
+    types: tuple[type, ...],
+    timeout_s: float,
+    retry: bytes | None = None,
+    server: tuple[str, int] | None = None,
+):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([sock], [], [], 0.4)
+        if not readable:
+            if retry is not None and server is not None:
+                sock.sendto(retry, server)
+            continue
+        try:
+            raw, _ = sock.recvfrom(4096)
+            packet = parse_packet(raw)
+        except (BlockingIOError, ValueError):
+            continue
+        if getattr(packet, "session_id", None) != session_id:
+            continue
+        if isinstance(packet, types):
+            return packet
+    return None
+
+
+def run_vfs_list(
+    host: str,
+    port: int,
+    rel: str = "",
+    timeout_s: float = 15.0,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+) -> list[VfsEntry]:
+    sock, server, session_id = _client_udp(
+        host, port, bind_port=bind_port, wait_punch=wait_punch
+    )
+    req = BlockListReq(session_id, rel).pack()
+    _send_copies(sock, server, req, n=3)
+    by_seq: dict[int, BlockListEnt] = {}
+    last_seq: int | None = None
+    deadline = time.monotonic() + timeout_s
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([sock], [], [], 0.4)
+            if not readable:
+                sock.sendto(req, server)
+                continue
+            try:
+                raw, _ = sock.recvfrom(4096)
+                packet = parse_packet(raw)
+            except (BlockingIOError, ValueError):
+                continue
+            if getattr(packet, "session_id", None) != session_id:
+                continue
+            if isinstance(packet, BlockAck) and not packet.ok:
+                raise FileNotFoundError(packet.message or "list failed")
+            if not isinstance(packet, BlockListEnt):
+                continue
+            by_seq[packet.seq] = packet
+            if packet.last:
+                last_seq = packet.seq
+            if last_seq is not None and all(i in by_seq for i in range(last_seq + 1)):
+                entries: list[VfsEntry] = []
+                for i in range(last_seq + 1):
+                    entries.extend(by_seq[i].entries)
+                return entries
+        raise TimeoutError("client timed out waiting for LIST")
+    finally:
+        sock.close()
+
+
+def run_vfs_mkdir(
+    host: str,
+    port: int,
+    rel: str,
+    timeout_s: float = 10.0,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+) -> None:
+    rel = _norm_rel(rel)
+    if not rel:
+        raise ValueError("mkdir requires a path")
+    sock, server, session_id = _client_udp(
+        host, port, bind_port=bind_port, wait_punch=wait_punch
+    )
+    req = BlockMkdir(session_id, rel).pack()
+    _send_copies(sock, server, req, n=3)
+    try:
+        ack = _wait_session_packet(
+            sock, session_id, (BlockAck,), timeout_s, retry=req, server=server
+        )
+    finally:
+        sock.close()
+    if ack is None:
+        raise TimeoutError("client timed out waiting for MKDIR ack")
+    if not ack.ok:
+        raise OSError(ack.message or "mkdir failed")
+
+
+def run_vfs_unlink(
+    host: str,
+    port: int,
+    rel: str,
+    timeout_s: float = 10.0,
+    bind_port: int = 0,
+    wait_punch: bool = False,
+) -> None:
+    rel = _norm_rel(rel)
+    if not rel:
+        raise ValueError("rm requires a path")
+    sock, server, session_id = _client_udp(
+        host, port, bind_port=bind_port, wait_punch=wait_punch
+    )
+    req = BlockUnlink(session_id, rel).pack()
+    _send_copies(sock, server, req, n=3)
+    try:
+        ack = _wait_session_packet(
+            sock, session_id, (BlockAck,), timeout_s, retry=req, server=server
+        )
+    finally:
+        sock.close()
+    if ack is None:
+        raise TimeoutError("client timed out waiting for UNLINK ack")
+    if not ack.ok:
+        raise OSError(ack.message or "rm failed")

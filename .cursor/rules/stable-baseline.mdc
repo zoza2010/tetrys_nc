@@ -16,3 +16,6 @@ alwaysApply: true
 - Если пользователь просит написать какой то код - проверяй его полностью на локальных симуляторах и на wan
 - **После WAN-прогонов** сразу гаси сервер на России: `fuser -k 7494/udp` (не `pkill -f tetrys_nc` — это убивает SSH). Порт должен стать FREE.
 - **Перед каждым WAN-прогоном tetrys** сначала сними C: `scripts/wan_path_probe.sh` (или вручную). Тот же порт/направление: Spain `213.96.39.104` → Russia `185.41.43.122:7494`, `iperf3 -u -R -l 1350`. Минимум **200M** и **800M**. Не суди BlastCc без свежего recv/loss. **Линейка — UDP**: 800M / ~0% loss = канал жирный (tetrys lock `--rate 800 --gen-overhead 24` ≈ 75–79 MiB/s). TCP `-R` на России уже `bbr`, но на этом пути он часто даёт ~250 Mbit из‑за окна — это не C для UDP tetrys. CC без `--rate` обязан целиться в UDP C, не в 200 Mbit после self-congest.
+- **WAN FM / VFS server root (default):** всегда абсолютный  
+  `/home/sysops/quic_tests/tetrys_nc/testdata`  
+  (полный набор с Maya ISO). Не `--dir testdata` от случайного cwd. Старт: `bash scripts/wan_server.sh`.

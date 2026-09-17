@@ -34,6 +34,12 @@ class BlockPacketType(IntEnum):
     OBJ_OPEN = 0x35
     OBJ_FIN = 0x36
     UPLOAD = 0x37
+    LIST = 0x38
+    LIST_ENT = 0x39
+    MKDIR = 0x3A
+    UNLINK = 0x3B
+    ACK = 0x3C
+    PUNCH = 0x3D
 
 
 @dataclass(slots=True, frozen=True)
@@ -123,6 +129,200 @@ class BlockUploadReady:
             raise ValueError("UPLOAD path truncated")
         path = data[14 : 14 + nlen].decode("utf-8")
         return cls(session, active, path)
+
+
+def _pack_rel_path(kind: BlockPacketType, session_id: int, rel_path: str) -> bytes:
+    name = rel_path.encode("utf-8")[:1200]
+    return (
+        _HDR.pack(MAGIC, VERSION, kind, 0, session_id & 0xFFFFFFFF)
+        + struct.pack("!IH", 0, len(name))
+        + name
+    )
+
+
+def _unpack_rel_path(data: bytes, kind: BlockPacketType) -> tuple[int, str]:
+    _require(data, 12, kind)
+    session = struct.unpack_from("!I", data, 4)[0]
+    if len(data) <= 12:
+        return session, ""
+    nlen = struct.unpack_from("!H", data, 12)[0]
+    if len(data) < 14 + nlen:
+        raise ValueError(f"{kind.name} path truncated")
+    return session, data[14 : 14 + nlen].decode("utf-8")
+
+
+@dataclass(slots=True)
+class BlockListReq:
+    session_id: int
+    rel_path: str = ""
+
+    def pack(self) -> bytes:
+        return _pack_rel_path(BlockPacketType.LIST, self.session_id, self.rel_path)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockListReq:
+        session, path = _unpack_rel_path(data, BlockPacketType.LIST)
+        return cls(session, path)
+
+
+@dataclass(slots=True)
+class VfsEntry:
+    name: str
+    is_dir: bool = False
+    size: int = 0
+    mtime: int = 0
+
+
+_LIST_HEAD = struct.Struct("!HB")
+_LIST_ENT = struct.Struct("!BQIB")
+
+
+def _pack_list_entries(session_id: int, entries: list[VfsEntry]) -> list[bytes]:
+    """Split a directory listing into LIST_ENT datagrams under MAX_DATAGRAM."""
+    sid = session_id & 0xFFFFFFFF
+    chunks: list[list[VfsEntry]] = [[]]
+    size = 8 + _LIST_HEAD.size
+    for item in entries:
+        raw = item.name.encode("utf-8")[:255]
+        need = _LIST_ENT.size + len(raw)
+        if chunks[-1] and size + need > MAX_DATAGRAM - 8:
+            chunks.append([])
+            size = 8 + _LIST_HEAD.size
+        chunks[-1].append(VfsEntry(raw.decode("utf-8"), item.is_dir, item.size, item.mtime))
+        size += need
+    out: list[bytes] = []
+    for seq, chunk in enumerate(chunks):
+        last = seq + 1 == len(chunks)
+        body = _LIST_HEAD.pack(seq & 0xFFFF, len(chunk))
+        for item in chunk:
+            raw = item.name.encode("utf-8")[:255]
+            body += _LIST_ENT.pack(
+                1 if item.is_dir else 0,
+                item.size & 0xFFFFFFFFFFFFFFFF,
+                item.mtime & 0xFFFFFFFF,
+                len(raw),
+            )
+            body += raw
+        flags = 1 if last else 0
+        out.append(_HDR.pack(MAGIC, VERSION, BlockPacketType.LIST_ENT, flags, sid) + body)
+    return out
+
+
+@dataclass(slots=True)
+class BlockListEnt:
+    session_id: int
+    seq: int
+    last: bool
+    entries: list[VfsEntry]
+
+    def pack(self) -> bytes:
+        body = _LIST_HEAD.pack(self.seq & 0xFFFF, len(self.entries))
+        for item in self.entries:
+            raw = item.name.encode("utf-8")[:255]
+            body += _LIST_ENT.pack(
+                1 if item.is_dir else 0,
+                item.size & 0xFFFFFFFFFFFFFFFF,
+                item.mtime & 0xFFFFFFFF,
+                len(raw),
+            )
+            body += raw
+        flags = 1 if self.last else 0
+        return (
+            _HDR.pack(
+                MAGIC,
+                VERSION,
+                BlockPacketType.LIST_ENT,
+                flags,
+                self.session_id & 0xFFFFFFFF,
+            )
+            + body
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockListEnt:
+        _require(data, 8 + _LIST_HEAD.size, BlockPacketType.LIST_ENT)
+        session = struct.unpack_from("!I", data, 4)[0]
+        seq, count = _LIST_HEAD.unpack_from(data, 8)
+        off = 8 + _LIST_HEAD.size
+        entries: list[VfsEntry] = []
+        for _ in range(count):
+            if off + _LIST_ENT.size > len(data):
+                raise ValueError("LIST_ENT truncated")
+            is_dir, size, mtime, nlen = _LIST_ENT.unpack_from(data, off)
+            off += _LIST_ENT.size
+            if off + nlen > len(data):
+                raise ValueError("LIST_ENT name truncated")
+            name = data[off : off + nlen].decode("utf-8")
+            off += nlen
+            entries.append(VfsEntry(name, bool(is_dir & 1), size, mtime))
+        return cls(session, seq, bool(data[3] & 1), entries)
+
+
+@dataclass(slots=True)
+class BlockMkdir:
+    session_id: int
+    rel_path: str = ""
+
+    def pack(self) -> bytes:
+        return _pack_rel_path(BlockPacketType.MKDIR, self.session_id, self.rel_path)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockMkdir:
+        session, path = _unpack_rel_path(data, BlockPacketType.MKDIR)
+        return cls(session, path)
+
+
+@dataclass(slots=True)
+class BlockUnlink:
+    session_id: int
+    rel_path: str = ""
+
+    def pack(self) -> bytes:
+        return _pack_rel_path(BlockPacketType.UNLINK, self.session_id, self.rel_path)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockUnlink:
+        session, path = _unpack_rel_path(data, BlockPacketType.UNLINK)
+        return cls(session, path)
+
+
+@dataclass(slots=True)
+class BlockAck:
+    session_id: int
+    ok: bool = True
+    message: str = ""
+
+    def pack(self) -> bytes:
+        msg = self.message.encode("utf-8")[:1200]
+        return (
+            _HDR.pack(
+                MAGIC, VERSION, BlockPacketType.ACK, 1 if self.ok else 0, self.session_id
+            )
+            + struct.pack("!H", len(msg))
+            + msg
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockAck:
+        _require(data, 10, BlockPacketType.ACK)
+        session = struct.unpack_from("!I", data, 4)[0]
+        nlen = struct.unpack_from("!H", data, 8)[0]
+        if len(data) < 10 + nlen:
+            raise ValueError("ACK truncated")
+        return cls(session, bool(data[3] & 1), data[10 : 10 + nlen].decode("utf-8"))
+
+
+@dataclass(slots=True)
+class BlockPunch:
+    """NAT keepalive. Server sends first so the mapped public port can reply."""
+
+    def pack(self) -> bytes:
+        return _HDR.pack(MAGIC, VERSION, BlockPacketType.PUNCH, 0, 0)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> BlockPunch:
+        _require(data, 8, BlockPacketType.PUNCH)
+        return cls()
 
 
 @dataclass(slots=True)
@@ -427,6 +627,12 @@ def parse_packet(data: bytes):
         BlockPacketType.OBJ_OPEN: ObjectOpen,
         BlockPacketType.OBJ_FIN: ObjectFin,
         BlockPacketType.UPLOAD: BlockUploadReady,
+        BlockPacketType.LIST: BlockListReq,
+        BlockPacketType.LIST_ENT: BlockListEnt,
+        BlockPacketType.MKDIR: BlockMkdir,
+        BlockPacketType.UNLINK: BlockUnlink,
+        BlockPacketType.ACK: BlockAck,
+        BlockPacketType.PUNCH: BlockPunch,
     }[kind]
     return cls.unpack(data)
 
