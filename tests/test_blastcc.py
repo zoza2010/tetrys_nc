@@ -1570,8 +1570,8 @@ def test_hol_on_latched_knee_does_not_ratchet_to_50():
     cc._recover_wrecked(1.0)
     assert cc.rate == pytest.approx(knee)
     assert cc.knee_bps == pytest.approx(knee)
-    assert cc.saw_loss_knee is True
     assert cc.last_good >= knee
+    # Soft HOL hold must not invent a dropper lock from an overshoot latch.
 
 
 def test_fat_startup_stall_locks_and_does_not_probe():
@@ -2020,3 +2020,107 @@ def test_stale_limiter_with_send_pause_cuts_when_bw_tracks_trickle():
     assert _mbit(cc.rate) < 400.0, _mbit(cc.rate)
     assert _mbit(cc.last_good) < 400.0, _mbit(cc.last_good)
     assert cc.phase != MEASURE
+
+
+def test_soft_knee_survives_cliff_with_dirty_path_loss():
+    """WAN blob_2g: soft knee≈749, path still ~9%, unique cliffs → must not forget."""
+    start = 8_000_000 / 8
+    knee = 749_000_000 / 8
+    bw = 961_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = CRUISE
+    cc.was_fat = True
+    cc.knee_bps = knee
+    cc.rate = 961_000_000 / 8
+    cc.last_good = start  # startup_stall used to leave good at seed
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.last_path_loss = 0.088
+    cc.recv_lag = True
+    cc.last_unique = 32 * 1048576
+    cc.last_delivery = 72_000_000 / 8
+    cc.last_send_rate = 115_000_000 / 8
+    cc.cliff_n = 4
+    for x in (bw * 0.95, bw, bw * 1.02):
+        cc.bw.observe(x)
+    cc._recover_wrecked(1.0)
+    assert "wrecked_cut" not in " ".join(cc._events), cc._events
+    assert cc.knee_bps == pytest.approx(knee)
+    assert cc.last_good >= knee * 0.70, _mbit(cc.last_good)
+    assert cc.rate >= knee * 0.70, _mbit(cc.rate)
+
+
+def test_startup_stall_with_lag_keeps_fat_last_good():
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    cc.was_fat = True
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.rtt.srtt = 0.08
+    cc.rtt.n = 20
+    cc.rate = 961_000_000 / 8
+    cc.knee_bps = 749_000_000 / 8
+    cc.last_good = start
+    cc.recv_lag = True
+    cc.last_step_ts = 0.0
+    bw = 961_000_000 / 8
+    for x in (bw * 0.95, bw, bw):
+        cc.bw.observe(x)
+    cc.bw_stall_n = 3
+    cc._tick_startup(
+        1.0,
+        buffer_full=False,
+        oversend_held=False,
+        settled=True,
+        policer=False,
+    )
+    assert cc.phase == CRUISE
+    assert cc.last_good >= 749_000_000 / 8, _mbit(cc.last_good)
+
+
+def test_probe_abort_dropper_rejects_lock_below_prior_good():
+    """After soft knee ~750, do not crown mid-ramp 481 as dropper C."""
+    start = 8_000_000 / 8
+    prior = 749_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = PROBE
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.probe_base = 481_000_000 / 8
+    cc.rate = 570_000_000 / 8
+    cc.knee_bps = 0.0
+    cc.last_good = prior
+    cc.was_fat = True
+    cc._abort_probe_dropper(1.0)
+    assert cc.dropper_confirmed is False
+    assert cc.last_good >= prior * 0.99, _mbit(cc.last_good)
+    assert cc.rate >= prior * 0.70, _mbit(cc.rate)
+    assert "dropper_reject_low" in " ".join(cc._events)
+
+
+def test_overshoot_knee_sanitized_on_hol_hold():
+    """WAN: soft knee latched 1249 overshoot; cliff must clip to bw≈1044 not hold 1249."""
+    start = 8_000_000 / 8
+    cc = BlastCc(max_bps=10_000_000_000 / 8, start_bps=start, min_bps=start)
+    cc.phase = STARTUP
+    cc.was_fat = True
+    cc.min_rtt = 0.08
+    cc.rtt.min_rtt = 0.08
+    cc.knee_bps = 1_249_000_000 / 8
+    cc.rate = 1_249_000_000 / 8
+    cc.last_good = 1_249_000_000 / 8
+    cc.last_path_loss = 0.219
+    cc.recv_lag = True
+    cc.last_unique = 32 * 1048576
+    cc.last_delivery = 128_000_000 / 8
+    cc.last_send_rate = 351_000_000 / 8
+    cc.cliff_n = 4
+    bw = 1_044_000_000 / 8
+    for x in (bw * 0.95, bw, bw * 1.02):
+        cc.bw.observe(x)
+    cc._recover_wrecked(1.0)
+    assert cc.saw_loss_knee is False
+    assert _mbit(cc.knee_bps) < 1150.0, _mbit(cc.knee_bps)
+    assert _mbit(cc.rate) < 1150.0, _mbit(cc.rate)
+    assert _mbit(cc.rate) > 800.0, _mbit(cc.rate)

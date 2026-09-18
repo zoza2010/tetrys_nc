@@ -678,14 +678,16 @@ class BlastCc:
                 delivery > 0
                 and send > 0
                 and not self._unique_cliff()
-                and delivery >= send * _IID_RATIO
+                and delivery >= send * 0.90
             )
-            if tracking and (self._clean_pipe() or delivery >= send * _IID_RATIO):
+            if tracking and (self._clean_pipe() or delivery >= send * 0.90):
                 knee = send
                 if self.rate > 0 and self.rate >= send * 0.85:
                     knee = min(send, self.rate)
             elif self._clean_pipe() and send > 0:
                 knee = min(send, self.rate) if self.rate > 0 else send
+                if delivery > 0:
+                    knee = min(knee, delivery * _POLICER_AIM)
             else:
                 knee = bw
         if knee is None or knee <= 0:
@@ -698,7 +700,7 @@ class BlastCc:
             and not (delivery > 0 and send < delivery * 0.70)
         ):
             knee = send
-        return knee
+        return self._sanitize_knee(knee)
 
     def _last_clean_send(self) -> float | None:
         if self.knee_bps > 0:
@@ -721,7 +723,19 @@ class BlastCc:
             self._emit("probe_abort fill_knee")
             return
         if base > 0:
-            self.knee_bps = base
+            prior = max(self.last_good, self.knee_bps)
+            # Mid-ramp after amnesia: do not crown ~481 as C when we already
+            # held a much fatter clean sample.
+            if prior >= fill * 1.5 and base < prior * 0.85:
+                self.rate = max(base, prior * _DRAIN_GAIN)
+                self.last_good = max(self.last_good, prior)
+                if self.knee_bps <= 0:
+                    self.knee_bps = prior
+                self.dropper_confirmed = False
+                self._enter_cruise(now, take_rate=False)
+                self._emit("probe_abort dropper_reject_low")
+                return
+            self.knee_bps = max(self.knee_bps, base)
             self.rate = base
             self.last_good = max(self.last_good, base)
             self.saw_loss_knee = True
@@ -742,9 +756,9 @@ class BlastCc:
                 self.last_good = max(self.last_good, knee)
             self.last_step_ts = now
             return
-        self.knee_bps = knee
-        self.rate = knee
-        self.last_good = knee
+        self.knee_bps = self._sanitize_knee(knee)
+        self.rate = self.knee_bps
+        self.last_good = self.knee_bps
         self.saw_loss_knee = True
         self._enter_cruise(now, take_rate=False)
         self._emit("loss_knee_lock")
@@ -756,6 +770,38 @@ class BlastCc:
         if self.knee_bps > 0:
             return self.knee_bps
         return None
+
+    def _delivery_cap_bps(self) -> float | None:
+        """Proxy for path C: unique/bw plateau — never the limiter overshoot."""
+        parts: list[float] = []
+        bw = self.bw.max_bw
+        if bw is not None and bw > 0:
+            parts.append(bw)
+        # Live unique during HOL/cliff is a trickle — do not use as C cap.
+        if (
+            self.last_delivery > 0
+            and not self._unique_cliff()
+            and not self.recv_lag
+        ):
+            parts.append(self.last_delivery)
+        for send, got in self.send_samples:
+            if send > 0 and got / send >= _KNEE_GOOD_RATIO:
+                parts.append(min(send, got))
+        if not parts:
+            return None
+        return max(parts)
+
+    def _sanitize_knee(self, knee: float) -> float:
+        """Clip a latched knee only when it clearly exceeds delivered C."""
+        if knee <= 0:
+            return knee
+        cap = self._delivery_cap_bps()
+        if cap is None or cap <= 0:
+            return knee
+        limit = cap * _POLICER_AIM
+        if knee <= limit:
+            return knee
+        return max(self.min_bps, limit)
 
     def _note_knee(self) -> None:
         if self.saw_loss_knee:
@@ -771,7 +817,10 @@ class BlastCc:
         if self.last_path_loss is not None and self.last_path_loss >= _LOSS_KNEE:
             return
         if got / send >= _KNEE_GOOD_RATIO:
-            latched = min(send, self.rate)
+            # Latch delivered C, not min(send, rate) which equals overshoot pace
+            # when unique briefly tracks a 1.25× blast.
+            latched = min(send, got, self.rate if self.rate > 0 else send)
+            latched = self._sanitize_knee(latched)
             if latched > self._starved_fill_bps() * 1.30:
                 self.knee_bps = max(self.knee_bps, latched)
 
@@ -839,7 +888,11 @@ class BlastCc:
             return
         self.rate = min(self.rate, self._aim_delivery())
         if remember:
-            self.last_good = min(self.last_good, self.rate)
+            # Soft knee / confirmed C: cut pace, do not erase memory.
+            if self.knee_bps > 0:
+                self.last_good = max(self.last_good, self.knee_bps)
+            else:
+                self.last_good = min(self.last_good, self.rate)
         self.last_step_ts = now
 
     def _recover_wrecked(self, now: float) -> None:
@@ -863,14 +916,29 @@ class BlastCc:
             and self.last_delivery < self.last_good * 0.35
         )
         if self.knee_bps > 0 and not trickle:
-            self.rate = self.knee_bps
-            self.last_good = max(self.last_good, self.knee_bps)
-            self.saw_loss_knee = True
+            sane = self._sanitize_knee(self.knee_bps)
+            self.knee_bps = sane
+            self.rate = sane
+            self.last_good = max(self.last_good, sane)
+            # Soft knee hold is not a dropper lock — allow later search.
             self.last_step_ts = now
             self._emit("hol_hold_knee")
             return
-        # HOL after a real climb (WAN 1210/unq=847 → snd=51): keep the fat
-        # sample. Two-block fill is not C.
+        # Soft knee or fat bw memory: HOL/lag cliff after overshoot must not
+        # call forget (WAN: knee≈749, path still 8% → old hol_hold_fat skipped).
+        if self.knee_bps > 0 or (trickle and held >= fill * 1.5 and self.was_fat):
+            raw = self.knee_bps if self.knee_bps > 0 else held * _DRAIN_GAIN
+            sane = self._sanitize_knee(max(raw, fill))
+            if self.knee_bps > 0:
+                self.knee_bps = min(self.knee_bps, max(sane, fill))
+            aimed = max(fill, sane)
+            self.rate = aimed
+            self.last_good = max(self.last_good, aimed)
+            self.last_step_ts = now
+            self.measure_holdoff = now + max(0.80, 8.0 * self._rtt_s())
+            self._emit("hol_hold_fat")
+            return
+        # HOL after a real climb with clean path (no soft knee yet).
         if (
             trickle
             and held >= fill * 1.5
@@ -1109,8 +1177,12 @@ class BlastCc:
                 aimed = max(self.min_bps, bw if self.was_fat else bw * _POLICER_AIM)
                 if self.rate > aimed:
                     self.rate = aimed
+                # Remember delivered C (bw/knee), not limiter overshoot pace.
+                held = max(self.knee_bps, bw)
+                if held >= self._starved_fill_bps() * 1.5:
+                    self.last_good = max(self.last_good, self._sanitize_knee(held))
                 self._emit("startup_stall")
-                self._enter_cruise(now, take_rate=not self.recv_lag)
+                self._enter_cruise(now, take_rate=False)
         elif now - self.last_step_ts >= (
             0.16 if self.min_rtt is None else max(0.12, min(0.40, 2.0 * self.min_rtt))
         ):
